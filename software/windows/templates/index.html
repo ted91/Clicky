@@ -1,0 +1,478 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Clicky Notes</title>
+  <style>
+    :root {
+      --bg: #ffffff; --fg: #1a1a1a; --muted: #666; --muted2: #888; --border: #ddd;
+      --card-bg: transparent; --pre-bg: #f7f7f7; --owner: #0a7; --due: #a70;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #121212; --fg: #eee; --muted: #aaa; --muted2: #888; --border: #3a3a3a;
+               --card-bg: #1c1c1c; --pre-bg: #262626; --owner: #4fd6a0; --due: #e0ac5c; }
+    }
+    :root[data-theme="dark"] { --bg: #121212; --fg: #eee; --muted: #aaa; --muted2: #888; --border: #3a3a3a;
+               --card-bg: #1c1c1c; --pre-bg: #262626; --owner: #4fd6a0; --due: #e0ac5c; }
+    :root[data-theme="light"] { --bg: #ffffff; --fg: #1a1a1a; --muted: #666; --muted2: #888; --border: #ddd;
+               --card-bg: transparent; --pre-bg: #f7f7f7; --owner: #0a7; --due: #a70; }
+
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, sans-serif; margin: 0; color: var(--fg); background: var(--bg); display: flex; min-height: 100vh; }
+    h1 { font-size: 1.4rem; }
+    .meta { color: var(--muted); font-size: 0.85rem; margin-bottom: 2rem; }
+
+    /* Site-wide left nav (see templates/_nav.html) -- same look as
+       settings.html's .sidebar, kept under its own class names since this
+       partial is included standalone (not nested inside another sidebar)
+       on this page. */
+    .app-nav { width: 210px; flex-shrink: 0; background: var(--sidebar, #f5f5f5); border-right: 1px solid var(--border); padding: 0.75rem 0; }
+    @media (prefers-color-scheme: dark) { .app-nav { background: #1a1a1a; } }
+    :root[data-theme="dark"] .app-nav { background: #1a1a1a; }
+    :root[data-theme="light"] .app-nav { background: #f5f5f5; }
+    .app-nav-item {
+      display: flex; align-items: center; gap: 0.6rem; padding: 0.6rem 1.1rem;
+      font-size: 0.9rem; color: var(--fg); text-decoration: none; border-left: 3px solid transparent;
+      background: none; border-top: none; border-right: none; border-bottom: none; width: 100%; text-align: left; cursor: pointer; font: inherit;
+    }
+    .app-nav-item .icon { font-size: 1.1rem; width: 1.3rem; text-align: center; }
+    .app-nav-item:hover { background: rgba(128,128,128,0.12); }
+    .app-nav-item.active { background: rgba(128,128,128,0.12); border-left-color: var(--owner); font-weight: 600; }
+    .app-nav-logout { margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 0.9rem; }
+
+    .page-content { flex: 1; max-width: 1400px; margin: 2rem auto; padding: 0 2rem; overflow-y: auto; }
+    /* Each card stays full-width (one per row), but splits its right-hand
+       content into two columns: everything through Speakers (the AI
+       summary) on the left, the transcript/processing detail on the
+       right -- rather than stacking both down a single narrow column. */
+    .recording-columns { display: flex; gap: 2rem; align-items: flex-start; }
+    .recording-columns .summary-col { flex: 1 1 0; min-width: 0; }
+    .recording-columns .detail-col { flex: 1 1 0; min-width: 0; }
+    @media (max-width: 900px) { .recording-columns { flex-direction: column; } }
+    .recording { border: 1px solid var(--border); background: var(--card-bg); border-radius: 8px; padding: 1rem 1.25rem; margin-bottom: 1rem; }
+    .recording h3 { margin: 0 0 0.25rem; font-size: 1rem; }
+    .recording .timestamp { color: var(--muted2); font-size: 0.8rem; margin-bottom: 0.75rem; }
+    .recording .providers { color: var(--muted); font-size: 0.75rem; }
+    .section-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); margin: 0.75rem 0 0.15rem; }
+    .action-items { margin: 0.25rem 0; padding-left: 1.2rem; }
+    .action-items li { margin-bottom: 0.25rem; }
+    .owner { color: var(--owner); font-weight: 600; }
+    .contact-toggle { font-size: 0.75rem; color: var(--muted2); margin-left: 0.4rem; text-decoration: none; white-space: nowrap; }
+    .contact-toggle:hover { text-decoration: underline; }
+    /* Breaks onto its own full-width line below the speaker/stakeholder
+       row instead of continuing inline to the right, which used to run
+       past the card's (and viewport's) edge -- max-width caps each input
+       so long placeholder text can't force overflow on narrow cards. */
+    .contact-form { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; flex-basis: 100%; margin-top: 0.3rem; margin-left: 1.5rem; }
+    .contact-form input { font-size: 0.8rem; padding: 0.15rem 0.4rem; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--fg); width: 160px; max-width: 100%; box-sizing: border-box; }
+    .contact-form .contact-save { font-size: 0.75rem; padding: 0.15rem 0.5rem; border-radius: 4px; border: 1px solid var(--owner); color: var(--owner); background: var(--bg); cursor: pointer; }
+    .contact-status { font-size: 0.75rem; color: var(--muted2); }
+    .due { color: var(--due); }
+    details { margin-top: 0.5rem; }
+    details summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; }
+    pre.transcript { white-space: pre-wrap; font-family: inherit; font-size: 0.9rem; background: var(--pre-bg); padding: 0.75rem; border-radius: 6px; margin-top: 0.5rem; }
+    /* A line classified "background" by audio_analysis.py (a quieter,
+       more distant conversation the mic also picked up) -- greyed out so
+       it's still visible in the full transcript, but visually set apart
+       from what actually made it into the summary. */
+    .transcript p.background-line { color: var(--muted2); opacity: 0.7; }
+    .background-tag { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.03em; margin-right: 0.35rem; }
+    .empty { color: var(--muted2); }
+    a { color: var(--owner); }
+    audio { width: 100%; height: 32px; margin: 0.5rem 0; }
+    .badge { display: inline-block; font-size: 0.7rem; padding: 0.15rem 0.5rem; border-radius: 999px; margin-left: 0.5rem; vertical-align: middle; }
+    .badge.pending { background: #e0ac5c33; color: var(--due); }
+    .badge.failed { background: #e0525233; color: #e05252; }
+    .badge.dest { background: var(--owner); color: #fff; opacity: 0.85; }
+    .badge.sentiment-positive { background: #22c55e22; color: #16a34a; }
+    .badge.sentiment-neutral  { background: #6b728022; color: #6b7280; }
+    .badge.sentiment-negative { background: #e0525222; color: #e05252; }
+    .topics { display: flex; flex-wrap: wrap; gap: 0.3rem; margin: 0.4rem 0 0.2rem; }
+    .topic-chip { font-size: 0.7rem; padding: 0.1rem 0.45rem; border-radius: 999px;
+                  background: var(--pre-bg); border: 1px solid var(--border); color: var(--muted); }
+    .meeting-indicator {
+      display: flex; align-items: center; gap: 0.4rem; margin: -1rem 0 1.5rem;
+      font-size: 0.85rem; color: #e05252;
+    }
+    .meeting-header { font-size: 0.85rem; color: var(--muted); margin-bottom: 0.5rem; display: flex; align-items: center; flex-wrap: wrap; gap: 0.4rem; }
+    .attendee-chip { font-size: 0.7rem; padding: 0.1rem 0.45rem; border-radius: 999px; background: var(--pre-bg); border: 1px solid var(--border); }
+    .draft-item { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.4rem; }
+    .draft-text { flex: 1; min-width: 200px; }
+    .draft-actions { display: flex; gap: 0.4rem; }
+    .draft-recipient-input {
+      font: inherit; font-size: 0.85rem; padding: 0.25rem 0.5rem; border: 1px solid var(--border);
+      border-radius: 4px; background: var(--bg); color: var(--fg); min-width: 200px;
+    }
+    .draft-recipient-input:focus { border-color: var(--owner); outline: none; }
+    .draft-approve-btn, .draft-dismiss-btn {
+      font-size: 0.75rem; padding: 0.2rem 0.55rem; border-radius: 4px; cursor: pointer;
+      border: 1px solid var(--border); background: var(--bg); color: var(--fg);
+    }
+    .draft-approve-btn { border-color: var(--owner); color: var(--owner); }
+    .draft-dismiss-btn:hover { border-color: #e05252; color: #e05252; }
+    .error-text { color: #e05252; font-size: 0.85rem; margin: 0.25rem 0; }
+    .speaker { color: var(--owner); font-weight: 600; }
+    .speaker.rename-speaker { cursor: pointer; }
+    .speaker.rename-speaker:hover { text-decoration: underline; }
+    .speaker-rename-input {
+      font: inherit; font-weight: 600; color: var(--owner); background: var(--pre-bg);
+      border: 1px solid var(--owner); border-radius: 4px; padding: 0 0.25rem;
+    }
+    .speakers-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; list-style: none; margin-left: -1.2rem; }
+    .speaker-slot-label { color: var(--owner); font-weight: 600; min-width: 90px; font-size: 0.9rem; }
+    .speaker-slot-input {
+      font: inherit; font-size: 0.85rem; padding: 0.25rem 0.5rem; border: 1px solid var(--border);
+      border-radius: 4px; background: var(--bg); color: var(--fg); flex: 1; max-width: 220px;
+    }
+    .speaker-slot-input:focus { border-color: var(--owner); outline: none; }
+    .speaker-slot-status { font-size: 0.75rem; color: var(--muted2); min-width: 3.5rem; }
+    .speaker-slot-input.speaker-suggested { border-color: var(--owner); background: color-mix(in srgb, var(--owner) 8%, transparent); }
+    .speaker-suggestion-tag {
+      font-size: 0.65rem; color: var(--owner); border: 1px solid var(--owner);
+      border-radius: 3px; padding: 0.05rem 0.3rem; white-space: nowrap;
+    }
+    .speaker-candidates-hint, .speaker-slot-hint { font-size: 0.75rem; color: var(--muted2); }
+    .speaker-candidate-chip { color: var(--owner); text-decoration: none; }
+    .speaker-candidate-chip:hover { text-decoration: underline; }
+    .speaker-candidates-or { color: var(--muted2); font-style: italic; }
+    /* Confidence bar: green >=90% match, yellow >=75% (the auto-suggest
+       floor), red below that (only ever seen on the "might be" candidate
+       chips, since a confirmed suggestion is never shown under 75%). */
+    .confidence-bar {
+      display: inline-block; width: 40px; height: 6px; border-radius: 3px;
+      background: var(--border); overflow: hidden; vertical-align: middle;
+    }
+    .confidence-bar-fill { display: block; height: 100%; }
+    .confidence-bar-fill.confidence-green { background: #3cb371; }
+    .confidence-bar-fill.confidence-yellow { background: #e0b23c; }
+    .confidence-bar-fill.confidence-red { background: #e05252; }
+    .recording-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.5rem; }
+    .recording-header { flex-wrap: wrap; }
+    .quick-open-links { display: flex; gap: 0.5rem; flex-shrink: 0; }
+    .quick-open-link {
+      font-size: 0.75rem; color: var(--owner); text-decoration: none; border: 1px solid var(--owner);
+      border-radius: 4px; padding: 0.15rem 0.5rem; white-space: nowrap;
+    }
+    .quick-open-link:hover { background: var(--owner); color: #fff; }
+    .delete-btn, .delete-device-btn {
+      background: none; border: 1px solid var(--border); color: var(--muted2);
+      border-radius: 4px; font-size: 0.75rem; padding: 0.2rem 0.5rem; cursor: pointer;
+      flex-shrink: 0;
+    }
+    .delete-btn:hover { border-color: #e05252; color: #e05252; }
+    .delete-device-btn.danger { border-color: #e05252; color: #e05252; }
+    .delete-device-btn.danger:hover { background: #e05252; color: #fff; }
+    .download-audio-btn {
+      background: none; border: 1px solid var(--border); color: var(--muted2);
+      border-radius: 4px; font-size: 0.75rem; padding: 0.2rem 0.5rem;
+      text-decoration: none; flex-shrink: 0; align-self: center;
+    }
+    .download-audio-btn:hover { border-color: var(--owner); color: var(--owner); }
+
+    /* Small, unobtrusive connection/sync status pill, bottom-right. */
+    .status-bar {
+      position: fixed; bottom: 12px; right: 12px;
+      display: flex; align-items: center; gap: 10px;
+      background: var(--card-bg, var(--bg)); border: 1px solid var(--border);
+      border-radius: 999px; padding: 5px 12px; font-size: 0.7rem; color: var(--muted);
+      box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+    }
+    .status-item { display: flex; align-items: center; gap: 5px; }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); display: inline-block; }
+    .status-dot.blue { background: #3b82f6; }
+    .status-dot.green { background: #22c55e; }
+    .status-dot.red { background: #e05252; }
+    .status-dot.blink { animation: dot-blink 1s ease-in-out infinite; }
+    @keyframes dot-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+    .sync-progress { color: var(--muted); font-variant-numeric: tabular-nums; }
+    .sync-progress:empty { display: none; }
+
+    /* Row layout: checkbox + delete actions + audio on the left, everything
+       else (title, summary, transcript, etc.) on the right -- reads
+       left-to-right as checkbox+actions / audio / text instead of the old
+       stacked audio-then-text with delete buttons up in the title row. */
+    .recording-row { display: flex; gap: 1rem; align-items: flex-start; }
+    .recording-left { flex: 0 0 180px; display: flex; flex-direction: column; gap: 0.5rem; }
+    .recording-left-controls { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
+    .recording-select { width: 16px; height: 16px; cursor: pointer; flex-shrink: 0; }
+    .recording-right { flex: 1; min-width: 0; }
+    @media (max-width: 560px) {
+      /* Narrow screens: fall back to stacked (checkbox/actions+audio above
+         text) -- a fixed 180px side column would crowd out the text
+         column entirely. */
+      .recording-row { flex-direction: column; }
+      .recording-left { width: 100%; }
+    }
+
+    /* Bulk select/delete bar -- appears once at least one recording is checked. */
+    .bulk-bar {
+      display: none; align-items: center; gap: 0.75rem; margin-bottom: 1rem;
+      padding: 0.6rem 1rem; border: 1px solid var(--border); border-radius: 8px; background: var(--card-bg);
+      font-size: 0.85rem;
+    }
+    .bulk-bar.active { display: flex; }
+    .bulk-bar .count { color: var(--muted); }
+    .bulk-bar button {
+      font-size: 0.8rem; padding: 0.3rem 0.7rem; border-radius: 4px; cursor: pointer;
+      border: 1px solid var(--border); background: var(--bg); color: var(--fg);
+    }
+    .bulk-bar button.danger { border-color: #e05252; color: #e05252; }
+    .bulk-bar button.danger:hover { background: #e05252; color: #fff; }
+    .bulk-bar button:hover { border-color: var(--owner); color: var(--owner); }
+
+    .person-link-card {
+      border: 1px solid var(--due); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem;
+      background: var(--card-bg); font-size: 0.85rem;
+    }
+    .person-link-card .title { margin-bottom: 0.5rem; }
+    .person-link-card .title strong { color: var(--due); }
+    .person-link-row { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+    .person-link-row select, .person-link-row input[type="text"] {
+      font: inherit; font-size: 0.85rem; padding: 0.3rem 0.5rem; border: 1px solid var(--border);
+      border-radius: 4px; background: var(--bg); color: var(--fg);
+    }
+    .person-link-row button {
+      font-size: 0.8rem; padding: 0.3rem 0.7rem; border-radius: 4px; cursor: pointer;
+      border: 1px solid var(--owner); background: var(--bg); color: var(--owner);
+    }
+    .person-link-row button:hover { background: var(--owner); color: #fff; }
+    .person-link-new-name { display: none; }
+    .person-link-new-name.active { display: inline-block; }
+  </style>
+</head>
+<body>
+  {% include "_nav.html" %}
+  <div class="page-content">
+  <h1>Clicky Notes</h1>
+  <div class="meta">
+    Sync: {{ sync_transport }} &middot; <span id="count">{{ recordings|length }}</span> recording(s)
+  </div>
+
+  {# Manual meeting recording is controlled from the menu-bar icon, not the
+     dashboard -- the dashboard is config + viewing only. This just shows a
+     passive indicator when a recording happens to be in progress. #}
+  <div id="meeting-indicator" class="meeting-indicator" style="display:none;">
+    🔴 <span id="meeting-indicator-text">Recording meeting…</span>
+  </div>
+
+  <div id="bulk-bar" class="bulk-bar">
+    <span class="count"><span id="bulk-count">0</span> selected</span>
+    <button type="button" id="bulk-delete-btn">Delete selected</button>
+    <button type="button" id="bulk-delete-device-btn" class="danger">Delete selected from device</button>
+    <button type="button" id="bulk-clear-btn">Clear selection</button>
+  </div>
+
+  {# A Task/Calendar entry created with just a name (no email to confirm
+     identity by) and 1+ matching existing People pages -- never
+     auto-linked, since two different people can share a name; the user
+     picks which one (or says "someone new") here. See notion_sync.py's
+     resolve_person_for_relation. #}
+  <div id="person-link-queue"></div>
+
+  <div id="recordings">
+    {% if not recordings %}
+      <p class="empty">No recordings processed yet — record a memo on the device and it'll show up here within one poll interval.</p>
+    {% endif %}
+    {% for r in recordings %}
+      <div class="recording">
+        <div class="recording-row">
+          <div class="recording-left">
+            <div class="recording-left-controls">
+              <input type="checkbox" class="recording-select" data-hash="{{ r.content_hash }}">
+              <button class="delete-btn" data-hash="{{ r.content_hash }}" data-name="{{ r.name }}">Delete</button>
+              <button class="delete-device-btn danger" data-hash="{{ r.content_hash }}" data-name="{{ r.name }}">Delete from device</button>
+            </div>
+            <audio controls preload="none" src="/audio/{{ r.content_hash }}.wav"></audio>
+            <a class="download-audio-btn" href="/audio/{{ r.content_hash }}.wav?download=1" download title="Download original recording">Download</a>
+          </div>
+          <div class="recording-right">
+        <div class="recording-header">
+          <h3>{{ r.name }}
+            {% if r.status == "pending" %}<span class="badge pending">Processing&hellip;</span>{% endif %}
+            {% if r.status == "failed" %}<span class="badge failed">Processing failed</span>{% endif %}
+          </h3>
+          {% if r.notion_url or r.obsidian_url %}
+            <span class="quick-open-links">
+              {% if r.notion_url %}<a href="{{ r.notion_url }}" target="_blank" rel="noopener" class="quick-open-link">Open in Notion</a>{% endif %}
+              {% if r.obsidian_url %}<a href="{{ r.obsidian_url }}" class="quick-open-link">Open in Obsidian</a>{% endif %}
+            </span>
+          {% endif %}
+        </div>
+        <div class="timestamp">{{ r.created_at }}</div>
+
+        {% if r.status == "done" %}
+        <div class="recording-columns">
+        <div class="summary-col">
+          {% if r.deepgram_insights %}
+            {% set ins = r.deepgram_insights %}
+            {% if ins.sentiment %}
+              <span class="badge sentiment-{{ ins.sentiment }}">
+                {% if ins.sentiment == "positive" %}😊{% elif ins.sentiment == "negative" %}😔{% else %}😐{% endif %}
+                {{ ins.sentiment | capitalize }}
+              </span>
+            {% endif %}
+            {% if ins.topics %}
+              <div class="topics">
+                {% for topic in ins.topics[:6] %}
+                  <span class="topic-chip">{{ topic }}</span>
+                {% endfor %}
+              </div>
+            {% endif %}
+          {% endif %}
+          <p>{{ r.summary.summary }}</p>
+          {% if r.summary.excluded_background_note %}
+            <p class="providers" style="font-style: italic;">{{ r.summary.excluded_background_note }}</p>
+          {% endif %}
+          {% if r.summary.action_items %}
+            <div class="section-label">Action items</div>
+            <ul class="action-items">
+              {% for item in r.summary.action_items %}
+                <li>{{ item.text }}
+                  {% if item.owner %}&mdash; <span class="owner">{{ item.owner }}</span>{% endif %}
+                  {% if item.due_date %}<span class="due">(due {{ item.due_date }})</span>{% endif %}
+                </li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+          {% if r.summary.follow_ups %}
+            <div class="section-label">Follow-ups</div>
+            <ul class="action-items">
+              {% for fu in r.summary.follow_ups %}
+                <li>{{ fu.text }}
+                  {% if fu.owner %}&mdash; <span class="owner">{{ fu.owner }}</span>{% endif %}
+                </li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+          {% if r.summary.stakeholders %}
+            <div class="section-label">Stakeholders</div>
+            <ul class="action-items">
+              {% for s in r.summary.stakeholders %}
+                <li>
+                  <span class="owner">{{ s.name }}</span>{% if s.note %} &mdash; {{ s.note }}{% endif %}
+                  <a class="contact-toggle" data-name="{{ s.name }}" href="javascript:void(0)">+ contact</a>
+                  <span class="contact-form" style="display:none;">
+                    <input type="email" class="contact-email" placeholder="email">
+                    <input type="url" class="contact-linkedin" placeholder="linkedin.com/in/...">
+                    <button type="button" class="contact-save">Save</button>
+                    <span class="contact-status"></span>
+                  </span>
+                </li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+          {% if r.summary.calendar_events %}
+            <div class="section-label">Calendar events</div>
+            <ul class="action-items">
+              {% for ev in r.summary.calendar_events %}
+                <li>📅 {{ ev.title }}
+                  {% if ev.date %}&mdash; {{ ev.date }}{% endif %}
+                  {% if ev.time %} {{ ev.time }}{% endif %}
+                </li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+        </div>
+        <div class="detail-col">
+          {% if r.segments %}
+            {% set speaker_ids = r.segments | map(attribute='speaker_id') | unique | list %}
+            {% if speaker_ids | length > 0 %}
+              <div class="section-label">Speakers</div>
+              <ul class="action-items speakers-list" data-hash="{{ r.content_hash }}">
+                {% for sid in speaker_ids %}
+                  {% set suggestion = ((r.summary or {}).get('speaker_name_suggestions') or {}).get(sid) %}
+                  {% set has_name = r.get('speaker_names', {}).get(sid) %}
+                  {% set candidates = ((r.summary or {}).get('speaker_name_candidates') or {}).get(sid) %}
+                  <li>
+                    <span class="speaker-slot-label">{{ r.get('speaker_names', {}).get(sid) or ("Speaker " ~ sid) }}</span>
+                    <input type="text" class="speaker-slot-input{{ ' speaker-suggested' if (suggestion and not has_name) else '' }}" data-speaker-id="{{ sid }}"
+                           value="{{ has_name or (suggestion.name if (suggestion and not has_name) else '') }}"
+                           placeholder="Speaker {{ sid }}">
+                    {% if suggestion and not has_name %}
+                      {% set pct = (suggestion.score * 100) | round %}
+                      {% set conf_class = 'confidence-green' if suggestion.score >= 0.9 else ('confidence-yellow' if suggestion.score >= 0.75 else 'confidence-red') %}
+                      <span class="confidence-bar" title="{{ pct }}% match"><span class="confidence-bar-fill {{ conf_class }}" style="width: {{ pct }}%;"></span></span>
+                      <span class="speaker-suggestion-tag" title="Recognized from voice ({{ pct }}% match) -- confirm or correct">recognized</span>
+                    {% elif candidates and not has_name %}
+                      <span class="speaker-candidates-hint">
+                        Might be:
+                        {% for c in candidates %}
+                          {% set c_pct = (c.score * 100) | round %}
+                          {% set c_conf_class = 'confidence-green' if c.score >= 0.9 else ('confidence-yellow' if c.score >= 0.75 else 'confidence-red') %}
+                          <span class="confidence-bar" title="{{ c_pct }}% match"><span class="confidence-bar-fill {{ c_conf_class }}" style="width: {{ c_pct }}%;"></span></span>
+                          <a href="javascript:void(0)" class="speaker-candidate-chip" data-speaker-id="{{ sid }}" data-name="{{ c.name }}" title="{{ c_pct }}% match">{{ c.name }}</a>{{ ", " if not loop.last }}
+                        {% endfor %}
+                        <span class="speaker-candidates-or">— or type a new name below</span>
+                      </span>
+                    {% elif not has_name and voice_id_enabled %}
+                      <span class="speaker-slot-hint">No voice match — type a name to add them</span>
+                    {% endif %}
+                    <span class="speaker-slot-status"></span>
+                    <a class="contact-toggle" data-name="{{ r.get('speaker_names', {}).get(sid) or '' }}" href="javascript:void(0)">+ contact</a>
+                    <span class="contact-form" style="display:none;">
+                      <input type="email" class="contact-email" placeholder="email">
+                      <input type="url" class="contact-linkedin" placeholder="linkedin.com/in/...">
+                      <button type="button" class="contact-save">Save</button>
+                      <span class="contact-status"></span>
+                    </span>
+                  </li>
+                {% endfor %}
+              </ul>
+            {% endif %}
+          {% endif %}
+          <details>
+            <summary>Full transcript</summary>
+            {% if r.merged_segments %}
+              <div class="transcript" data-hash="{{ r.content_hash }}">
+                {% for seg in r.merged_segments %}
+                  <p class="{{ 'background-line' if seg.loudness_class == 'background' }}">{% if seg.loudness_class == 'background' %}<span class="background-tag" title="Classified as a quieter, more distant conversation -- excluded from the summary">background</span>{% endif %}<span class="speaker rename-speaker" data-speaker-id="{{ seg.speaker_id }}" title="Click to rename">{{ r.get('speaker_names', {}).get(seg.speaker_id) or ("Speaker " ~ seg.speaker_id) }}:</span> {{ seg.text }}</p>
+                {% endfor %}
+              </div>
+            {% else %}
+              <pre class="transcript">{{ r.transcript }}</pre>
+            {% endif %}
+          </details>
+          <div class="providers">
+            stt={{ r.stt_provider }} · llm={{ r.llm_provider }}
+            {% if r.notion_synced %}<span class="badge dest">Notion</span>{% endif %}
+            {% if r.notion_tasks_synced %}<span class="badge dest">Notion Tasks</span>{% endif %}
+            {% if r.notion_people_synced %}<span class="badge dest">Notion People</span>{% endif %}
+            {% if r.notion_events_synced %}<span class="badge dest">Notion Calendar</span>{% endif %}
+            {% if r.obsidian_synced %}<span class="badge dest">Obsidian</span>{% endif %}
+          </div>
+        </div>
+        </div>
+        {% elif r.status == "failed" %}
+          <p class="error-text">{{ r.error }}</p>
+          <p class="providers">Will retry automatically next sync cycle — audio is already saved, no need to re-record.</p>
+        {% else %}
+          <p class="providers">Audio synced, waiting to be transcribed and summarized&hellip;</p>
+        {% endif %}
+          </div>
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+  </div>
+
+  <div class="status-bar">
+    <span class="status-item">
+      <span class="status-dot" id="dot-device"></span>
+      <span id="label-device">{{ sync_transport|upper }}</span>
+    </span>
+    <span class="status-item">
+      <span class="status-dot" id="dot-sync"></span>
+      <span>Sync</span>
+      <span id="sync-progress" class="sync-progress"></span>
+    </span>
+  </div>
+
+  <!-- Manual email/LinkedIn entry for a stakeholder/speaker (see
+       POST /people/contact, notion_sync.set_person_contact_by_name) is
+       wired up in static/app.js as a delegated click handler on
+       #recordings, not here -- app.js replaces #recordings' innerHTML
+       every refresh() cycle, so per-element listeners attached at initial
+       page load would silently stop working the first time it refreshes. -->
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSIX manifest for a sideloaded (self-signed) Clicky package.
+
+  Two placeholders MUST be edited before this will build/sign correctly:
+    - Publisher attribute below (both on <Identity> and <PublisherDisplayName>)
+      must exactly match the Subject of whatever cert you sign the package
+      with (see build-msix.ps1, which generates a matching self-signed cert
+      automatically if you don't already have one; if you generate your
+      own cert instead, copy its Subject string here verbatim, including
+      the "CN=" prefix and comma-separated fields).
+    - Version number: bump this (fourth-quad "Build" segment is ignored by
+      Windows for install purposes, but bump something) every time you
+      rebuild and reinstall over an existing install, or Add-AppxPackage
+      will refuse a same-version reinstall.
+-->
+<Package
+    xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+    xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+    xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+    IgnorableNamespaces="uap rescap">
+
+  <Identity
+      Name="Clicky.VoiceMemoPipeline"
+      Publisher="CN=Clicky Dev"
+      Version="1.0.0.0" />
+
+  <Properties>
+    <DisplayName>Clicky</DisplayName>
+    <PublisherDisplayName>Clicky Dev</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22631.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="Clicky" Executable="Clicky.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+          DisplayName="Clicky"
+          Description="Voice-memo-to-Notion pipeline dashboard"
+          BackgroundColor="transparent"
+          Square150x150Logo="Assets\Square150x150Logo.png"
+          Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" Square310x310Logo="Assets\Square310x310Logo.png" />
+        <uap:SplashScreen Image="Assets\SplashScreen.png" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

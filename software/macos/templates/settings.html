@@ -1,0 +1,887 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Settings — Clicky Notes</title>
+  <style>
+    :root { --bg: #fff; --fg: #1a1a1a; --border: #ddd; --muted: #666; --error: #c0392b; --ok: #0a7; --card: transparent; --sidebar: #f5f5f5; --sidebar-active: #e8e8e8; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #121212; --fg: #eee; --border: #3a3a3a; --muted: #aaa; --error: #ff6b5e; --ok: #4fd6a0; --card: #1c1c1c; --sidebar: #1a1a1a; --sidebar-active: #2a2a2a; }
+    }
+    :root[data-theme="dark"] { --bg: #121212; --fg: #eee; --border: #3a3a3a; --muted: #aaa; --error: #ff6b5e; --ok: #4fd6a0; --card: #1c1c1c; --sidebar: #1a1a1a; --sidebar-active: #2a2a2a; }
+    :root[data-theme="light"] { --bg: #fff; --fg: #1a1a1a; --border: #ddd; --muted: #666; --error: #c0392b; --ok: #0a7; --card: transparent; --sidebar: #f5f5f5; --sidebar-active: #e8e8e8; }
+
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, sans-serif; margin: 0; background: var(--bg); color: var(--fg); display: flex; min-height: 100vh; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; padding: 0.9rem 1.25rem; border-bottom: 1px solid var(--border); }
+    .topbar h1 { font-size: 1.1rem; margin: 0; }
+
+    /* Site-wide left nav (templates/_nav.html) -- the outermost column;
+       Settings' own category sidebar (.sidebar below) is a second,
+       nested column to its right. */
+    .app-nav { width: 210px; flex-shrink: 0; background: var(--sidebar); border-right: 1px solid var(--border); padding: 0.75rem 0; }
+    .app-nav-item {
+      display: flex; align-items: center; gap: 0.6rem; padding: 0.6rem 1.1rem;
+      font-size: 0.9rem; color: var(--fg); text-decoration: none; border-left: 3px solid transparent;
+      background: none; border-top: none; border-right: none; border-bottom: none; width: 100%; text-align: left; cursor: pointer; font: inherit;
+    }
+    .app-nav-item .icon { font-size: 1.1rem; width: 1.3rem; text-align: center; }
+    .app-nav-item:hover { background: var(--sidebar-active); }
+    .app-nav-item.active { background: var(--sidebar-active); border-left-color: var(--ok); font-weight: 600; }
+    .app-nav-logout { margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 0.9rem; }
+
+    .settings-shell { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+    .layout { display: flex; flex: 1; min-height: 0; }
+    .sidebar { width: 210px; flex-shrink: 0; background: var(--sidebar); border-right: 1px solid var(--border); padding: 0.75rem 0; overflow-y: auto; }
+    .sidebar-group-label { padding: 0.9rem 1.1rem 0.3rem; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+    .sidebar-item {
+      display: flex; align-items: center; gap: 0.6rem; padding: 0.55rem 1.1rem; cursor: pointer;
+      font-size: 0.9rem; color: var(--fg); border-left: 3px solid transparent;
+    }
+    .sidebar-item .icon { font-size: 1.1rem; width: 1.3rem; text-align: center; }
+    .sidebar-item .status-dot { width: 7px; height: 7px; border-radius: 50%; margin-left: auto; background: var(--border); }
+    .sidebar-item .status-dot.connected { background: var(--ok); }
+    .sidebar-item:hover { background: var(--sidebar-active); }
+    .sidebar-item.active { background: var(--sidebar-active); border-left-color: var(--ok); font-weight: 600; }
+
+    .content { flex: 1; padding: 1.75rem 2rem; max-width: 680px; overflow-y: auto; }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .panel h2 { font-size: 1.15rem; margin: 0 0 0.3rem; }
+    .panel .desc { color: var(--muted); font-size: 0.85rem; margin-bottom: 1.25rem; line-height: 1.5; }
+
+    fieldset { border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.25rem; margin-bottom: 1rem; background: var(--card); }
+    legend { padding: 0 0.4rem; font-size: 0.85rem; color: var(--muted); }
+    label { display: block; margin: 0.75rem 0 0.25rem; font-size: 0.9rem; }
+    input, select, textarea { width: 100%; box-sizing: border-box; padding: 0.5rem; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--fg); font-family: inherit; }
+    button { padding: 0.6rem 1.1rem; margin-top: 1rem; border: none; border-radius: 6px; background: #0a7; color: #fff; font-weight: 600; cursor: pointer; font-size: 0.9rem; }
+    button.secondary { background: #888; }
+    .full-width { width: 100%; }
+    .saved { color: var(--ok); font-size: 0.85rem; margin-bottom: 1rem; }
+    .error { color: var(--error); font-size: 0.85rem; margin-bottom: 1rem; }
+    .step { color: var(--muted); font-size: 0.8rem; margin: 0.5rem 0 0; line-height: 1.5; }
+    .key-field { display: none; }
+    .key-field.active { display: block; }
+
+    .wifi-status { display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem; margin-bottom: 1rem; padding: 0.7rem 0.9rem; border: 1px solid var(--border); border-radius: 8px; background: var(--card); }
+    .wifi-status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); flex-shrink: 0; }
+    .wifi-status .dot.connected { background: var(--ok); }
+    .wifi-status .detail { color: var(--muted); font-size: 0.8rem; }
+    .ble-current { color: var(--ok); font-size: 0.85rem; margin-bottom: 0.75rem; }
+    .scan-row { display: flex; align-items: center; gap: 0.6rem; margin: 0.75rem 0; flex-wrap: wrap; }
+    .scan-row button { margin-top: 0; padding: 0.45rem 0.8rem; font-size: 0.85rem; }
+    .custom-status-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.6rem; }
+    .custom-status-row select { flex: 0 0 170px; width: auto; }
+    .custom-status-row input[type="text"] { flex: 1; }
+    .custom-status-row .remove-status-btn { margin-top: 0; padding: 0.4rem 0.7rem; flex-shrink: 0; }
+    #add-status-btn { margin-right: 0.6rem; }
+
+    /* Social Media Posting cards */
+    .post-recording { margin-bottom: 1.1rem; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+    .post-recording-title { padding: 0.65rem 0.9rem; font-weight: 600; border-bottom: 1px solid var(--border); background: var(--card); font-size: 0.9rem; }
+    .post-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1px; background: var(--border); }
+    .post-card { background: var(--bg); padding: 0.8rem 0.9rem; }
+    .post-card .platform { font-weight: 600; text-transform: capitalize; margin-bottom: 0.3rem; font-size: 0.85rem; }
+    .post-status { display: inline-block; font-size: 0.72rem; padding: 0.12rem 0.45rem; border-radius: 999px; border: 1px solid var(--border); margin-bottom: 0.4rem; }
+    .post-status.published { color: var(--ok); border-color: var(--ok); }
+    .post-status.failed, .post-status.error { color: var(--error); border-color: var(--error); }
+    .post-body-preview { font-size: 0.8rem; color: var(--muted); max-height: 4em; overflow: hidden; margin-bottom: 0.4rem; }
+    .post-error-text { font-size: 0.75rem; color: var(--error); margin-top: 0.3rem; }
+    a.post-url { font-size: 0.78rem; }
+    .empty { padding: 1.5rem 0; text-align: center; color: var(--muted); font-size: 0.9rem; }
+    button.md-download { font-size: 0.75rem; padding: 0.3rem 0.6rem; border: 1px solid var(--border); border-radius: 6px; background: var(--card); color: var(--fg); cursor: pointer; margin-top: 0.3rem; }
+  </style>
+</head>
+<body>
+  {% include "_nav.html" %}
+  <div class="settings-shell">
+  <div class="topbar">
+    <h1>Settings</h1>
+  </div>
+  <div class="layout">
+    <div class="sidebar">
+      <div class="sidebar-group-label">General</div>
+      <div class="sidebar-item" data-panel="device">
+        <span class="icon">📡</span> Device
+      </div>
+      <div class="sidebar-item" data-panel="custom-statuses">
+        <span class="icon">🙂</span> Custom Statuses
+      </div>
+      <div class="sidebar-item" data-panel="providers">
+        <span class="icon">🤖</span> Providers
+      </div>
+      <div class="sidebar-item" data-panel="notifications">
+        <span class="icon">🔔</span> Notifications
+      </div>
+      <div class="sidebar-item" data-panel="voice-id">
+        <span class="icon">🎙️</span> Speaker Identification
+        <span class="status-dot {{ 'connected' if current.get('voice_id_enabled', True) }}"></span>
+      </div>
+
+      <div class="sidebar-group-label">Integrations</div>
+      <div class="sidebar-item" data-panel="notion">
+        <span class="icon">📝</span> Notion
+        <span class="status-dot {{ 'connected' if current.notion_token }}"></span>
+      </div>
+      <div class="sidebar-item" data-panel="google">
+        <span class="icon">📅</span> Google
+        <span class="status-dot {{ 'connected' if google_connected }}"></span>
+      </div>
+      <div class="sidebar-item" data-panel="obsidian">
+        <span class="icon">🗂️</span> Obsidian
+        <span class="status-dot {{ 'connected' if current.obsidian_vault_path }}"></span>
+      </div>
+      <div class="sidebar-item" data-panel="social-accounts">
+        <span class="icon">📣</span> Social Media Accounts
+        <span class="status-dot {{ 'connected' if current.notion_publications_database_id }}"></span>
+      </div>
+      <div class="sidebar-item" data-panel="people">
+        <span class="icon">👥</span> People
+      </div>
+
+      <div class="sidebar-group-label">Account</div>
+      <div class="sidebar-item" data-panel="feedback">
+        <span class="icon">💬</span> Feedback
+      </div>
+      <div class="sidebar-item" data-panel="account">
+        <span class="icon">🔒</span> Account
+      </div>
+    </div>
+
+    <div class="content">
+      {% if saved %}<div class="saved">Saved.</div>{% endif %}
+      {% if setup_error %}<div class="error">Failed: {{ setup_error }}</div>{% endif %}
+
+      <!-- Device: sync transport, WiFi connection, BLE pairing -->
+      <div class="panel" data-panel="device">
+        <h2>Device</h2>
+        <p class="desc">How the dashboard reaches your e-paper device — over your WiFi network, or directly via Bluetooth (works even if the device can't join your router, e.g. a 2.4GHz-only dual-band situation).</p>
+
+        <form method="post" action="/settings/transport">
+          <fieldset>
+            <legend>Sync transport</legend>
+            <select name="sync_transport">
+              <option value="wifi" {{ "selected" if current.sync_transport in (None, "wifi") }}>WiFi (device joins your network)</option>
+              <option value="ble" {{ "selected" if current.sync_transport == "ble" }}>Bluetooth (works even if WiFi can't connect)</option>
+            </select>
+            <button type="submit">Save</button>
+          </fieldset>
+        </form>
+
+        <fieldset>
+          <legend>WiFi connection</legend>
+          <div class="wifi-status" id="wifi-status">
+            <span class="dot" id="wifi-dot"></span>
+            <span id="wifi-text">Checking device WiFi status&hellip;</span>
+          </div>
+          {% if wifi_msg %}<div class="saved">{{ wifi_msg }}</div>{% endif %}
+          <p class="step">Sends new credentials to the device over Bluetooth (works regardless of the transport selected above, and even the first time — the device doesn't need to already be on a network). The device saves them and reconnects automatically; refresh this page in a few seconds to see the result.</p>
+          <div class="scan-row">
+            <button type="button" class="secondary" id="scan-btn" onclick="scanWifi()">Scan for networks</button>
+            <button type="button" class="secondary" id="use-mac-btn" onclick="useMacNetwork()">Use my Mac's network</button>
+            <span class="step" id="scan-status"></span>
+          </div>
+          <form method="post" action="/settings/wifi/connect">
+            <label for="ssid">Network name (SSID)</label>
+            <input type="text" id="ssid" name="ssid" list="wifi-networks" autocomplete="off" required>
+            <datalist id="wifi-networks"></datalist>
+            <label for="wifi_password">Password</label>
+            <input type="password" id="wifi_password" name="password">
+            <p class="step">"Use my Mac's network" only fills in the network name — your Mac's WiFi password lives in Keychain behind its own unlock prompt, so you'll still need to type it here yourself.</p>
+            <button type="submit">Connect device to WiFi</button>
+          </form>
+        </fieldset>
+
+        <fieldset>
+          <legend>Bluetooth pairing</legend>
+          {% if current.paired_ble_address %}
+            <div class="ble-current">Currently paired: {{ current.paired_ble_address }}</div>
+          {% else %}
+            <p class="step">Not paired yet — if only one device is in range this isn't required (sync works unambiguously either way), but pairing skips the scan step on every reconnect.</p>
+          {% endif %}
+          <a href="/pair?next=/settings%3Fpanel%3Ddevice"><button type="button" class="secondary">Scan &amp; pair a BLE device</button></a>
+        </fieldset>
+      </div>
+
+      <!-- Custom Statuses: user-defined device screens, cycled via BOOT button after the built-in ones -->
+      <div class="panel" data-panel="custom-statuses">
+        <h2>Custom Statuses</h2>
+        <p class="desc">
+          Add your own status screens for the device — an icon in the top third, your message wrapped in the
+          bottom two-thirds, same layout as the built-in idle screen. They show up after the built-in statuses
+          when you click BOOT to cycle, and persist on the device even if it's offline. Up to 5.
+        </p>
+        {% if wifi_msg %}<div class="saved">{{ wifi_msg }}</div>{% endif %}
+
+        <form method="post" action="/settings/custom-statuses" id="custom-statuses-form">
+          <fieldset>
+            <legend>Statuses</legend>
+            <div id="custom-status-rows">
+              {% for cs in (current.custom_statuses or []) %}
+                <div class="custom-status-row">
+                  <select name="icon">
+                    <option value="round" {{ "selected" if cs.icon == "round" }}>😊 Round / Happy</option>
+                    <option value="closed" {{ "selected" if cs.icon == "closed" }}>😴 Closed / Sleepy</option>
+                    <option value="x" {{ "selected" if cs.icon == "x" }}>❌ X / Out</option>
+                    <option value="narrow" {{ "selected" if cs.icon == "narrow" }}>😑 Narrow / Squint</option>
+                  </select>
+                  <input type="text" name="text" value="{{ cs.text }}" maxlength="60" placeholder="Status message">
+                  <button type="button" class="secondary remove-status-btn" onclick="this.parentElement.remove()">&minus;</button>
+                </div>
+              {% endfor %}
+            </div>
+            <button type="button" class="secondary" id="add-status-btn">+ Add status</button>
+            <button type="submit">Save &amp; sync to device</button>
+          </fieldset>
+        </form>
+        <form method="post" action="/settings/custom-statuses/clear" onsubmit="return confirm('Clear all custom statuses? This removes them from the device too.');">
+          <button type="submit" class="delete-device-btn danger">Clear all statuses</button>
+        </form>
+        <script>
+          document.getElementById("add-status-btn").addEventListener("click", () => {
+            const rows = document.getElementById("custom-status-rows");
+            if (rows.children.length >= 5) return;
+            const row = document.createElement("div");
+            row.className = "custom-status-row";
+            row.innerHTML = `
+              <select name="icon">
+                <option value="round">😊 Round / Happy</option>
+                <option value="closed">😴 Closed / Sleepy</option>
+                <option value="x">❌ X / Out</option>
+                <option value="narrow">😑 Narrow / Squint</option>
+              </select>
+              <input type="text" name="text" maxlength="60" placeholder="Status message">
+              <button type="button" class="secondary remove-status-btn" onclick="this.parentElement.remove()">&minus;</button>
+            `;
+            rows.appendChild(row);
+          });
+        </script>
+      </div>
+
+      <!-- Notifications: AI-pager sources -->
+      <div class="panel" data-panel="notifications">
+        <h2>Notifications</h2>
+        <p class="desc">Each enabled source is pushed to the device as it arrives — shown on the e-paper with a click, until dismissed with the BOOT button.</p>
+
+        <form method="post" action="/settings/notifications">
+          <fieldset>
+            <legend>Sources</legend>
+            <label>
+              <input type="checkbox" name="notify_gmail_enabled" value="true" {{ "checked" if current.notify_gmail_enabled }} style="width:auto;display:inline-block;vertical-align:middle;">
+              Gmail (unread inbox) — needs Google connected under Integrations
+            </label>
+            <p class="step">{{ "Connected." if google_connected else "Not connected — visit the Google panel to connect first." }}</p>
+
+            <label>
+              <input type="checkbox" name="notify_calendar_enabled" value="true" {{ "checked" if current.notify_calendar_enabled }} style="width:auto;display:inline-block;vertical-align:middle;">
+              Calendar (event starting soon) — same Google connection as above
+            </label>
+
+            <label>
+              <input type="checkbox" name="notify_mac_enabled" value="true" {{ "checked" if current.notify_mac_enabled }} style="width:auto;display:inline-block;vertical-align:middle;">
+              Mac notifications (all apps — Messages, Slack, etc.)
+            </label>
+            <p class="step">Reads this Mac's own Notification Center history directly — needs <strong>Full Disk Access</strong> granted to this app (System Settings → Privacy &amp; Security → Full Disk Access). Without it, this source silently sees nothing rather than erroring.</p>
+          </fieldset>
+
+          <fieldset>
+            <legend>Importance filtering</legend>
+            <p class="step">Applies to Gmail and Mac notifications only — Calendar reminders always push through unfiltered. Each one is judged by AI before reaching the device; anyone on the VIP list below always gets through regardless.</p>
+
+            <label>
+              Sensitivity
+              <select name="notification_sensitivity">
+                <option value="low" {{ "selected" if current.notification_sensitivity == "low" }}>Low — only skip obvious noise (newsletters, receipts)</option>
+                <option value="medium" {{ "selected" if not current.notification_sensitivity or current.notification_sensitivity == "medium" }}>Medium — skip routine, push anything that looks actionable</option>
+                <option value="high" {{ "selected" if current.notification_sensitivity == "high" }}>High — only push what you'd want to be interrupted for right now</option>
+              </select>
+            </label>
+
+            <label>
+              VIP list (one name or email per line — always pushed, skips the AI check)
+              <textarea name="notification_vip_list" rows="3" placeholder="jeremy@example.com&#10;Sanchit">{{ current.notification_vip_list or "" }}</textarea>
+            </label>
+
+            <button type="submit">Save</button>
+          </fieldset>
+        </form>
+      </div>
+
+      <!-- Speaker Identification: local speaker-voiceprint matching -->
+      <div class="panel" data-panel="voice-id">
+        <h2>Speaker Identification</h2>
+        <p class="desc">
+          Recognizes a person's voice across recordings and suggests their name automatically — entirely local,
+          embeddings never leave this device (unlike transcription/summarization, which do go to whichever cloud
+          provider you've configured under Providers). On by default: this pulls in a real ML dependency
+          (PyTorch + SpeechBrain), noticeably larger than the rest of the app, and downloads a ~80MB model the
+          first time it's used.
+        </p>
+        <p class="desc">
+          Your own voice is enrolled automatically from meeting recordings (no action needed). Everyone else is
+          enrolled the first time you name a speaker — future recordings then prefill a recognized speaker's
+          name as a suggestion (never silently applied); typing a different name corrects it and re-trains that
+          voice going forward.
+        </p>
+
+        <form method="post" action="/settings/voice-id">
+          <fieldset>
+            <legend>Enable</legend>
+            <label>
+              <input type="checkbox" name="voice_id_enabled" value="true" {{ "checked" if current.get('voice_id_enabled', True) }} style="width:auto;display:inline-block;vertical-align:middle;">
+              Recognize speakers from voice (experimental, fully local)
+            </label>
+            <button type="submit">Save</button>
+          </fieldset>
+        </form>
+
+        <fieldset>
+          <legend>Enrolled voices ({{ voiceprints | length }})</legend>
+          {% if not voiceprints %}
+            <p class="step">Nobody enrolled yet.</p>
+          {% else %}
+            <ul class="action-items">
+              {% for key, entry in voiceprints.items() %}
+                <li>
+                  <span class="speaker-slot-label">{{ entry.display_name or key }}</span>
+                  <span class="speaker-slot-status">&mdash; {{ entry.sample_count }} sample{{ "s" if entry.sample_count != 1 }}</span>
+                  <form method="post" action="/settings/voice-id/forget" style="display:inline;">
+                    <input type="hidden" name="person_key" value="{{ key }}">
+                    <button type="submit" class="delete-btn">Forget</button>
+                  </form>
+                </li>
+              {% endfor %}
+            </ul>
+            <form method="post" action="/settings/voice-id/forget-all" onsubmit="return confirm('Forget every enrolled voice? This can\'t be undone.');">
+              <button type="submit" class="delete-device-btn danger">Forget everyone</button>
+            </form>
+          {% endif %}
+        </fieldset>
+      </div>
+
+      <!-- Providers: transcription/summarization -->
+      <div class="panel" data-panel="providers">
+        <h2>Providers</h2>
+        <p class="desc">Transcription and summarization are independent choices — mix e.g. local transcription with a cloud LLM.</p>
+
+        <form method="post" action="/setup">
+          <input type="hidden" name="password" value="">
+          <input type="hidden" name="sync_transport" value="{{ current.sync_transport or 'wifi' }}">
+          <fieldset>
+            <legend>Transcription &amp; summarization</legend>
+            <label for="stt_provider">Transcription (speech-to-text)</label>
+            <select id="stt_provider" name="stt_provider" onchange="updateKeyFields()">
+              <option value="mistral" {{ "selected" if current.stt_provider == "mistral" }}>Mistral (Voxtral)</option>
+              <option value="openai" {{ "selected" if current.stt_provider == "openai" }}>OpenAI (Whisper)</option>
+              <option value="deepgram" {{ "selected" if current.stt_provider == "deepgram" }}>Deepgram (Nova-3, higher accuracy)</option>
+              <option value="local" {{ "selected" if current.stt_provider == "local" }}>Local (faster-whisper, free)</option>
+            </select>
+
+            <label for="llm_provider">Summarization (LLM)</label>
+            <select id="llm_provider" name="llm_provider" onchange="updateKeyFields()">
+              <option value="mistral" {{ "selected" if current.llm_provider == "mistral" }}>Mistral</option>
+              <option value="openai" {{ "selected" if current.llm_provider == "openai" }}>OpenAI</option>
+              <option value="anthropic" {{ "selected" if current.llm_provider == "anthropic" }}>Anthropic (Claude)</option>
+              <option value="local" {{ "selected" if current.llm_provider == "local" }}>Local (Ollama, free)</option>
+            </select>
+
+            <div id="mistral-key" class="key-field">
+              <label for="mistral_api_key">Mistral API key {{ "(already saved)" if current.mistral_api_key }}</label>
+              <input type="password" id="mistral_api_key" name="mistral_api_key" placeholder="{{ '••••••••' if current.mistral_api_key else '' }}">
+            </div>
+            <div id="openai-key" class="key-field">
+              <label for="openai_api_key">OpenAI API key {{ "(already saved)" if current.openai_api_key }}</label>
+              <input type="password" id="openai_api_key" name="openai_api_key" placeholder="{{ '••••••••' if current.openai_api_key else '' }}">
+            </div>
+            <div id="anthropic-key" class="key-field">
+              <label for="anthropic_api_key">Anthropic API key {{ "(already saved)" if current.anthropic_api_key }}</label>
+              <input type="password" id="anthropic_api_key" name="anthropic_api_key" placeholder="{{ '••••••••' if current.anthropic_api_key else '' }}">
+            </div>
+            <div id="deepgram-key" class="key-field">
+              <label for="deepgram_api_key">Deepgram API key {{ "(already saved)" if current.deepgram_api_key }}</label>
+              <input type="password" id="deepgram_api_key" name="deepgram_api_key" placeholder="{{ '••••••••' if current.deepgram_api_key else '' }}">
+            </div>
+            <button type="submit">Save</button>
+          </fieldset>
+        </form>
+
+        <form method="post" action="/settings/audio">
+          <fieldset>
+            <legend>Crosstalk filtering</legend>
+            <p class="step">
+              At a noisy venue, the device's single mic can pick up a nearby unrelated conversation alongside the
+              real one. This classifies noticeably quieter/more-distant speech as background and excludes it from
+              the summary (transcript still shows everything). It's a mitigation, not true speaker separation —
+              two people talking over each other at similar volume can't be untangled by this. Disable it if it
+              ever misfires on a legitimately quiet-but-relevant speaker.
+            </p>
+            <label>
+              <input type="checkbox" name="filter_background_conversations" value="true"
+                     {{ "checked" if current.get("filter_background_conversations", True) }}
+                     style="width:auto;display:inline-block;vertical-align:middle;">
+              Filter likely background conversations (experimental)
+            </label>
+            <button type="submit">Save</button>
+          </fieldset>
+        </form>
+      </div>
+
+      <!-- Notion -->
+      <div class="panel" data-panel="notion">
+        <h2>Notion</h2>
+        <p class="desc">Every processed recording is pushed here automatically once configured — Notes, plus optional Tasks/People/Calendar/Journal databases.</p>
+
+        <form method="post" action="/integrations/setup-notion">
+          <fieldset>
+            <legend>Auto-setup (recommended)</legend>
+            <p class="step">
+              Creates the Notes/Tasks/People/Calendar databases automatically, wired up with the right columns and relations.<br><br>
+              1. In Notion, create a Teamspace for this (sidebar → Teamspaces → <strong>+</strong>) — the public API can't create a Teamspace itself.<br>
+              2. Inside it, create one blank page (any name, e.g. "Clicky").<br>
+              3. Create an integration at <a href="https://www.notion.so/my-integrations" target="_blank">notion.so/my-integrations</a>, copy its "Internal Integration Token".<br>
+              4. Share that page with the integration (••• menu on the page → Connections → your integration).<br>
+              5. Paste the token and the page's ID below, then run setup.<br><br>
+              <strong>Only run this once per workspace</strong> — running it again creates a duplicate set of databases.
+            </p>
+            <label for="setup_notion_token">Integration token {{ "(already saved)" if current.notion_token }}</label>
+            <input type="password" id="setup_notion_token" name="notion_token" placeholder="{{ '••••••••' if current.notion_token else 'secret_...' }}" required>
+            <label for="notion_parent_page_id">Page ID (the blank page inside your Teamspace)</label>
+            <input type="text" id="notion_parent_page_id" name="notion_parent_page_id" placeholder="32-character ID from the page URL, or paste the full URL" required>
+            <button type="submit">Create Notion workspace</button>
+          </fieldset>
+        </form>
+
+        <form method="post" action="/integrations">
+          <input type="hidden" name="panel" value="notion">
+          <fieldset>
+            <legend>Manual (only needed if you skipped auto-setup)</legend>
+            <p class="step">
+              1. Create an integration at <a href="https://www.notion.so/my-integrations" target="_blank">notion.so/my-integrations</a>, copy its token.<br>
+              2. Create (or pick) a database, share it with that integration (••• → Connections).<br>
+              3. Copy the database ID from its URL (the 32-character part before any "?").
+            </p>
+            <label for="notion_token">Integration token {{ "(already saved)" if current.notion_token }}</label>
+            <input type="password" id="notion_token" name="notion_token" placeholder="{{ '••••••••' if current.notion_token else 'secret_...' }}">
+            <label for="notion_database_id">Notes database ID</label>
+            <input type="text" id="notion_database_id" name="notion_database_id" value="{{ current.notion_database_id or '' }}" placeholder="32-character ID, or paste the full URL">
+          </fieldset>
+
+          <fieldset>
+            <legend>Tasks (optional)</legend>
+            <p class="step">
+              One page per action item. Columns: <strong>Name</strong> (title), <strong>Status</strong> (status),
+              <strong>Due Date</strong> (date), <strong>Assignee</strong> (person — exact name match only),
+              <strong>Related Note</strong> (relation → Notes). Enable <strong>"Read user information"</strong> under
+              your integration's Capabilities for Assignee matching.
+            </p>
+            <label for="notion_tasks_database_id">Tasks database ID</label>
+            <input type="text" id="notion_tasks_database_id" name="notion_tasks_database_id" value="{{ current.notion_tasks_database_id or '' }}" placeholder="32-character ID, or paste the full URL">
+          </fieldset>
+
+          <fieldset>
+            <legend>People (optional)</legend>
+            <p class="step">
+              One page per person mentioned. Columns: <strong>Name</strong> (title), <strong>Note</strong> (text),
+              <strong>Email</strong> (email — matched against calendar attendees so recordings with the same person
+              stay linked to one page), <strong>Related Note</strong> (relation → Notes).
+            </p>
+            <label for="notion_people_database_id">People database ID</label>
+            <input type="text" id="notion_people_database_id" name="notion_people_database_id" value="{{ current.notion_people_database_id or '' }}" placeholder="32-character ID, or paste the full URL">
+          </fieldset>
+
+          <fieldset>
+            <legend>Calendar (optional)</legend>
+            <p class="step">
+              One page per calendar event mentioned. Columns: <strong>Name</strong> (title), <strong>Date</strong> (date), <strong>Related Note</strong> (relation → Notes).
+            </p>
+            <label for="notion_events_database_id">Calendar database ID</label>
+            <input type="text" id="notion_events_database_id" name="notion_events_database_id" value="{{ current.notion_events_database_id or '' }}" placeholder="32-character ID, or paste the full URL">
+          </fieldset>
+
+          <fieldset>
+            <legend>Journal (optional)</legend>
+            <p class="step">
+              Self-reflective recordings (no tasks, no one else substantively involved) get pushed here in addition to Notes.
+              Point this at Notion's own "Journal" template, or any database with a title and a Date property.
+            </p>
+            <label for="notion_journal_database_id">Journal database ID</label>
+            <input type="text" id="notion_journal_database_id" name="notion_journal_database_id" value="{{ current.notion_journal_database_id or '' }}" placeholder="32-character ID, or paste the full URL">
+          </fieldset>
+
+          <button type="submit" class="full-width">Save Notion settings</button>
+        </form>
+      </div>
+
+      <!-- Google -->
+      <div class="panel" data-panel="google">
+        <h2>Google</h2>
+        <p class="desc">
+          Reads your calendar to auto-detect meetings (Meet or Teams links — Teams works fine even on a Google
+          calendar) and pull attendee names/emails for better speaker naming and Notion People matching. Also lets
+          you send a summary email, create a Google Task, or book a follow-up event after a meeting — nothing is
+          ever sent without you clicking Approve on the dashboard first.
+        </p>
+        {% if not google_configured %}
+          <p class="error">Google integration isn't set up for this build yet — that's a one-time step for the app's developer, not something you need to do. Check back after an update.</p>
+        {% elif google_connected %}
+          <p class="saved">✓ Connected</p>
+          <form method="post" action="/google/disconnect"><button type="submit" class="secondary">Disconnect</button></form>
+        {% else %}
+          <a href="/google/connect" style="text-decoration:none;"><button type="button">Connect Google Calendar</button></a>
+        {% endif %}
+      </div>
+
+      <!-- Obsidian -->
+      <div class="panel" data-panel="obsidian">
+        <h2>Obsidian</h2>
+        <p class="desc">
+          No account needed — everything is written as markdown files directly into your vault folder on disk;
+          Obsidian picks them up automatically. Full parity with Notion: a note per recording (vault root),
+          plus Tasks/People/Calendar notes, a Journal note for journal-classified recordings, and a Publications
+          note per recording for social posts. Approvals/scheduling use Obsidian's Properties panel — checkboxes
+          like <code>approve_send</code> or <code>approve_linkedin</code> and date pickers like
+          <code>linkedin_scheduled_at</code> are read back automatically. Check the
+          <code>generate_social_media</code> checkbox on a recording's note (or its Journal note) to generate
+          social posts on demand.
+        </p>
+        <form method="post" action="/integrations">
+          <input type="hidden" name="panel" value="obsidian">
+          <fieldset>
+            <legend>Vault folder</legend>
+            <label for="obsidian_vault_path">Vault folder path</label>
+            <input type="text" id="obsidian_vault_path" name="obsidian_vault_path" value="{{ current.obsidian_vault_path or '' }}" placeholder="/Users/you/Documents/MyVault">
+          </fieldset>
+          <button type="submit" class="full-width">Save Obsidian settings</button>
+        </form>
+      </div>
+
+      <!-- People: cross-recording identity linking / duplicate merge -->
+      <div class="panel" data-panel="people">
+        <h2>People</h2>
+        <p class="desc">
+          Adding a stakeholder's email or LinkedIn (from a recording's Stakeholders list) links them across
+          recordings even when their name is spelled differently each time -- contact info wins over name
+          matching. This scans for existing People pages that already share an email/LinkedIn under different
+          names, so you can merge them.
+        </p>
+        <button type="button" id="scan-duplicates-btn" class="secondary">Scan for duplicates</button>
+        <div id="duplicates-list"></div>
+      </div>
+
+      <!-- Social Media Accounts: credentials/connections -->
+      <div class="panel" data-panel="social-accounts">
+        <h2>Social Media Accounts</h2>
+        <p class="desc">
+          Journal-type recordings get turned into a long-form post plus a short LinkedIn/X teaser linking to it.
+          Approve, edit, and schedule each one from Notion's <strong>Publications</strong> database — a checkbox,
+          a date/time, and a "Post URL" that fills in once published. See <a href="/social">Social Media Posting</a>
+          (site nav, left) for a read-only view grouping each recording's posts together.
+        </p>
+
+        {% if not current.notion_publications_database_id %}
+        <form method="post" action="/integrations/setup-publications">
+          <fieldset>
+            <legend>One-time setup</legend>
+            <p class="step">Requires Notion (Notes database) already configured. Creates a "Publications" database under the same parent page.</p>
+            <label for="social_notion_parent_page_id">Page ID (same parent page as your other databases)</label>
+            <input type="text" id="social_notion_parent_page_id" name="notion_parent_page_id" placeholder="32-character ID, or paste the full URL" required>
+            <button type="submit">Create Publications database</button>
+          </fieldset>
+        </form>
+        {% else %}
+        <p class="saved">✓ Publications database configured</p>
+        {% endif %}
+
+        <fieldset>
+          <legend>LinkedIn</legend>
+          <p class="step">
+            Posting to your own profile is self-serve — no partner review needed. Register an app at
+            <a href="https://www.linkedin.com/developers/apps" target="_blank">linkedin.com/developers/apps</a>
+            with the <strong>Share on LinkedIn</strong> product added (grants <code>w_member_social</code>), and
+            add this redirect URL: <code>{{ request.url_for('linkedin_callback') }}</code>
+          </p>
+          <form method="post" action="/integrations">
+            <input type="hidden" name="panel" value="social-accounts">
+            <label for="linkedin_client_id">Client ID</label>
+            <input type="text" id="linkedin_client_id" name="linkedin_client_id" value="{{ current.linkedin_client_id or '' }}">
+            <label for="linkedin_client_secret">Client Secret {{ "(already saved)" if current.linkedin_client_secret }}</label>
+            <input type="password" id="linkedin_client_secret" name="linkedin_client_secret" placeholder="{{ '••••••••' if current.linkedin_client_secret else '' }}">
+            <button type="submit">Save LinkedIn app credentials</button>
+          </form>
+          {% if linkedin_configured %}
+            {% if linkedin_connected %}
+              <p class="saved">✓ Connected</p>
+              <form method="post" action="/linkedin/disconnect"><button type="submit" class="secondary">Disconnect</button></form>
+            {% else %}
+              <a href="/linkedin/connect" style="text-decoration:none;"><button type="button">Connect LinkedIn</button></a>
+            {% endif %}
+          {% endif %}
+        </fieldset>
+
+        <fieldset>
+          <legend>X</legend>
+          <p class="step">
+            App registration is instant/self-serve, but as of Feb 2026 X charges per post (~$0.015, ~$0.20 with a
+            link) — there is no free posting tier. Register an app at
+            <a href="https://developer.x.com" target="_blank">developer.x.com</a> (OAuth 2.0, confidential client),
+            add this redirect URL: <code>{{ request.url_for('x_callback') }}</code>
+          </p>
+          <form method="post" action="/integrations">
+            <input type="hidden" name="panel" value="social-accounts">
+            <label for="x_client_id">Client ID</label>
+            <input type="text" id="x_client_id" name="x_client_id" value="{{ current.x_client_id or '' }}">
+            <label for="x_client_secret">Client Secret {{ "(already saved)" if current.x_client_secret }}</label>
+            <input type="password" id="x_client_secret" name="x_client_secret" placeholder="{{ '••••••••' if current.x_client_secret else '' }}">
+            <button type="submit">Save X app credentials</button>
+          </form>
+          {% if x_configured %}
+            {% if x_connected %}
+              <p class="saved">✓ Connected</p>
+              <form method="post" action="/x/disconnect"><button type="submit" class="secondary">Disconnect</button></form>
+            {% else %}
+              <a href="/x/connect" style="text-decoration:none;"><button type="button">Connect X</button></a>
+            {% endif %}
+          {% endif %}
+        </fieldset>
+
+        <fieldset>
+          <legend>Substack ⚠️ unofficial</legend>
+          <p class="step" style="color: var(--error);">
+            Substack has no official API. This uses an unsupported, reverse-engineered library that drives
+            Substack's own internal endpoints via your session cookie — it can break without notice on any
+            Substack frontend change, and automated use of internal endpoints likely violates Substack's Terms of
+            Service (including account-level risk). Only proceed if you accept that risk.
+          </p>
+          <form method="post" action="/integrations">
+            <input type="hidden" name="panel" value="social-accounts">
+            <label for="substack_publication_url">Your publication URL</label>
+            <input type="text" id="substack_publication_url" name="substack_publication_url" value="{{ current.substack_publication_url or '' }}" placeholder="https://yourname.substack.com">
+            <label for="substack_session_cookie">Session cookie {{ "(already saved)" if substack_connected }}</label>
+            <input type="password" id="substack_session_cookie" name="substack_session_cookie" placeholder="{{ '••••••••' if substack_connected else 'substack.sid value from your browser' }}">
+            <button type="submit">Save Substack credentials</button>
+          </form>
+        </fieldset>
+
+        <fieldset>
+          <legend>Medium — manual only</legend>
+          <p class="step">
+            Medium closed new API integrations in Jan 2025 — no automated publish path exists. Each recording's
+            Medium draft gets a "Download markdown" button under <a href="/social">Social Media Posting</a> (site
+            nav, left); paste it into Medium's own editor or
+            <a href="https://help.medium.com/hc/en-us/articles/214550207-Importing-a-post-to-Medium" target="_blank">Import a story</a>,
+            then paste the resulting URL into that post's "Post URL" property in Notion — that's what tells the
+            LinkedIn/X teaser it's safe to go out with a real link.
+          </p>
+        </fieldset>
+      </div>
+
+      <!-- Feedback / feature requests -->
+      <div class="panel" data-panel="feedback">
+        <h2>Feedback</h2>
+        <p class="desc">Sent directly to the developer. Also counted in the periodic usage digest -- see the usage summary emailed automatically once a day (requires Google connected).</p>
+        <form method="post" action="/feedback">
+          <fieldset>
+            <legend>Send a message</legend>
+            <label for="feedback_kind">Type</label>
+            <select id="feedback_kind" name="kind">
+              <option value="feedback">Feedback</option>
+              <option value="feature_request">Feature request</option>
+              <option value="bug_report">Bug report</option>
+            </select>
+            <label for="feedback_message">Message</label>
+            <textarea id="feedback_message" name="message" rows="6" placeholder="What's working, what isn't, what you'd like to see..." required></textarea>
+            {% if not google_connected %}
+              <p class="step">Google isn't connected -- this'll open your default mail app instead of sending directly.</p>
+            {% endif %}
+            <button type="submit" class="full-width">Send</button>
+          </fieldset>
+        </form>
+      </div>
+
+      <!-- Account: password -->
+      <div class="panel" data-panel="account">
+        <h2>Account</h2>
+        <p class="desc">Password protecting this dashboard, your name, and this device's ID.</p>
+
+        <form method="post" action="/setup">
+          <input type="hidden" name="stt_provider" value="{{ current.stt_provider or 'mistral' }}">
+          <input type="hidden" name="llm_provider" value="{{ current.llm_provider or 'mistral' }}">
+          <input type="hidden" name="sync_transport" value="{{ current.sync_transport or 'wifi' }}">
+          <fieldset>
+            <legend>Owner</legend>
+            <label for="owner_name">Your name</label>
+            <input type="text" id="owner_name" name="owner_name" value="{{ current.owner_name or '' }}" placeholder="e.g. Sanchit Gupta">
+            <p class="hint">Used to label the daily usage-digest email and (if voice recognition is enabled) as your own recognized speaker name.</p>
+          </fieldset>
+          <fieldset>
+            <legend>Password</legend>
+            <label for="password">New password (leave blank to keep current)</label>
+            <input type="password" id="password" name="password">
+          </fieldset>
+          <button type="submit">Save</button>
+        </form>
+
+        <fieldset>
+          <legend>Device ID</legend>
+          <p class="desc">Included in the daily usage-digest email so you can tell which device it's reporting on. Generated once, doesn't change.</p>
+          <code>{{ device_id }}</code>
+        </fieldset>
+      </div>
+    </div>
+  </div>
+  </div>
+
+  <script>
+    const defaultPanel = {{ (active_panel or "device") | tojson }};
+    function showPanel(name) {
+      document.querySelectorAll(".sidebar-item").forEach(el => el.classList.toggle("active", el.dataset.panel === name));
+      document.querySelectorAll(".panel").forEach(el => el.classList.toggle("active", el.dataset.panel === name));
+    }
+    document.querySelectorAll(".sidebar-item").forEach(el => {
+      el.addEventListener("click", () => showPanel(el.dataset.panel));
+    });
+    showPanel(defaultPanel);
+
+    function updateKeyFields() {
+      const needed = new Set();
+      const sttNeeds = {mistral: "mistral-key", openai: "openai-key", deepgram: "deepgram-key"};
+      const llmNeeds = {mistral: "mistral-key", openai: "openai-key", anthropic: "anthropic-key"};
+      const stt = document.getElementById("stt_provider").value;
+      const llm = document.getElementById("llm_provider").value;
+      if (sttNeeds[stt]) needed.add(sttNeeds[stt]);
+      if (llmNeeds[llm]) needed.add(llmNeeds[llm]);
+      for (const id of ["mistral-key", "openai-key", "anthropic-key", "deepgram-key"]) {
+        document.getElementById(id).classList.toggle("active", needed.has(id));
+      }
+    }
+    updateKeyFields();
+
+    // Live device WiFi status -- a BLE read, so give it a moment and don't
+    // block the rest of the page on it.
+    async function refreshWifiStatus() {
+      const dot = document.getElementById("wifi-dot");
+      const text = document.getElementById("wifi-text");
+      try {
+        const resp = await fetch("/api/wifi-status");
+        const data = await resp.json();
+        if (data.error) {
+          dot.classList.remove("connected");
+          text.textContent = "Could not reach device over Bluetooth (" + data.error + ")";
+          return;
+        }
+        dot.classList.toggle("connected", !!data.connected);
+        if (data.connected) {
+          text.textContent = `Connected to "${data.ssid}" (${data.ip})`;
+        } else if (data.configured) {
+          text.textContent = `Not connected -- last configured for "${data.ssid}"`;
+        } else {
+          text.textContent = "No WiFi configured yet";
+        }
+      } catch (e) {
+        text.textContent = "Could not reach device (" + e + ")";
+      }
+    }
+
+    async function scanWifi() {
+      const btn = document.getElementById("scan-btn");
+      const status = document.getElementById("scan-status");
+      const list = document.getElementById("wifi-networks");
+      btn.disabled = true;
+      status.textContent = "Scanning (a few seconds)…";
+      try {
+        const resp = await fetch("/api/wifi-scan", { method: "POST" });
+        const data = await resp.json();
+        if (data.error) {
+          status.textContent = "Scan failed: " + data.error;
+          return;
+        }
+        list.innerHTML = "";
+        for (const net of data.networks || []) {
+          const opt = document.createElement("option");
+          opt.value = net.ssid;
+          opt.label = `${net.ssid} (${net.rssi} dBm)`;
+          list.appendChild(opt);
+        }
+        status.textContent = data.networks && data.networks.length
+          ? `Found ${data.networks.length} network(s) -- pick one from the SSID field's dropdown.`
+          : "No networks found nearby.";
+      } catch (e) {
+        status.textContent = "Scan failed: " + e;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function useMacNetwork() {
+      const status = document.getElementById("scan-status");
+      try {
+        const resp = await fetch("/api/mac-wifi-ssid");
+        const data = await resp.json();
+        if (data.ssid) {
+          document.getElementById("ssid").value = data.ssid;
+          status.textContent = `Filled in "${data.ssid}" -- enter its password below.`;
+        } else if (data.blocked) {
+          status.textContent = "Your Mac is online, but macOS is hiding the network name from this app "
+            + "(needs Location Services permission — System Settings → Privacy & Security → Location Services). "
+            + "Type the network name manually, or use Scan instead.";
+        } else {
+          status.textContent = "Your Mac doesn't appear to be on WiFi right now.";
+        }
+      } catch (e) {
+        status.textContent = "Could not read your Mac's network: " + e;
+      }
+    }
+    refreshWifiStatus();
+
+    // People duplicate detection/merge -- see app.py's /api/people/duplicates
+    // (notion_sync.find_duplicate_people) and POST /people/merge
+    // (notion_sync.merge_person_pages). Merge is always an explicit click,
+    // never automatic.
+    const scanBtn = document.getElementById("scan-duplicates-btn");
+    if (scanBtn) {
+      scanBtn.addEventListener("click", async () => {
+        const list = document.getElementById("duplicates-list");
+        scanBtn.disabled = true;
+        list.innerHTML = "<p class='step'>Scanning…</p>";
+        try {
+          const resp = await fetch("/api/people/duplicates");
+          const data = await resp.json();
+          if (data.error) { list.innerHTML = `<p class="error">${data.error}</p>`; return; }
+          if (!data.groups || !data.groups.length) { list.innerHTML = "<p class='step'>No duplicates found.</p>"; return; }
+          list.innerHTML = "";
+          data.groups.forEach(group => {
+            const div = document.createElement("div");
+            div.style.cssText = "border:1px solid var(--border);border-radius:8px;padding:0.75rem 1rem;margin-top:0.75rem;";
+            const names = group.pages.map(p => p.name).join(" / ");
+            div.innerHTML = `<div style="margin-bottom:0.5rem;"><strong>${names}</strong> share <code>${group.key}</code></div>`;
+            group.pages.forEach(keeper => {
+              const btn = document.createElement("button");
+              btn.type = "button";
+              btn.className = "secondary";
+              btn.style.cssText = "margin-top:0;margin-right:0.4rem;font-size:0.8rem;padding:0.35rem 0.7rem;";
+              btn.textContent = `Keep "${keeper.name}"`;
+              btn.addEventListener("click", async () => {
+                const losers = group.pages.filter(p => p.id !== keeper.id);
+                for (const loser of losers) {
+                  await fetch("/people/merge", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                    body: new URLSearchParams({ keeper_id: keeper.id, loser_id: loser.id }),
+                  });
+                }
+                div.innerHTML = `<p class="saved">Merged into "${keeper.name}".</p>`;
+              });
+              div.appendChild(btn);
+            });
+            list.appendChild(div);
+          });
+        } catch (e) {
+          list.innerHTML = `<p class="error">Scan failed: ${e}</p>`;
+        } finally {
+          scanBtn.disabled = false;
+        }
+      });
+    }
+  </script>
+</body>
+</html>

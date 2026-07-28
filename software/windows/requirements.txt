@@ -1,0 +1,36 @@
+# Core — always required.
+fastapi
+uvicorn[standard]
+jinja2
+python-multipart
+requests
+python-dotenv
+itsdangerous          # needed by starlette's SessionMiddleware (login sessions)
+pyyaml                # obsidian_sync.py's frontmatter read/write (was an implicit transitive dep before -- declared explicitly now)
+
+# Local speaker-voiceprint recognition (voice_id.py) -- a real, deliberate
+# exception to this file's "avoid heavy deps" pattern below (see
+# noise_reduction.py's vendored-dylib RNNoise for the usual approach).
+# Adds several hundred MB to a packaged build; the feature itself defaults
+# OFF (Settings -> Voice Recognition) so this is only unconditional here
+# because a toggle in a shipped .exe can't install a new dependency at
+# runtime -- it has to already be bundled. CPU-only torch is sufficient
+# (no GPU inference needed for a single short embedding at a time).
+--extra-index-url https://download.pytorch.org/whl/cpu
+speechbrain
+torch
+
+# Provider SDKs — only install the ones for the provider(s) you set in
+# .env (STT_PROVIDER / LLM_PROVIDER). Uncomment as needed:
+# mistralai            # STT_PROVIDER=mistral or LLM_PROVIDER=mistral
+# openai               # STT_PROVIDER=openai or LLM_PROVIDER=openai
+# anthropic            # LLM_PROVIDER=anthropic
+# faster-whisper       # STT_PROVIDER=local
+# ollama               # LLM_PROVIDER=local
+# bleak                # SYNC_TRANSPORT=ble
+# pyobjc-framework-CoreBluetooth   # SYNC_TRANSPORT=ble, macOS only -- optional L2CAP CoC fast path (ble_l2cap_client.py); safe to skip, falls back to bleak/GATT automatically
+# substack-api         # Substack publishing (substack_client.py) -- UNOFFICIAL/reverse-engineered, no real API exists; ToS/breakage risk, only install if you've accepted that at /integrations
+
+# Background noise suppression (noise_reduction.py) needs NO pip package --
+# it talks to the vendored rnnoise.dll directly via ctypes (stdlib). See
+# THIRD_PARTY_NOTICES.md for that binary's origin/license.

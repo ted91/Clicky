@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "clicky",
+      "runtimeExecutable": ".venv/bin/python3",
+      "runtimeArgs": ["app.py"],
+      "port": 8000,
+      "cwd": "/Users/sanchitgupta/Documents/AI usage/epaper-transcriber/software/macos"
+    }
+  ]
+}

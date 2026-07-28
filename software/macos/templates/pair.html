@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Pair device — Clicky Notes</title>
+  <style>
+    :root { --bg: #fff; --fg: #1a1a1a; --border: #ddd; --muted: #666; --error: #c0392b; --card: transparent; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #121212; --fg: #eee; --border: #3a3a3a; --muted: #aaa; --error: #ff6b5e; --card: #1c1c1c; }
+    }
+    :root[data-theme="dark"] { --bg: #121212; --fg: #eee; --border: #3a3a3a; --muted: #aaa; --error: #ff6b5e; --card: #1c1c1c; }
+    :root[data-theme="light"] { --bg: #fff; --fg: #1a1a1a; --border: #ddd; --muted: #666; --error: #c0392b; --card: transparent; }
+    body { font-family: -apple-system, sans-serif; max-width: 480px; margin: 3rem auto; padding: 0 1rem; background: var(--bg); color: var(--fg); }
+    h1 { font-size: 1.3rem; }
+    .hint { color: var(--muted); font-size: 0.85rem; margin-bottom: 1.5rem; }
+    .error { color: var(--error); font-size: 0.9rem; margin-bottom: 1rem; }
+    .device { display: block; border: 1px solid var(--border); background: var(--card); border-radius: 8px; padding: 0.9rem 1rem; margin-bottom: 0.75rem; cursor: pointer; }
+    .device input { margin-right: 0.6rem; }
+    .device .addr { color: var(--muted); font-size: 0.8rem; }
+    .current { color: #0a7; font-size: 0.8rem; }
+    button { padding: 0.6rem 1.2rem; border: none; border-radius: 4px; background: #0a7; color: #fff; font-weight: 600; cursor: pointer; }
+    a { color: var(--muted); font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <h1>Pair a device</h1>
+  <p class="hint">Scanning for nearby devices advertising as "EpaperTranscriber*". Power the device on and reload this page if nothing shows up.</p>
+
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+  {% if devices %}
+    <form method="post" action="/pair">
+      <input type="hidden" name="next" value="{{ next or '/' }}">
+      {% for d in devices %}
+        <label class="device">
+          <input type="radio" name="address" value="{{ d.address }}" {{ "checked" if d.address == current_address else "" }} required>
+          {{ d.name }}
+          {% if d.address == current_address %}<span class="current">(currently paired)</span>{% endif %}
+          <div class="addr">{{ d.address }}</div>
+        </label>
+      {% endfor %}
+      <button type="submit">Pair selected device</button>
+    </form>
+  {% endif %}
+
+  <p><a href="{{ next or '/' }}">&larr; Back</a></p>
+</body>
+</html>

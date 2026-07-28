@@ -1,0 +1,22 @@
+{# Persistent, site-wide left nav -- included on every top-level page
+   (index.html, social.html, settings.html) so navigating between them is
+   always one click away, instead of a per-page "back to dashboard" link.
+   `active_nav` ("transcription" | "social" | "settings") highlights the
+   current destination; this partial expects the including page to define
+   the .app-nav/.app-nav-item CSS (same shape as settings.html's existing
+   .sidebar/.sidebar-item, kept separate since some pages nest this nav
+   next to their own secondary sidebar -- see settings.html). #}
+<div class="app-nav">
+  <a class="app-nav-item {{ 'active' if active_nav == 'transcription' }}" href="/">
+    <span class="icon">🎙️</span> Audio Transcription
+  </a>
+  <a class="app-nav-item {{ 'active' if active_nav == 'social' }}" href="/social">
+    <span class="icon">✍️</span> Social Media Posting
+  </a>
+  <a class="app-nav-item {{ 'active' if active_nav == 'settings' }}" href="/settings">
+    <span class="icon">⚙️</span> Settings
+  </a>
+  <a class="app-nav-item app-nav-logout" href="/logout">
+    <span class="icon">🚪</span> Logout
+  </a>
+</div>

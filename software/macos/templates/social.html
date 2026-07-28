@@ -1,0 +1,90 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Social Posts — Clicky Notes</title>
+  <style>
+    :root { --bg: #fff; --fg: #1a1a1a; --border: #ddd; --muted: #666; --ok: #0a7; --warn: #c0392b; --card: #f9f9f9; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #121212; --fg: #eee; --border: #3a3a3a; --muted: #aaa; --ok: #4fd6a0; --warn: #ff6b5e; --card: #1c1c1c; }
+    }
+    :root[data-theme="dark"] { --bg: #121212; --fg: #eee; --border: #3a3a3a; --muted: #aaa; --ok: #4fd6a0; --warn: #ff6b5e; --card: #1c1c1c; }
+    :root[data-theme="light"] { --bg: #fff; --fg: #1a1a1a; --border: #ddd; --muted: #666; --ok: #0a7; --warn: #c0392b; --card: #f9f9f9; }
+
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, sans-serif; margin: 0; background: var(--bg); color: var(--fg); display: flex; min-height: 100vh; }
+
+    .app-nav { width: 210px; flex-shrink: 0; background: #f5f5f5; border-right: 1px solid var(--border); padding: 0.75rem 0; }
+    @media (prefers-color-scheme: dark) { .app-nav { background: #1a1a1a; } }
+    :root[data-theme="dark"] .app-nav { background: #1a1a1a; }
+    :root[data-theme="light"] .app-nav { background: #f5f5f5; }
+    .app-nav-item {
+      display: flex; align-items: center; gap: 0.6rem; padding: 0.6rem 1.1rem;
+      font-size: 0.9rem; color: var(--fg); text-decoration: none; border-left: 3px solid transparent;
+      background: none; border-top: none; border-right: none; border-bottom: none; width: 100%; text-align: left; cursor: pointer; font: inherit;
+    }
+    .app-nav-item .icon { font-size: 1.1rem; width: 1.3rem; text-align: center; }
+    .app-nav-item:hover { background: rgba(128,128,128,0.12); }
+    .app-nav-item.active { background: rgba(128,128,128,0.12); border-left-color: var(--ok); font-weight: 600; }
+    .app-nav-logout { margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 0.9rem; }
+
+    .page-content { flex: 1; padding: 1.75rem 2rem; overflow-y: auto; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
+    .topbar h1 { font-size: 1.1rem; margin: 0; }
+    .note { color: var(--muted); font-size: 0.85rem; padding-bottom: 0.9rem; border-bottom: 1px solid var(--border); margin-bottom: 1.25rem; }
+
+    .recording { margin-bottom: 1.25rem; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+    .recording-title { padding: 0.75rem 1rem; font-weight: 600; border-bottom: 1px solid var(--border); background: var(--card); }
+    .posts { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1px; background: var(--border); }
+    .post-card { background: var(--bg); padding: 0.9rem 1rem; }
+    .post-card .platform { font-weight: 600; text-transform: capitalize; margin-bottom: 0.35rem; }
+    .status { display: inline-block; font-size: 0.75rem; padding: 0.15rem 0.5rem; border-radius: 999px; border: 1px solid var(--border); margin-bottom: 0.5rem; }
+    .status.published { color: var(--ok); border-color: var(--ok); }
+    .status.failed, .status.error { color: var(--warn); border-color: var(--warn); }
+    .body-preview { font-size: 0.85rem; color: var(--muted); max-height: 4.5em; overflow: hidden; margin-bottom: 0.5rem; }
+    .error-text { font-size: 0.8rem; color: var(--warn); margin-top: 0.4rem; }
+    a.post-url { font-size: 0.8rem; }
+    .empty { padding: 2rem; text-align: center; color: var(--muted); }
+    button.md-download { font-size: 0.8rem; padding: 0.35rem 0.7rem; border: 1px solid var(--border); border-radius: 6px; background: var(--card); color: var(--fg); cursor: pointer; }
+  </style>
+</head>
+<body>
+  {% include "_nav.html" %}
+  <div class="page-content">
+  <div class="topbar">
+    <h1>Social Posts</h1>
+  </div>
+  <div class="note">
+    Read-only — approve, edit, and schedule each post from Notion's <strong>Publications</strong> database
+    (one page per recording, sectioned per platform — each platform has its own approve checkbox + date), not here.
+    Posts generated from the same recording are grouped below so you can see which LinkedIn/X teaser links to
+    which Substack/Medium post.
+  </div>
+
+  {% if not cards %}
+    <div class="empty">No social post drafts yet — check the "Generate Social Media" checkbox on a recording's Notes or Journal page in Notion to generate one (see Settings → Social Media Accounts).</div>
+  {% endif %}
+
+  {% for card in cards %}
+  <div class="recording">
+    <div class="recording-title">{{ card.name }}</div>
+    <div class="posts">
+      {% for platform, post in card.posts.items() %}
+      <div class="post-card">
+        <div class="platform">{{ platform }}</div>
+        <span class="status {{ post.status }}">{{ post.status }}</span>
+        {% if post.title %}<div><strong>{{ post.title }}</strong></div>{% endif %}
+        <div class="body-preview">{{ post.body }}</div>
+        {% if post.url %}<div><a class="post-url" href="{{ post.url }}" target="_blank">{{ post.url }}</a></div>{% endif %}
+        {% if post.error %}<div class="error-text">{{ post.error }}</div>{% endif %}
+        {% if platform == "medium" %}
+          <a href="/social/{{ card.content_hash }}/medium.md"><button class="md-download">Download markdown</button></a>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endfor %}
+  </div>
+</body>
+</html>
