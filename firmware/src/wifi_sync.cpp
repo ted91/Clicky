@@ -296,13 +296,19 @@ static void handleVersion() {
     s_server.send(200, "application/json", String("{\"version\":\"") + FW_VERSION + "\"}");
 }
 
-// Receives a raw firmware.bin body (Content-Type: application/octet-stream,
-// no multipart wrapping -- this is the app pushing a file it already has,
-// not an HTML upload form) and flashes it to the inactive OTA partition
-// (see partitions.csv). WebServer buffers a non-form/non-multipart POST
-// body into server.arg("plain") in one shot -- fine here since it fits
-// comfortably in PSRAM (firmware is ~1.4MB, 8MB PSRAM available) and this
-// is a rare, one-shot operation, not something worth streaming incrementally.
+// Firmware auto-update, flashed to the inactive OTA partition (see
+// partitions.csv). Uses WebServer's two-callback multipart upload
+// mechanism (handleOtaUpload below, registered as the 4th arg to
+// s_server.on()) rather than reading the POST body as a single buffered
+// arg -- confirmed live that WebServer's plain-body/"arg(\"plain\")" path
+// is unreliable for a >1MB raw binary payload (a real firmware push
+// consistently failed with a generic "Flash Write Failed" from
+// Update.write()/end() -- that codepath is built for small form fields,
+// not multi-hundred-KB binaries). The multipart upload path streams each
+// chunk into Update.write() as WebServer's own parser reads it off the
+// socket, which is the standard, well-tested ESP32 Arduino OTA-over-HTTP
+// pattern -- the pipeline app's push_firmware_update_if_needed() sends a
+// real multipart/form-data body (via requests' `files=`) to match.
 //
 // Safety net: CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE is on for this board
 // (confirmed in the framework's sdkconfig.h, no patching needed) -- the
@@ -310,30 +316,40 @@ static void handleVersion() {
 // will automatically revert to the previous slot if the new image never
 // calls esp_ota_mark_app_valid_cancel_rollback() (see main.cpp's setup())
 // before crash-looping. A bad push can't brick a device left in the field.
-static void handleOta() {
-    noteHttpActivity();
-    if (!s_server.hasArg("plain") || s_server.arg("plain").length() == 0) {
-        s_server.send(400, "text/plain", "empty body");
-        return;
+static void handleOtaUpload() {
+    HTTPUpload &upload = s_server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+        noteHttpActivity();
+        Serial.printf("wifi_sync: OTA upload starting: %s\n", upload.filename.c_str());
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+            Serial.printf("wifi_sync: Update.begin failed: %s\n", Update.errorString());
+        }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+            Serial.printf("wifi_sync: Update.write failed at %u bytes: %s\n",
+                          (unsigned)upload.totalSize, Update.errorString());
+        }
+    } else if (upload.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) {
+            Serial.printf("wifi_sync: OTA flashed successfully (%u bytes)\n", (unsigned)upload.totalSize);
+        } else {
+            Serial.printf("wifi_sync: Update.end failed: %s\n", Update.errorString());
+        }
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+        Update.abort();
+        Serial.println("wifi_sync: OTA upload aborted");
     }
-    String body = s_server.arg("plain");
-    Serial.printf("wifi_sync: OTA push received, %u bytes\n", (unsigned)body.length());
+}
 
-    if (!Update.begin(body.length(), U_FLASH)) {
-        Serial.printf("wifi_sync: Update.begin failed: %s\n", Update.errorString());
-        s_server.send(500, "text/plain", String("Update.begin failed: ") + Update.errorString());
-        return;
-    }
-    size_t written = Update.write((uint8_t *)body.c_str(), body.length());
-    bool ok = (written == body.length()) && Update.end(true);
-    if (!ok) {
-        Serial.printf("wifi_sync: OTA write/end failed (wrote %u of %u): %s\n",
-                      (unsigned)written, (unsigned)body.length(), Update.errorString());
+// Called once the whole multipart request (including the upload above)
+// has been fully processed -- reports success/failure and, only on
+// success, reboots into the newly-flashed image.
+static void handleOtaComplete() {
+    if (Update.hasError()) {
         s_server.send(500, "text/plain", String("OTA failed: ") + Update.errorString());
         return;
     }
-
-    Serial.println("wifi_sync: OTA flashed successfully, rebooting into new firmware");
+    Serial.println("wifi_sync: OTA complete, rebooting into new firmware");
     s_server.send(200, "text/plain", "ok (rebooting)");
     s_server.client().flush();
     delay(500); // let the response actually reach the app before the radio drops
@@ -637,7 +653,7 @@ void wifi_sync_init() {
     s_server.on("/wifi/scan", HTTP_POST, handleWifiScanStart);
     s_server.on("/wifi/scan", HTTP_GET, handleWifiScanStatus);
     s_server.on("/version", HTTP_GET, handleVersion);
-    s_server.on("/ota", HTTP_POST, handleOta);
+    s_server.on("/ota", HTTP_POST, handleOtaComplete, handleOtaUpload);
     s_server.begin();
 
     // Radio-off by default: the server socket is registered (lwIP survives

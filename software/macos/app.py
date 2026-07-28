@@ -761,6 +761,9 @@ def _settings_context(active_panel: str = "device", wifi_msg: str = "", saved: b
         "device_id": settings.get_or_create_device_id(),
         "voiceprints": voice_id.list_voiceprints(),
         "app_update": update_check.check_app_update(),
+        "app_version": config.APP_VERSION,
+        "bundled_firmware_version": update_check.get_bundled_firmware_version(),
+        "device_firmware_version": poller.get_device_firmware_version(),
     }
 
 

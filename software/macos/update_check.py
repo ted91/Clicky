@@ -138,10 +138,15 @@ def push_firmware_update_if_needed(base_url: str) -> bool:
 
     log.info("pushing firmware %s -> device (currently %s)", bundled_version, device_version)
     try:
+        # Real multipart/form-data (requests builds this automatically for
+        # `files=`), not a raw octet-stream body -- confirmed live that the
+        # device's WebServer library can't reliably buffer a >1MB raw POST
+        # body as a single arg (see wifi_sync.cpp's handleOtaUpload for the
+        # full story); its multipart-upload parser is the one that actually
+        # works for a payload this size.
         resp = requests.post(
             f"{base_url}/ota",
-            data=firmware_bytes,
-            headers={"Content-Type": "application/octet-stream"},
+            files={"firmware": ("firmware.bin", firmware_bytes, "application/octet-stream")},
             timeout=60,
         )
         if not resp.ok:

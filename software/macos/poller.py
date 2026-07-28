@@ -108,6 +108,24 @@ def _wifi_base_url_if_reachable():
     return discovered
 
 
+def get_device_firmware_version():
+    """Best-effort current firmware version string from the paired device
+    (see wifi_sync.cpp's /version route), or None if it's not reachable
+    over WiFi right now. Used by Settings' Device panel -- reuses the same
+    throttled reachability check _get_transport() does, so this doesn't add
+    its own extra BLE/network round trip beyond what's already cached."""
+    base_url = _wifi_base_url_if_reachable()
+    if not base_url:
+        return None
+    try:
+        resp = requests.get(f"{base_url}/version", timeout=2)
+        if resp.ok:
+            return resp.json().get("version")
+    except Exception as e:
+        log.debug("device firmware version check failed (non-fatal): %s", e)
+    return None
+
+
 def _get_transport():
     """Resolved fresh on every poll, not cached at import — so switching
     SYNC_TRANSPORT via /settings takes effect on a running process without
