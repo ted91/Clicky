@@ -362,7 +362,19 @@ async def resync_after_rename(content_hash: str):
     formatted = format_transcript_with_speakers(
         record.get("transcript") or "", record["segments"], record.get("speaker_names")
     )
-    await _resummarize_and_repush(content_hash, formatted, record.get("speaker_names") or {})
+    try:
+        await _resummarize_and_repush(content_hash, formatted, record.get("speaker_names") or {})
+    except Exception as e:
+        # An LLM/Notion hiccup here must NOT skip voice-ID enrollment below --
+        # they used to share one un-isolated code path, so a resummarize
+        # failure (rate limit, API blip, whatever) silently meant the
+        # rename never enrolled a voiceprint either, with nothing surfaced
+        # anywhere (this ran as a fire-and-forget FastAPI background task --
+        # see app.py's rename_speaker route). Confirmed live: a real rename
+        # left speaker_names updated but the voiceprint's sample_count
+        # never bumped, with no error visible to the user at all.
+        log.warning("resummarize/repush after rename failed for %s (non-fatal, enrollment still proceeds): %s",
+                    content_hash, e)
 
     # Voice-ID enrollment path C (see voice_id.py's module docstring) --
     # a rename is exactly the "confidently associated with a real name"

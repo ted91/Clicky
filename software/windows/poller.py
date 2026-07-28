@@ -361,63 +361,73 @@ async def resync_after_rename(content_hash: str):
 
     old_type = (record.get("summary") or {}).get("type")
 
-    formatted = format_transcript_with_speakers(
-        record.get("transcript") or "", record["segments"], record.get("speaker_names")
-    )
-    _, summarize = get_summarizer()
-    new_summary = await asyncio.to_thread(summarize, formatted, record.get("deepgram_insights"), record.get("meeting"))
-    new_summary["speaker_names"] = record.get("speaker_names") or {}
-    _enforce_journal_rule(new_summary, record["segments"])
-    _add_speakers_as_stakeholders(new_summary)
-    storage.update_summary(content_hash, new_summary)
-
-    # A rename can shift the journal/actionable call (this literally
-    # happened testing this feature -- renaming "speaker_1" changed enough
-    # context that the classification flipped). Without resetting these,
-    # a recording that becomes "journal" here would never get pushed to
-    # the Journal database (stuck on a stale "already handled" flag from
-    # before), and vice versa for Tasks/Calendar. Tasks/Calendar are
-    # deliberately only reset on a type change (not every rename) -- unlike
-    # People, push_tasks()/push_events() always create a brand-new page
-    # with no find-or-create check, so resetting them unconditionally would
-    # create a duplicate Task/Event page on every single rename.
-    if new_summary.get("type") != old_type:
-        storage.reset_distribution_flags(
-            content_hash, ["notion_tasks", "notion_people", "notion_events", "notion_journal"]
+    # Wrapped as a whole: an LLM/Notion hiccup anywhere in here must NOT
+    # skip voice-ID enrollment below (they used to share one un-isolated
+    # code path) -- confirmed live that a real rename left speaker_names
+    # updated but the voiceprint's sample_count never bumped, with no
+    # error surfaced anywhere, since this ran as a fire-and-forget FastAPI
+    # background task (see app.py's rename_speaker route).
+    try:
+        formatted = format_transcript_with_speakers(
+            record.get("transcript") or "", record["segments"], record.get("speaker_names")
         )
-    else:
-        # People, by contrast, IS safe to always re-push: push_people()
-        # find-or-creates by email/name (see notion_sync.py), so re-running
-        # it after a rename just links the now-correctly-named speaker to
-        # an existing or new People page rather than duplicating anything.
-        # Without this, a renamed speaker who was already a "stakeholder"
-        # under a stale name (or wasn't one at all before the rename) never
-        # gets pushed to People at all, since notion_people_synced was
-        # already True from the original push and this record would
-        # otherwise never be reconsidered.
-        storage.reset_distribution_flags(content_hash, ["notion_people"])
+        _, summarize = get_summarizer()
+        new_summary = await asyncio.to_thread(summarize, formatted, record.get("deepgram_insights"), record.get("meeting"))
+        new_summary["speaker_names"] = record.get("speaker_names") or {}
+        _enforce_journal_rule(new_summary, record["segments"])
+        _add_speakers_as_stakeholders(new_summary)
+        storage.update_summary(content_hash, new_summary)
 
-    if record.get("notion_page_id"):
-        import notion_sync
-        fresh_record = storage.get_recording(content_hash)
-        try:
-            await asyncio.to_thread(notion_sync.update_all_blocks, record["notion_page_id"], fresh_record)
-            # Also sync the "Speaker N" *properties*, not just the page
-            # body -- without this, a rename made on the dashboard (or a
-            # restore after a Notion-side rename) leaves Notion's property
-            # value stale, which sync_speaker_edits_once() would then treat
-            # as the authoritative source on the next poll cycle and flip
-            # the name right back. This is what keeps the two directions
-            # from fighting each other.
-            slots = {
-                idx: name
-                for sid, name in fresh_record["speaker_names"].items()
-                if (idx := notion_sync.speaker_slot_index(sid))
-            }
-            if slots:
-                await asyncio.to_thread(notion_sync.set_speaker_slot_values, record["notion_page_id"], slots)
-        except Exception as e:
-            log.error("re-summarized %s locally but failed to refresh Notion page: %s", record["name"], e)
+        # A rename can shift the journal/actionable call (this literally
+        # happened testing this feature -- renaming "speaker_1" changed enough
+        # context that the classification flipped). Without resetting these,
+        # a recording that becomes "journal" here would never get pushed to
+        # the Journal database (stuck on a stale "already handled" flag from
+        # before), and vice versa for Tasks/Calendar. Tasks/Calendar are
+        # deliberately only reset on a type change (not every rename) -- unlike
+        # People, push_tasks()/push_events() always create a brand-new page
+        # with no find-or-create check, so resetting them unconditionally would
+        # create a duplicate Task/Event page on every single rename.
+        if new_summary.get("type") != old_type:
+            storage.reset_distribution_flags(
+                content_hash, ["notion_tasks", "notion_people", "notion_events", "notion_journal"]
+            )
+        else:
+            # People, by contrast, IS safe to always re-push: push_people()
+            # find-or-creates by email/name (see notion_sync.py), so re-running
+            # it after a rename just links the now-correctly-named speaker to
+            # an existing or new People page rather than duplicating anything.
+            # Without this, a renamed speaker who was already a "stakeholder"
+            # under a stale name (or wasn't one at all before the rename) never
+            # gets pushed to People at all, since notion_people_synced was
+            # already True from the original push and this record would
+            # otherwise never be reconsidered.
+            storage.reset_distribution_flags(content_hash, ["notion_people"])
+
+        if record.get("notion_page_id"):
+            import notion_sync
+            fresh_record = storage.get_recording(content_hash)
+            try:
+                await asyncio.to_thread(notion_sync.update_all_blocks, record["notion_page_id"], fresh_record)
+                # Also sync the "Speaker N" *properties*, not just the page
+                # body -- without this, a rename made on the dashboard (or a
+                # restore after a Notion-side rename) leaves Notion's property
+                # value stale, which sync_speaker_edits_once() would then treat
+                # as the authoritative source on the next poll cycle and flip
+                # the name right back. This is what keeps the two directions
+                # from fighting each other.
+                slots = {
+                    idx: name
+                    for sid, name in fresh_record["speaker_names"].items()
+                    if (idx := notion_sync.speaker_slot_index(sid))
+                }
+                if slots:
+                    await asyncio.to_thread(notion_sync.set_speaker_slot_values, record["notion_page_id"], slots)
+            except Exception as e:
+                log.error("re-summarized %s locally but failed to refresh Notion page: %s", record["name"], e)
+    except Exception as e:
+        log.warning("resummarize/repush after rename failed for %s (non-fatal, enrollment still proceeds): %s",
+                    content_hash, e)
 
     # Voice-ID enrollment path C (see voice_id.py's module docstring) --
     # a rename is exactly the "confidently associated with a real name"
