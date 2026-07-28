@@ -1887,16 +1887,32 @@ async def check_social_post_generation_triggers_once():
     for record in storage.list_recordings():
         if record["status"] != "done":
             continue
-        notion_trigger_id = (record.get("notion_page_id") or record.get("notion_journal_page_id")) if notion_configured else None
+        # A recording can end up with BOTH notion_page_id and
+        # notion_journal_page_id set (e.g. it was pushed to Notes before a
+        # later resummarize reclassified it as journal-type, or vice versa
+        # -- nothing clears the stale one) -- "or" here used to silently
+        # pick whichever came first and never check the other page at all,
+        # which is exactly why checking the box on a Journal page for such
+        # a recording did nothing while Notes worked: the Notes page id won
+        # the "or" and the Journal checkbox was never read. Check every
+        # Notion page this recording actually has, independently.
+        notion_page_ids = []
+        if notion_configured:
+            if record.get("notion_page_id"):
+                notion_page_ids.append(record["notion_page_id"])
+            if record.get("notion_journal_page_id"):
+                notion_page_ids.append(record["notion_journal_page_id"])
         obsidian_trigger_path = (record.get("obsidian_note_path") or record.get("obsidian_journal_note_path")) if obsidian_configured else None
-        if not notion_trigger_id and not obsidian_trigger_path:
+        if not notion_page_ids and not obsidian_trigger_path:
             continue
 
         triggered = False
-        if notion_trigger_id:
+        triggered_notion_ids = []
+        for page_id in notion_page_ids:
             try:
-                if await asyncio.to_thread(notion_sync.is_generate_social_triggered, notion_trigger_id):
+                if await asyncio.to_thread(notion_sync.is_generate_social_triggered, page_id):
                     triggered = True
+                    triggered_notion_ids.append(page_id)
             except Exception as e:
                 log.error("failed to read Generate Social Media checkbox (Notion) for %s: %s", record["name"], e)
         if obsidian_trigger_path:
@@ -1921,8 +1937,8 @@ async def check_social_post_generation_triggers_once():
             continue
 
         if not generated.get("long_form_body"):
-            if notion_trigger_id:
-                await asyncio.to_thread(notion_sync.reset_generate_social_trigger, notion_trigger_id)
+            for page_id in triggered_notion_ids:
+                await asyncio.to_thread(notion_sync.reset_generate_social_trigger, page_id)
             if obsidian_trigger_path:
                 await asyncio.to_thread(obsidian_sync.reset_generate_social_trigger, obsidian_trigger_path)
             continue
@@ -1956,7 +1972,7 @@ async def check_social_post_generation_triggers_once():
 
         record_with_posts = dict(record, social_posts=posts)
         pushed_any = False
-        if notion_trigger_id:
+        if notion_page_ids:
             try:
                 created = await asyncio.to_thread(notion_sync.push_social_posts, record_with_posts, record.get("notion_page_id"))
                 if created.get("notion_page_id"):
@@ -1976,8 +1992,8 @@ async def check_social_post_generation_triggers_once():
             continue
 
         storage.set_social_posts(record["content_hash"], posts)
-        if notion_trigger_id:
-            await asyncio.to_thread(notion_sync.reset_generate_social_trigger, notion_trigger_id)
+        for page_id in triggered_notion_ids:
+            await asyncio.to_thread(notion_sync.reset_generate_social_trigger, page_id)
         if obsidian_trigger_path:
             await asyncio.to_thread(obsidian_sync.reset_generate_social_trigger, obsidian_trigger_path)
         log.info("generated %d social post draft(s) for %s", len(posts), record["name"])
