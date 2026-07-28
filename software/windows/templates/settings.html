@@ -157,6 +157,17 @@
         <h2>Device</h2>
         <p class="desc">How the dashboard reaches your e-paper device — over your WiFi network, or directly via Bluetooth (works even if the device can't join your router, e.g. a 2.4GHz-only dual-band situation).</p>
 
+        {% if app_update.available %}
+          <fieldset>
+            <legend>App update available</legend>
+            <p class="step">
+              A newer version ({{ app_update.latest }}) is available — you're on {{ app_update.current }}.
+              Download it and re-run "Setup Clicky.command" to update (this app can't safely auto-update itself yet).
+            </p>
+            {% if app_update.url %}<a href="{{ app_update.url }}" target="_blank" rel="noopener"><button type="button" class="secondary">View release</button></a>{% endif %}
+          </fieldset>
+        {% endif %}
+
         <form method="post" action="/settings/transport">
           <fieldset>
             <legend>Sync transport</legend>

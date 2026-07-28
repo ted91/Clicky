@@ -81,11 +81,11 @@ void face_show_pairing_setup();
 // entirely so a returning user never lands on it again.
 void face_set_paired(bool paired);
 
-// Small always-on-screen "BLE"/"SYNC" checkbox indicators pinned to the
-// bottom of the panel, independent of face_update()'s own redraw cycle —
-// call this periodically (e.g. every 1-2s) so connection/sync state stays
-// current even when nothing else visible has changed.
-void face_update_indicators(bool bleConnected, bool syncActive);
+// Small always-on-screen "BLE"/"WIFI"/"SYNC" checkbox indicators pinned to
+// the bottom of the panel, one line, independent of face_update()'s own
+// redraw cycle — call this periodically (e.g. every 1-2s) so connection/
+// sync state stays current even when nothing else visible has changed.
+void face_update_indicators(bool bleConnected, bool wifiConnected, bool syncActive);
 
 // Phone-style battery badge (icon + percentage), pinned to the top-right
 // corner, always visible regardless of scene -- unlike the bottom strip's

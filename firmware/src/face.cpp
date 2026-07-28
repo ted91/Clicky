@@ -7,6 +7,7 @@
 #include <nvs_flash.h>
 #include "user_config.h"
 #include "power_mgr.h"
+#include "fw_version.h"
 
 static epaper_driver_display *s_driver = nullptr;
 static int s_lastRecording = -1; // -1 = not drawn yet, forces first draw
@@ -457,49 +458,55 @@ static bool s_isPaired = false; // see face_set_paired()
 // fixed-function charge indicator, not GPIO-controllable) -- the BLE/SYNC
 // checkboxes are the closest on-device equivalent.
 static bool s_lastBleIndicator = false;
+static bool s_lastWifiIndicator = false;
 static bool s_lastSyncIndicator = false;
 static bool s_currentRecording = false; // set by face_update(); read here since
                                          // face_update_indicators()'s own periodic
                                          // caller (main.cpp's indicatorTask) doesn't
                                          // otherwise know recording state
 static const int INDICATOR_CLEAR_Y = 180;
-static const int INDICATOR_LABEL_Y = 184;
-static const int INDICATOR_BOX_Y = 192;
 static const int INDICATOR_BOX_SIZE = 8;
+// Single row, vertically centering the 8px checkbox and the 7px-tall font
+// within the 20px strip -- previously label and checkbox were two separate
+// rows (label above, checkbox below) per item, which read as more visually
+// disconnected than intended, especially now that there are three items
+// instead of two.
+static const int INDICATOR_ROW_Y = INDICATOR_CLEAR_Y + (EPD_HEIGHT - INDICATOR_CLEAR_Y - INDICATOR_BOX_SIZE) / 2;
+static const int INDICATOR_TEXT_Y = INDICATOR_ROW_Y; // scale-1 glyphs are 7px, close enough to the 8px box to look aligned
+
+// Draws one "[x] LABEL" pair starting at x, returns the x position right
+// after it (caller chains items left-to-right with a small gap between).
+static int drawIndicatorItem(int x, const char *label, bool on) {
+    drawCheckbox(x, INDICATOR_ROW_Y, INDICATOR_BOX_SIZE, on);
+    int textX = x + INDICATOR_BOX_SIZE + 3;
+    drawTextAt(textX, INDICATOR_TEXT_Y, label, 1);
+    int labelWidth = (int)strlen(label) * 6 - 1; // (5+1)*scale1 - 1
+    return textX + labelWidth;
+}
 
 // Draws the indicator strip unconditionally (no change-check, no
 // EPD_DisplayPart() call) — used both by face_update_indicators() and by
 // face_update() itself, so a full-screen redraw doesn't leave the strip
 // blank until the next indicator tick.
-static void drawIndicatorStrip(bool bleConnected, bool syncActive) {
+static void drawIndicatorStrip(bool bleConnected, bool wifiConnected, bool syncActive) {
     for (int y = INDICATOR_CLEAR_Y; y < EPD_HEIGHT; y++) {
         for (int x = 0; x < EPD_WIDTH; x++) {
             s_driver->EPD_DrawColorPixel(x, y, DRIVER_COLOR_WHITE);
         }
     }
 
-    drawTextAt(4, INDICATOR_LABEL_Y, "BLE", 1);
-    drawCheckbox(4, INDICATOR_BOX_Y, INDICATOR_BOX_SIZE, bleConnected);
-
-    // Battery % (voltage-estimate, see power_mgr.h) to the right of the BLE
-    // checkbox -- the only spare room in this strip. Only drawn below 30%
-    // so it doesn't clutter the display during ordinary (plugged-in-often)
-    // use; below 10% it's the one thing on screen worth noticing.
-    int pct = power_mgr_battery_pct();
-    if (pct < 30 && !power_mgr_on_external_power()) {
-        char buf[8];
-        snprintf(buf, sizeof(buf), "%d%%", pct);
-        drawTextAt(4 + INDICATOR_BOX_SIZE + 4, INDICATOR_BOX_Y, buf, 1);
-    }
-
-    const char *syncLabel = "SYNC";
-    int syncLabelWidth = (int)strlen(syncLabel) * 6 - 1; // (5+1)*scale1 - 1
-    drawTextAt((EPD_WIDTH - syncLabelWidth) / 2, INDICATOR_LABEL_Y, syncLabel, 1);
-    drawCheckbox((EPD_WIDTH - INDICATOR_BOX_SIZE) / 2, INDICATOR_BOX_Y, INDICATOR_BOX_SIZE, syncActive);
+    // BLE / WIFI / SYNC, one line, left to right -- low-battery text that
+    // used to live in this strip is gone; the always-on top-right battery
+    // badge (drawBatteryBadge) already covers that, and this strip needed
+    // the room for a third checkbox anyway.
+    int x = 2;
+    x = drawIndicatorItem(x, "BLE", bleConnected) + 8;
+    x = drawIndicatorItem(x, "WIFI", wifiConnected) + 8;
+    x = drawIndicatorItem(x, "SYNC", syncActive);
 
     const char *recordLabel = s_currentRecording ? "STOP" : "RECORD";
     int recordLabelWidth = (int)strlen(recordLabel) * 6 - 1;
-    drawTextAt(EPD_WIDTH - 4 - recordLabelWidth, INDICATOR_LABEL_Y, recordLabel, 1);
+    drawTextAt(EPD_WIDTH - 2 - recordLabelWidth, INDICATOR_TEXT_Y, recordLabel, 1);
 }
 
 // --- top-right battery badge, phone-status-bar style -----------------------
@@ -562,6 +569,17 @@ static void drawBatteryBadge(int pct) {
     drawBatteryIcon(iconX, BATTERY_Y, pct);
 }
 
+// --- top-left firmware version label ---------------------------------------
+// Compile-time constant, unlike the battery badge -- no periodic re-sample
+// needed, just reapply it after every EPD_Clear() the same way the battery
+// badge/indicator strip already do. Small and unobtrusive (scale 1, dim
+// against the corner) since this is a diagnostic/support aid (confirming
+// an OTA update actually landed, or reading it off over a support call),
+// not something a normal user needs to look at day to day.
+static void drawVersionBadge() {
+    drawTextAt(2, 2, "v" FW_VERSION, 1);
+}
+
 static int s_lastBatteryPct = -1; // -1 = not read yet, skip drawing until the first real sample
 
 static int s_customStatusIndex = -1; // meaningful only when s_currentStatus == Status::CUSTOM
@@ -571,6 +589,7 @@ void face_init(epaper_driver_display *driver) {
     s_lastRecording = -1;
     s_currentStatus = Status::NONE;
     s_lastBleIndicator = false;
+    s_lastWifiIndicator = false;
     s_lastSyncIndicator = false;
     s_currentRecording = false;
     s_lastBatteryPct = -1;
@@ -622,11 +641,12 @@ void face_update(bool recording) {
     // Reapply the last-known indicator state immediately -- otherwise the
     // strip would sit blank for up to a second until indicatorTask's next
     // tick, since EPD_Clear() above just wiped it along with everything else.
-    drawIndicatorStrip(s_lastBleIndicator, s_lastSyncIndicator);
+    drawIndicatorStrip(s_lastBleIndicator, s_lastWifiIndicator, s_lastSyncIndicator);
     // Same reasoning as the indicator strip above -- reapply the last-known
     // battery reading so the badge doesn't sit blank until the next
     // periodic battery sample (see face_update_battery()/indicatorTask).
     if (s_lastBatteryPct >= 0) drawBatteryBadge(s_lastBatteryPct);
+    drawVersionBadge();
     s_driver->EPD_DisplayPart();
 }
 
@@ -697,13 +717,15 @@ void face_dismiss_notification() {
     s_notifActive = false;
 }
 
-void face_update_indicators(bool bleConnected, bool syncActive) {
+void face_update_indicators(bool bleConnected, bool wifiConnected, bool syncActive) {
     if (!s_driver) return;
-    if (bleConnected == s_lastBleIndicator && syncActive == s_lastSyncIndicator) return;
+    if (bleConnected == s_lastBleIndicator && wifiConnected == s_lastWifiIndicator &&
+        syncActive == s_lastSyncIndicator) return;
     s_lastBleIndicator = bleConnected;
+    s_lastWifiIndicator = wifiConnected;
     s_lastSyncIndicator = syncActive;
 
-    drawIndicatorStrip(bleConnected, syncActive);
+    drawIndicatorStrip(bleConnected, wifiConnected, syncActive);
     s_driver->EPD_DisplayPart();
 }
 

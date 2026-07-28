@@ -12,6 +12,7 @@
 #include "wifi_sync.h"
 #include "ble_sync.h"
 #include "power_mgr.h"
+#include "esp_ota_ops.h"
 
 // PWR button: single click toggles recording on/off (same click sound on
 // both start and stop, see recorder.cpp's playClick()).
@@ -240,9 +241,8 @@ static void indicatorTask(void *arg) {
     int batterySampleCounter = 0;
     for (;;) {
         power_mgr_tick(); // updates the debounced external-power reading
-        bool connected = ble_sync_is_connected() || wifi_sync_is_connected();
         bool syncing = ble_sync_is_transferring() || wifi_sync_is_transferring();
-        face_update_indicators(connected, syncing);
+        face_update_indicators(ble_sync_is_connected(), wifi_sync_is_connected(), syncing);
 
         // Battery % (top-right badge, see face_update_battery()) sampled
         // every 30s, not every 1s tick like BLE/sync -- power_mgr.h notes
@@ -300,6 +300,17 @@ static void sleepWatchTask(void *arg) {
 
 void setup() {
     Serial.begin(115200);
+    // Firmware OTA safety net (see wifi_sync.cpp's /ota handler and
+    // partitions.csv's comment): a freshly-flashed OTA slot boots in
+    // "pending verify" state (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE is on
+    // for this board) -- reaching this line at all means the new image got
+    // far enough to run real code, so mark it good. Never explicitly
+    // triggering a rollback ourselves here (no self-test beyond "did we
+    // get this far") -- if something further into setup() hangs/crashes
+    // before this, the bootloader's own crash-loop detection is still the
+    // backstop, just a slightly later one. No-op (harmless) on a normal
+    // boot that was never pending verification in the first place.
+    esp_ota_mark_app_valid_cancel_rollback();
     WakeCause wake = power_mgr_wake_cause();
     // Timer wake's only job is a brief BLE reconnect check -- skip the
     // e-paper hardware entirely (see initHardware's initDisplay doc) so it

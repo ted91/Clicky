@@ -13,6 +13,27 @@ import settings as _settings
 _env_dir = sys._MEIPASS if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(_env_dir, ".env"))
 
+# Bump on every release (matching the git tag pushed to GITHUB_REPO, e.g.
+# "0.1.0" for tag "v0.1.0") -- see update_check.py, which compares this
+# against GitHub Releases' latest tag to show the Settings "update
+# available" banner. Kept as a plain module constant (not settings.json)
+# since it describes the running binary, not user-editable state.
+APP_VERSION = "0.1.0"
+
+# Private for now (see this project's distribution-planning conversation --
+# no paid Apple Developer ID yet, demo-scale only) -- update_check.py's
+# GitHub API calls will 404 against a private repo without auth, which is
+# an accepted gap at this stage rather than shipping a token inside a
+# distributed binary (extractable by anyone with the .app). Make the repo
+# public, or add a read-only token via a real secrets mechanism, before
+# relying on this for real distribution.
+GITHUB_REPO = "ted91/Clicky"
+
+# Bundled alongside this app (see clicky.spec's `datas`) so a newer app
+# release always carries the firmware it should push to a paired device
+# once WiFi is reachable -- see update_check.py's firmware-push half.
+FIRMWARE_DIR = os.path.join(_env_dir, "firmware")
+
 # Deployment-level defaults, from .env — these are the fallback values used
 # until first-run /setup is completed (or forever, for fields /setup never
 # touches, like poll interval). User-editable fields below get overlaid by

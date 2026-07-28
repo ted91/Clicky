@@ -23,6 +23,7 @@ a = Analysis(
     datas=[
         ('templates', 'templates'),
         ('static', 'static'),
+        ('firmware', 'firmware'),
         # Carries GOOGLE_CLIENT_ID/SECRET (the app's shared OAuth client --
         # see config.py's comment) into the packaged build. Landed at the
         # bundle root to match config.py's frozen-mode lookup of

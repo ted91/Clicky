@@ -1,0 +1,19 @@
+# Custom partition table -- dual OTA app slots for firmware auto-update
+# (see wifi_sync.cpp's /ota endpoint). This board's default single-app
+# partition scheme has no otadata/ota_1, so there's nowhere to write a new
+# firmware image without overwriting the one currently running -- risky if
+# power is lost mid-flash. Two 3MB app slots (compiled firmware is
+# currently ~1.4MB, plenty of headroom) plus otadata let the bootloader
+# always have a known-good fallback image; CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+# is already 1 in this board's SDK config, so a new image that crash-loops
+# gets automatically reverted to the previous slot -- no sdkconfig patching
+# needed (unlike this project's other sdkconfig overrides, see
+# extra_scripts/patch_sdkconfig.py).
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xe000,   0x2000,
+app0,       app,  ota_0,    0x10000,  0x300000,
+app1,       app,  ota_1,    0x310000, 0x300000,
+spiffs,     data, spiffs,   0x610000, 0x1E0000,
+coredump,   data, coredump, 0x7F0000, 0x10000,

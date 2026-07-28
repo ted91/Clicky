@@ -48,6 +48,7 @@ a = Analysis(
     datas=[
         ('templates', 'templates'),
         ('static', 'static'),
+        ('firmware', 'firmware'),
         # Carries GOOGLE_CLIENT_ID/SECRET (the app's shared OAuth client --
         # see config.py's comment) into the packaged build, same as the
         # macOS spec. Provider API keys (Mistral/OpenAI/etc.) don't need

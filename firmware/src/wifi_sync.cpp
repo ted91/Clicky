@@ -12,7 +12,9 @@
 #include "recorder.h"
 #include "face.h"
 #include "power_mgr.h"
+#include "fw_version.h"
 #include <NimBLEDevice.h>
+#include <Update.h>
 
 // ESP32-S3 shares one physical radio between WiFi and BLE (time-division
 // coexistence, see beginConnectAttempt()'s own comment on this same
@@ -284,6 +286,58 @@ static void handleNotify() {
 static void handleWifiStatus() {
     noteHttpActivity();
     s_server.send(200, "application/json", wifi_sync_status_json());
+}
+
+// Firmware auto-update -- see FW_VERSION's own docstring. The paired
+// pipeline app compares this against its own bundled firmware version and
+// only pushes a new image via POST /ota when this is older.
+static void handleVersion() {
+    noteHttpActivity();
+    s_server.send(200, "application/json", String("{\"version\":\"") + FW_VERSION + "\"}");
+}
+
+// Receives a raw firmware.bin body (Content-Type: application/octet-stream,
+// no multipart wrapping -- this is the app pushing a file it already has,
+// not an HTML upload form) and flashes it to the inactive OTA partition
+// (see partitions.csv). WebServer buffers a non-form/non-multipart POST
+// body into server.arg("plain") in one shot -- fine here since it fits
+// comfortably in PSRAM (firmware is ~1.4MB, 8MB PSRAM available) and this
+// is a rare, one-shot operation, not something worth streaming incrementally.
+//
+// Safety net: CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE is on for this board
+// (confirmed in the framework's sdkconfig.h, no patching needed) -- the
+// bootloader treats a freshly-flashed OTA slot as "pending verify" and
+// will automatically revert to the previous slot if the new image never
+// calls esp_ota_mark_app_valid_cancel_rollback() (see main.cpp's setup())
+// before crash-looping. A bad push can't brick a device left in the field.
+static void handleOta() {
+    noteHttpActivity();
+    if (!s_server.hasArg("plain") || s_server.arg("plain").length() == 0) {
+        s_server.send(400, "text/plain", "empty body");
+        return;
+    }
+    String body = s_server.arg("plain");
+    Serial.printf("wifi_sync: OTA push received, %u bytes\n", (unsigned)body.length());
+
+    if (!Update.begin(body.length(), U_FLASH)) {
+        Serial.printf("wifi_sync: Update.begin failed: %s\n", Update.errorString());
+        s_server.send(500, "text/plain", String("Update.begin failed: ") + Update.errorString());
+        return;
+    }
+    size_t written = Update.write((uint8_t *)body.c_str(), body.length());
+    bool ok = (written == body.length()) && Update.end(true);
+    if (!ok) {
+        Serial.printf("wifi_sync: OTA write/end failed (wrote %u of %u): %s\n",
+                      (unsigned)written, (unsigned)body.length(), Update.errorString());
+        s_server.send(500, "text/plain", String("OTA failed: ") + Update.errorString());
+        return;
+    }
+
+    Serial.println("wifi_sync: OTA flashed successfully, rebooting into new firmware");
+    s_server.send(200, "text/plain", "ok (rebooting)");
+    s_server.client().flush();
+    delay(500); // let the response actually reach the app before the radio drops
+    ESP.restart();
 }
 
 // The Mac's poller calls this once a WiFi sync cycle finishes (nothing
@@ -582,6 +636,8 @@ void wifi_sync_init() {
     s_server.on("/wifi/connect", HTTP_POST, handleWifiConnect);
     s_server.on("/wifi/scan", HTTP_POST, handleWifiScanStart);
     s_server.on("/wifi/scan", HTTP_GET, handleWifiScanStatus);
+    s_server.on("/version", HTTP_GET, handleVersion);
+    s_server.on("/ota", HTTP_POST, handleOta);
     s_server.begin();
 
     // Radio-off by default: the server socket is registered (lwIP survives

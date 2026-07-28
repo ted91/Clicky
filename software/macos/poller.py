@@ -56,6 +56,13 @@ def _is_valid_wav(data: bytes) -> bool:
 _WIFI_PROBE_INTERVAL_SECONDS = 15
 _wifi_probe = {"base_url": None, "last_check": 0.0, "reachable": False}
 
+# Firmware-push attempts are throttled separately (and much less often) --
+# every reachable-WiFi poll would otherwise mean an extra /version round
+# trip forever, even though the answer only ever changes right after a
+# real app update ships a newer bundled firmware.bin.
+_FIRMWARE_PUSH_CHECK_INTERVAL_SECONDS = 300
+_last_firmware_push_check = 0.0
+
 
 def _http_reachable(base_url: str) -> bool:
     try:
@@ -121,6 +128,16 @@ def _get_transport():
     wifi_url = _wifi_base_url_if_reachable()
     if wifi_url:
         config.DEVICE_BASE_URL = wifi_url
+
+        global _last_firmware_push_check
+        now = time.monotonic()
+        if now - _last_firmware_push_check > _FIRMWARE_PUSH_CHECK_INTERVAL_SECONDS:
+            _last_firmware_push_check = now
+            try:
+                import update_check
+                update_check.push_firmware_update_if_needed(wifi_url)
+            except Exception as e:
+                log.debug("firmware update check failed (non-fatal): %s", e)
         # One connection to the device at a time -- BLE is strictly the
         # backup path. The ESP32's single radio is time-sliced between BLE
         # and WiFi, so an idle-but-open BLE connection during WiFi

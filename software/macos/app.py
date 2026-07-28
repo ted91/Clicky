@@ -27,6 +27,7 @@ import storage
 import poller
 from poller import poll_forever
 import voice_id
+import update_check
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("app")
@@ -759,6 +760,7 @@ def _settings_context(active_panel: str = "device", wifi_msg: str = "", saved: b
         "substack_connected": substack_client.is_connected(),
         "device_id": settings.get_or_create_device_id(),
         "voiceprints": voice_id.list_voiceprints(),
+        "app_update": update_check.check_app_update(),
     }
 
 
