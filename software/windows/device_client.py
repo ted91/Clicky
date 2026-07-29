@@ -101,3 +101,48 @@ def delete_recording_from_sd(name: str):
         timeout=TIMEOUT_SECONDS,
     )
     resp.raise_for_status()
+
+
+# --- WiFi status/scan/connect over the device's own WiFi HTTP server -------
+# Mirrors ble_device_client's equivalents, same endpoints wifi_sync.cpp
+# already exposes for exactly this. Added so Settings' WiFi actions don't
+# have to go over BLE when WiFi is already up and reachable -- see
+# app.py's routes, which now try this module first via
+# poller.get_device_firmware_version()'s same reachability check, falling
+# back to BLE only when WiFi genuinely isn't reachable. This is the other
+# half of "BLE is backup-only, not a second always-on connection" (see
+# ble_sync.cpp's resumeIdleAdvertising(), which now only advertises while
+# WiFi is NOT connected).
+WIFI_SCAN_POLL_TIMEOUT_SECONDS = 10
+WIFI_SCAN_POLL_INTERVAL_SECONDS = 0.5
+
+
+def get_wifi_status() -> dict:
+    resp = requests.get(f"{config.DEVICE_BASE_URL}/wifi/status", timeout=TIMEOUT_SECONDS)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def scan_wifi_networks() -> list:
+    import time
+    resp = requests.post(f"{config.DEVICE_BASE_URL}/wifi/scan", timeout=TIMEOUT_SECONDS)
+    resp.raise_for_status()
+    deadline = time.monotonic() + WIFI_SCAN_POLL_TIMEOUT_SECONDS
+    while True:
+        resp = requests.get(f"{config.DEVICE_BASE_URL}/wifi/scan", timeout=TIMEOUT_SECONDS)
+        resp.raise_for_status()
+        result = resp.json()
+        if not result.get("scanning"):
+            return sorted(result.get("networks", []), key=lambda n: n.get("rssi", -999), reverse=True)
+        if time.monotonic() > deadline:
+            raise RuntimeError("WiFi scan did not complete in time")
+        time.sleep(WIFI_SCAN_POLL_INTERVAL_SECONDS)
+
+
+def set_wifi_credentials(ssid: str, password: str):
+    resp = requests.post(
+        f"{config.DEVICE_BASE_URL}/wifi/connect",
+        data={"ssid": ssid, "password": password},
+        timeout=TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()

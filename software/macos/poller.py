@@ -108,6 +108,14 @@ def _wifi_base_url_if_reachable():
     return discovered
 
 
+def wifi_base_url_if_reachable():
+    """Public wrapper around _wifi_base_url_if_reachable() -- for app.py's
+    Settings routes (WiFi scan/connect/status) to check before deciding
+    whether to talk to the device over its WiFi HTTP server or fall back
+    to BLE. See device_client.py's WiFi-HTTP equivalents of those calls."""
+    return _wifi_base_url_if_reachable()
+
+
 def get_device_firmware_version():
     """Best-effort current firmware version string from the paired device
     (see wifi_sync.cpp's /version route), or None if it's not reachable

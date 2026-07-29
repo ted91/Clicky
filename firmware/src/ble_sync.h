@@ -55,6 +55,14 @@ bool ble_sync_is_paired();
 void ble_sync_start_pairing();  // fast advertising, ~120s auto-timeout
 void ble_sync_stop_pairing();   // back to normal (slow-adv if paired, silent if not)
 
+// BLE is a backup sync/control path, not a peer to WiFi -- call
+// periodically (e.g. indicatorTask's 1s tick) so idle BLE advertising
+// stops the moment WiFi is actually connected, and resumes automatically
+// once WiFi disconnects or its radio session ends. No-op during active
+// pairing or an active BLE connection -- those already own their own
+// advertising state.
+void ble_sync_reconcile_advertising();
+
 // True once a fast-pairing window's ~120s timeout has elapsed without a
 // connection -- main.cpp polls this to know when to drop Status::PAIRING
 // back to NONE on its own (independent of BOOT-button activity).

@@ -241,6 +241,7 @@ static void indicatorTask(void *arg) {
     int batterySampleCounter = 0;
     for (;;) {
         power_mgr_tick(); // updates the debounced external-power reading
+        ble_sync_reconcile_advertising(); // BLE is a backup -- stay silent while WiFi is actually up
         bool syncing = ble_sync_is_transferring() || wifi_sync_is_transferring();
         face_update_indicators(ble_sync_is_connected(), wifi_sync_is_connected(), syncing);
 

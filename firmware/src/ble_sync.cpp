@@ -305,24 +305,34 @@ static void applyAdvertisingInterval(uint16_t minInterval, uint16_t maxInterval)
 // reconnectability alive (slow adv); unpaired devices stay silent until
 // the user explicitly enters pairing via the BOOT-button status cycle.
 //
-// REVERTED: briefly tried suppressing this whole thing while WiFi was
-// connected (BLE as pure backup) -- broke WiFi scan/reconfigure from the
-// Settings page, which goes over this exact same BLE connection
-// (ble_device_client.py writes SCANWIFI/SETWIFI to the CONTROL
-// characteristic) regardless of whether WiFi is already connected. If BLE
-// stops advertising the moment WiFi connects, the dashboard can never open
-// a fresh connection to change networks again -- a real dead end, not just
-// a battery tradeoff. Slow advertising is already deliberately low-duty
-// (see SLOW_ADV_MIN/MAX's comment, ~10-20x less than old always-fast
-// advertising), so staying reachable here costs little.
+// BLE is the backup sync/control path (see ble_sync.h's module docstring)
+// -- only one radio needs to be actively reachable at a time, and WiFi
+// wins whenever it's up (higher throughput, longer range, see
+// poller._get_transport()'s own preference). A prior attempt at this
+// exact suppression broke WiFi scan/reconfigure from the Settings page,
+// because at the time that only ever went over BLE regardless of WiFi
+// state -- fixed now (see device_client.py's WiFi-HTTP scan/connect/status,
+// used by app.py whenever WiFi is reachable; BLE is the fallback for
+// "device isn't on WiFi at all yet"), so suppressing idle BLE advertising
+// while WiFi is connected no longer creates a dead end.
 static void resumeIdleAdvertising() {
     if (s_pairingActive) return; // pairing's own fast-adv window owns this
-    if (s_paired) {
+    if (s_paired && !wifi_sync_is_connected()) {
         applyAdvertisingInterval(SLOW_ADV_MIN, SLOW_ADV_MAX);
         NimBLEDevice::startAdvertising();
     } else {
         NimBLEDevice::stopAdvertising();
     }
+}
+
+// Call periodically (indicatorTask's 1s tick) -- WiFi's connection state
+// can change independent of any BLE-side event (connect, disconnect, pair,
+// unpair), so nothing else would otherwise notice "WiFi just connected,
+// stop advertising" or "WiFi just dropped, resume as backup" in between
+// those events.
+void ble_sync_reconcile_advertising() {
+    if (s_pairingActive || s_centralConnected) return; // those own advertising state themselves
+    resumeIdleAdvertising();
 }
 
 bool ble_sync_is_paired() { return s_paired; }

@@ -597,12 +597,25 @@ def settings_wifi_connect(request: Request, ssid: str = Form(...), password: str
     redirect = _gate(request)
     if redirect:
         return redirect
-    import ble_device_client
+    # BLE is backup-only now (see ble_sync.cpp's resumeIdleAdvertising() --
+    # it stops idle-advertising while WiFi is connected), so reach the
+    # device over its own WiFi HTTP server whenever that's actually
+    # reachable, same as every other device call already does (see
+    # poller._get_transport()); BLE is the fallback for "device isn't on
+    # WiFi yet at all," which is exactly the case this route also needs to
+    # keep working for (first-time setup).
+    wifi_url = poller.wifi_base_url_if_reachable()
     try:
-        ble_device_client.set_wifi_credentials(ssid, password)
+        if wifi_url:
+            import device_client
+            device_client.set_wifi_credentials(ssid, password)
+        else:
+            import ble_device_client
+            ble_device_client.set_wifi_credentials(ssid, password)
         msg = f"Sent -- device is connecting to \"{ssid}\". Reload in a few seconds to check status."
     except Exception as e:
-        msg = f"Failed to reach device over BLE: {e}"
+        transport = "WiFi" if wifi_url else "BLE"
+        msg = f"Failed to reach device over {transport}: {e}"
     return RedirectResponse(f"/settings?panel=device&wifi_msg={msg}", status_code=303)
 
 
@@ -611,8 +624,12 @@ def api_wifi_status(request: Request):
     redirect = _gate(request)
     if redirect:
         return redirect
-    import ble_device_client
+    wifi_url = poller.wifi_base_url_if_reachable()
     try:
+        if wifi_url:
+            import device_client
+            return device_client.get_wifi_status()
+        import ble_device_client
         return ble_device_client.get_wifi_status()
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=503)
@@ -623,8 +640,12 @@ def api_wifi_scan(request: Request):
     redirect = _gate(request)
     if redirect:
         return redirect
-    import ble_device_client
+    wifi_url = poller.wifi_base_url_if_reachable()
     try:
+        if wifi_url:
+            import device_client
+            return {"networks": device_client.scan_wifi_networks()}
+        import ble_device_client
         return {"networks": ble_device_client.scan_wifi_networks()}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=503)
