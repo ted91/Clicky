@@ -79,20 +79,41 @@ def _wifi_base_url_if_reachable():
     to asking the device for its current IP over BLE -- which also
     doubles as auto-discovery: the device's WiFi IP is DHCP-assigned and
     can change between reboots/reconnects, so this never assumes
-    config.DEVICE_BASE_URL is still correct, it verifies live."""
+    config.DEVICE_BASE_URL is still correct, it verifies live.
+
+    _wifi_probe's in-memory cache doesn't survive an app restart, but the
+    BLE fallback below can no longer be relied on to always work: BLE now
+    stops advertising while WiFi is connected (see ble_sync.cpp's
+    resumeIdleAdvertising()), which is exactly the situation a restarted
+    app finds itself in -- device already on WiFi, BLE deliberately
+    silent. Confirmed live: a fresh process with an empty _wifi_probe cache
+    hung the full 15s BLE timeout and returned nothing, even though the
+    device was reachable over WiFi the whole time. settings.json's
+    persisted last-known IP breaks that chicken-and-egg: try it directly
+    over HTTP first, no BLE involved, before ever falling back to a BLE
+    scan (which now only succeeds when WiFi genuinely isn't up)."""
     now = time.monotonic()
     if now - _wifi_probe["last_check"] < _WIFI_PROBE_INTERVAL_SECONDS:
         return _wifi_probe["base_url"] if _wifi_probe["reachable"] else None
 
     cached = _wifi_probe["base_url"]
+    if not cached:
+        persisted_ip = settings.get_all().get("last_known_device_ip")
+        if persisted_ip:
+            cached = f"http://{persisted_ip}"
     if cached and _http_reachable(cached):
-        _wifi_probe.update(last_check=now, reachable=True)
+        _wifi_probe.update(base_url=cached, last_check=now, reachable=True)
+        settings.update(last_known_device_ip=cached.replace("http://", ""))
         return cached
 
-    # No cached URL, or it stopped working -- ask the device for its
-    # current WiFi status over BLE (works regardless of sync_transport;
+    # No cached/persisted URL, or it stopped working -- ask the device for
+    # its current WiFi status over BLE (works regardless of sync_transport;
     # see ble_device_client.get_wifi_status()'s docstring) and verify
-    # whatever IP it reports is actually reachable before trusting it.
+    # whatever IP it reports is actually reachable before trusting it. Only
+    # actually reachable itself when WiFi is NOT currently connected (see
+    # this function's own docstring) -- the persisted-IP check above is
+    # what covers the much more common "already on WiFi, just restarted"
+    # case instead.
     discovered = None
     try:
         import ble_device_client
@@ -101,6 +122,7 @@ def _wifi_base_url_if_reachable():
             candidate = f"http://{wifi_status['ip']}"
             if _http_reachable(candidate):
                 discovered = candidate
+                settings.update(last_known_device_ip=wifi_status["ip"])
     except Exception as e:
         log.debug("WiFi reachability auto-discovery via BLE failed: %s", e)
 
