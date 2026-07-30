@@ -774,6 +774,18 @@ async def process_once():
 
             formatted = format_transcript_with_speakers(transcript, segments)
 
+            # Jarvis voice commands (cmd_*.wav, see recorder.cpp) skip the
+            # memo pipeline entirely -- routed here, right before the
+            # type-classification call below, so a command never pays for
+            # two wasted memo-pipeline LLM calls (type classification +
+            # summarize) before being dispatched.
+            if record.get("kind") == "command":
+                import jarvis
+                jarvis_result = await asyncio.to_thread(jarvis.process_command, record, formatted)
+                storage.mark_jarvis_processed(content_hash, transcript, jarvis_result, stt_name)
+                status.update(sync_ok=True)
+                continue
+
             # Dedicated journal-vs-conversation classification, run BEFORE
             # the big summary call rather than left as one field competing
             # for attention inside it -- see providers.base.
@@ -912,6 +924,8 @@ async def process_once():
             log.error("failed to process %s: %s", record["name"], e)
             storage.mark_failed(content_hash, str(e))
             status.update(sync_ok=False)
+            import analytics
+            analytics.track_event("processing_failures")
         finally:
             status.update(sync_in_progress=False)
 
@@ -1874,6 +1888,55 @@ LONG_FORM_PLATFORMS = ("substack", "medium")
 TEASER_PLATFORMS = ("linkedin", "x")
 
 
+def generate_social_posts(transcript: str, meeting: dict = None) -> dict:
+    """Synchronous core of the LLM social-post generation -- extracted out
+    of check_social_post_generation_triggers_once so jarvis.py's
+    _action_social_post ("write me a post based on...") can reuse the exact
+    same generation/signature logic without duplicating it, and without
+    needing to be async (jarvis.py's action handlers are all plain sync
+    functions run via asyncio.to_thread from process_once). Returns {} if
+    nothing worth publishing was generated (empty long_form_body)."""
+    from providers.base import build_social_post_prompt, parse_social_post_json
+    from providers import get_completer
+    _, complete = get_completer()
+    # summary intentionally NOT passed -- build_social_post_prompt generates
+    # from the raw transcript only, not the already-condensed summary (see
+    # its docstring).
+    prompt = build_social_post_prompt(transcript or "", meeting=meeting)
+    raw = complete(prompt)
+    generated = parse_social_post_json(raw)
+    if not generated.get("long_form_body"):
+        return {}
+
+    posts = {}
+    # Deterministic signature, not LLM-generated -- guarantees the exact
+    # text every time rather than relying on the model to remember it.
+    long_form_body = generated["long_form_body"]
+    if long_form_body:
+        long_form_body = long_form_body.rstrip() + "\n\n— written using Clicky"
+    for platform in LONG_FORM_PLATFORMS:
+        posts[platform] = {
+            "status": "draft", "title": generated["long_form_title"], "body": long_form_body,
+            "notion_page_id": None, "scheduled_at": None, "published_at": None, "url": None, "error": None,
+        }
+    teaser_body = generated["linkedin_teaser"]
+    if teaser_body:
+        # Signature goes before the {{LONG_FORM_URL}} placeholder (kept on
+        # its own trailing line, same as the LLM was told to produce it) so
+        # the link stays the last thing in the post either way.
+        if "{{LONG_FORM_URL}}" in teaser_body:
+            before, _, after = teaser_body.rpartition("{{LONG_FORM_URL}}")
+            teaser_body = before.rstrip() + "\n\n— written using Clicky\n{{LONG_FORM_URL}}" + after
+        else:
+            teaser_body = teaser_body.rstrip() + "\n\n— written using Clicky"
+    for platform in TEASER_PLATFORMS:
+        posts[platform] = {
+            "status": "draft", "title": None, "body": teaser_body,
+            "notion_page_id": None, "scheduled_at": None, "published_at": None, "url": None, "error": None,
+        }
+    return posts
+
+
 async def check_social_post_generation_triggers_once():
     """On-demand replacement for the old always-journal-only auto-generation:
     polls the "Generate Social Media" checkbox -- notion_sync.
@@ -1896,8 +1959,6 @@ async def check_social_post_generation_triggers_once():
     obsidian_configured = bool(saved.get("obsidian_vault_path"))
     if not notion_configured and not obsidian_configured:
         return  # feature isn't set up on either backend -- see /integrations
-    from providers.base import build_social_post_prompt, parse_social_post_json
-    from providers import get_completer
 
     notion_sync = None
     if notion_configured:
@@ -1955,50 +2016,17 @@ async def check_social_post_generation_triggers_once():
             continue
 
         try:
-            _, complete = get_completer()
-            # summary intentionally NOT passed -- build_social_post_prompt
-            # generates from the raw transcript only, not the already-
-            # condensed summary (see its docstring).
-            prompt = build_social_post_prompt(record.get("transcript") or "", meeting=record.get("meeting"))
-            raw = await asyncio.to_thread(complete, prompt)
-            generated = parse_social_post_json(raw)
+            posts = await asyncio.to_thread(generate_social_posts, record.get("transcript") or "", record.get("meeting"))
         except Exception as e:
             log.error("failed to generate social post for %s: %s", record["name"], e)
             continue
 
-        if not generated.get("long_form_body"):
+        if not posts:
             for page_id in triggered_notion_ids:
                 await asyncio.to_thread(notion_sync.reset_generate_social_trigger, page_id)
             if obsidian_trigger_path:
                 await asyncio.to_thread(obsidian_sync.reset_generate_social_trigger, obsidian_trigger_path)
             continue
-
-        posts = {}
-        # Deterministic signature, not LLM-generated -- guarantees the exact
-        # text every time rather than relying on the model to remember it.
-        long_form_body = generated["long_form_body"]
-        if long_form_body:
-            long_form_body = long_form_body.rstrip() + "\n\n— written using Clicky"
-        for platform in LONG_FORM_PLATFORMS:
-            posts[platform] = {
-                "status": "draft", "title": generated["long_form_title"], "body": long_form_body,
-                "notion_page_id": None, "scheduled_at": None, "published_at": None, "url": None, "error": None,
-            }
-        teaser_body = generated["linkedin_teaser"]
-        if teaser_body:
-            # Signature goes before the {{LONG_FORM_URL}} placeholder (kept
-            # on its own trailing line, same as the LLM was told to produce
-            # it) so the link stays the last thing in the post either way.
-            if "{{LONG_FORM_URL}}" in teaser_body:
-                before, _, after = teaser_body.rpartition("{{LONG_FORM_URL}}")
-                teaser_body = before.rstrip() + "\n\n— written using Clicky\n{{LONG_FORM_URL}}" + after
-            else:
-                teaser_body = teaser_body.rstrip() + "\n\n— written using Clicky"
-        for platform in TEASER_PLATFORMS:
-            posts[platform] = {
-                "status": "draft", "title": None, "body": teaser_body,
-                "notion_page_id": None, "scheduled_at": None, "published_at": None, "url": None, "error": None,
-            }
 
         record_with_posts = dict(record, social_posts=posts)
         pushed_any = False
@@ -2030,6 +2058,51 @@ async def check_social_post_generation_triggers_once():
         import analytics
         for platform in posts:
             analytics.track_event("social_posts_generated", key=platform)
+
+
+def push_social_posts_now(content_hash: str) -> dict:
+    """Pushes a record's already-generated social_posts to whichever of
+    Notion Publications DB / Obsidian vault is configured RIGHT NOW --
+    called by the dashboard's "Sync now" button (see app.py's
+    /social/sync-now route) and by jarvis.py's _action_social_post right
+    after generating a post, in case a backend happens to already be
+    configured. Unlike check_social_post_generation_triggers_once, this
+    does NOT require the record to already have a Notion Notes/Journal
+    page id -- related_page_id is simply None when there isn't one (both
+    notion_sync.push_social_posts and obsidian_sync.push_social_posts
+    already tolerate that, since a Jarvis-generated post has no source
+    Note page at all)."""
+    record = storage.get_recording(content_hash)
+    if not record or not record.get("social_posts"):
+        return {"pushed": False, "error": "no_posts"}
+    saved = settings.get_all()
+    notion_configured = bool(saved.get("notion_publications_database_id") and saved.get("notion_token"))
+    obsidian_configured = bool(saved.get("obsidian_vault_path"))
+    if not notion_configured and not obsidian_configured:
+        return {"pushed": False, "error": "not_configured"}
+
+    pushed_any = False
+    if notion_configured and not record.get("notion_publication_page_id"):
+        try:
+            import notion_sync
+            related = record.get("notion_page_id") or record.get("notion_journal_page_id")
+            created = notion_sync.push_social_posts(record, related)
+            if created.get("notion_page_id"):
+                storage.set_notion_publication_page_id(content_hash, created["notion_page_id"])
+                pushed_any = True
+        except Exception as e:
+            log.error("failed to push social posts for %s to Notion: %s", record["name"], e)
+    if obsidian_configured and not record.get("obsidian_publication_note_path"):
+        try:
+            import obsidian_sync
+            related = record.get("obsidian_note_path") or record.get("obsidian_journal_note_path")
+            path = obsidian_sync.push_social_posts(record, related)
+            if path:
+                storage.set_obsidian_publication_note_path(content_hash, path)
+                pushed_any = True
+        except Exception as e:
+            log.error("failed to push social posts for %s to Obsidian: %s", record["name"], e)
+    return {"pushed": pushed_any}
 
 
 async def check_publication_approvals_once():
@@ -2241,12 +2314,29 @@ async def check_social_publish_once():
                                              pub_note_path, platform, "failed")
 
 
-def _format_usage_digest(summary: dict) -> str:
+def _format_usage_digest(summary: dict, device_info: dict = None) -> str:
     saved = settings.get_all()
     owner_name = saved.get("owner_name") or "(not set -- add it in Settings -> Account)"
     lines = [
         f"Owner: {owner_name}",
-        f"Device ID: {settings.get_or_create_device_id()}",
+        f"App install ID: {settings.get_or_create_device_id()}",
+    ]
+    # device_info (chip_id/name/battery -- see wifi_sync.cpp's /device/info)
+    # is best-effort: only present if the physical device happened to be
+    # reachable when this digest was built. chip_id is the stable per-ESP32
+    # identity the admin fleet page also uses (see app.py's /admin) --
+    # what actually lets "which physical device did this come from" be
+    # answered across many users' independent app installs, since
+    # "App install ID" above is random per Mac, not tied to the hardware.
+    if device_info:
+        lines.append(
+            f"Device: {device_info.get('name') or '(unnamed)'} "
+            f"(chip {device_info.get('chip_id', 'unknown')}, firmware v{device_info.get('version', '?')})"
+        )
+        if "batteryPct" in device_info:
+            charging = " (charging)" if device_info.get("externalPower") else ""
+            lines.append(f"Battery: {device_info['batteryPct']}%{charging}")
+    lines += [
         "",
         "Clicky usage summary since " + (summary.get("period_start") or "install") + ":",
         "",
@@ -2278,6 +2368,10 @@ def _format_usage_digest(summary: dict) -> str:
         lines.append(f"Duplicate People pages merged: {summary['people_merged']}")
     if summary.get("feedback_submitted_count"):
         lines.append(f"Feedback submitted: {summary['feedback_submitted_count']}")
+    if summary.get("jarvis_commands"):
+        lines.append(f"Jarvis voice commands: {summary['jarvis_commands']}")
+    if summary.get("processing_failures"):
+        lines.append(f"Processing failures (software health): {summary['processing_failures']}")
     return "\n".join(lines)
 
 
@@ -2312,12 +2406,21 @@ async def check_usage_report_once():
         # retry every poll cycle for an empty report, but skip the email.
         analytics.reset_period(today)
         return
+    device_info = None
+    try:
+        wifi_url = _wifi_base_url_if_reachable()
+        if wifi_url:
+            import device_client
+            device_info = await asyncio.to_thread(device_client.get_device_info, wifi_url)
+    except Exception as e:
+        log.debug("device info fetch for usage digest failed (non-fatal): %s", e)
+
     try:
         await asyncio.to_thread(
             google_client.send_email,
             ["sanchit.gupta01@gmail.com"],
             "Clicky usage digest",
-            _format_usage_digest(summary),
+            _format_usage_digest(summary, device_info),
         )
     except Exception as e:
         log.warning("usage digest email failed (will retry next poll cycle): %s", e)
@@ -2331,20 +2434,22 @@ def check_notifications_once():
     transcription, so any failure is swallowed inside notifications.py
     itself, not here.
 
-    Always routed over BLE, regardless of the configured sync_transport --
-    the firmware now gates its WiFi radio off except during a bounded sync
-    session (battery, see wifi_sync.cpp), so a notification riding the
-    "wifi" transport would fail almost all the time once WiFi is the active
-    sync_transport. BLE stays continuously advertising/connectable whenever
-    the device is paired (slow-interval reconnect, see ble_sync.cpp), which
-    is exactly what a notification needs regardless of which transport is
-    moving audio files. notifications._push() only marks a notification
-    "seen" once send_notification() actually succeeds, so a failed push
-    here (device asleep/out of range) is retried automatically on the next
-    poll cycle -- no separate queue needed."""
-    import ble_device_client
+    Prefers WiFi (same _get_transport() selection every other device call
+    uses) and falls back to BLE only when WiFi isn't reachable -- BLE is
+    now a backup path (see ble_sync.cpp's resumeIdleAdvertising), not the
+    always-on primary, so hardcoding BLE here would silently degrade once
+    WiFi is the active sync_transport. notifications._push() only marks a
+    notification "seen" once send_notification() actually succeeds, so a
+    failed push here (device asleep/out of range on both transports) is
+    retried automatically on the next poll cycle -- no separate queue
+    needed."""
     try:
-        notifications.check_once(ble_device_client)
+        transport = _get_transport()
+    except Exception as e:
+        log.warning("notifications check failed: could not resolve transport: %s", e)
+        return
+    try:
+        notifications.check_once(transport)
     except Exception as e:
         log.warning("notifications check failed: %s", e)
 

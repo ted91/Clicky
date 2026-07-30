@@ -15,7 +15,16 @@ void recorder_init();
 // consecutive recordings don't collide. Safe to call again only after
 // recorder_stop() has fully finished (recorder_is_recording() == false).
 // Plays a short click through the speaker before recording begins.
-void recorder_start();
+// isCommand=true records a Jarvis voice command instead of a memo -- saved
+// as cmd_NNN.wav (own NVS-persisted counter, see recorder.cpp) instead of
+// rec_NNN.wav, excluded from FIFO eviction, and meant to be deleted from SD
+// by the host right after processing rather than kept as a permanent
+// archive.
+void recorder_start(bool isCommand = false);
+
+// True if the most recently completed recording was a Jarvis command
+// (started with isCommand=true) rather than a memo.
+bool recorder_last_was_command();
 
 // Signals the recording task to finalize the WAV header and close out.
 // Returns immediately; poll recorder_is_recording() to know when it's done.
@@ -64,5 +73,13 @@ void recorder_clear_ram();
 // Silently skipped while a recording is in progress -- record and playback
 // share the I2S peripheral. Blocks ~18ms.
 void recorder_notify_click();
+
+// Plays a WAV buffer (header + 16-bit PCM, any channel count matching the
+// codec's open format -- see audio_bsp.c) through the speaker, chunked so a
+// button press can preempt it. Skipped entirely if a recording is in
+// progress (same I2S-sharing constraint as recorder_notify_click()).
+// Blocks for the duration of playback; call from a dedicated low-priority
+// task (see main.cpp's jarvisAudioTask), never from the button/HTTP tasks.
+void recorder_play_wav(const uint8_t *data, size_t len);
 
 #endif

@@ -146,3 +146,41 @@ def set_wifi_credentials(ssid: str, password: str):
         timeout=TIMEOUT_SECONDS,
     )
     resp.raise_for_status()
+
+
+def get_device_info(base_url: str = None) -> dict:
+    """{"chip_id": str, "name": str, "version": str} -- chip_id is the
+    ESP32's stable factory-programmed identity (see wifi_sync.cpp's
+    chipIdHex()), name is the user-set friendly label (NVS). Takes an
+    explicit base_url (unlike most functions in this module, which default
+    to config.DEVICE_BASE_URL) so the admin fleet page (app.py's /admin)
+    can query any device on the LAN by IP, not just the one currently
+    paired to this app install."""
+    resp = requests.get(f"{base_url or config.DEVICE_BASE_URL}/device/info", timeout=TIMEOUT_SECONDS)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def set_device_name(name: str, base_url: str = None):
+    resp = requests.post(
+        f"{base_url or config.DEVICE_BASE_URL}/device/name",
+        data={"name": name},
+        timeout=TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+
+
+def send_jarvis_audio(wav_bytes: bytes, base_url: str = None):
+    """Uploads a Jarvis spoken reply for on-device playback via POST
+    /jarvis/audio (see wifi_sync.cpp's handleJarvisAudioUpload/Complete) --
+    same multipart/form-data idiom as update_check.py's firmware push.
+    WiFi-only in Phase 1 (no BLE equivalent -- see the firmware endpoint's
+    own doc on payload size), so base_url is required rather than falling
+    back to config.DEVICE_BASE_URL silently; jarvis.send_audio_reply()
+    already checked WiFi reachability before calling this."""
+    resp = requests.post(
+        f"{base_url or config.DEVICE_BASE_URL}/jarvis/audio",
+        files={"audio": ("reply.wav", wav_bytes, "audio/wav")},
+        timeout=60,
+    )
+    resp.raise_for_status()

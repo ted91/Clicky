@@ -15,6 +15,8 @@
 #include "fw_version.h"
 #include <NimBLEDevice.h>
 #include <Update.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 // ESP32-S3 shares one physical radio between WiFi and BLE (time-division
 // coexistence, see beginConnectAttempt()'s own comment on this same
@@ -296,6 +298,65 @@ static void handleVersion() {
     s_server.send(200, "application/json", String("{\"version\":\"") + FW_VERSION + "\"}");
 }
 
+// --- fleet admin: stable chip identity + settable friendly name ----------
+// Only reachable over the local network, same as every other route here --
+// no cloud involved. Used by the Mac app's admin-only device management
+// page (naming + flashing devices before shipping them out) and by the
+// daily usage-report email (see poller.py's _format_usage_digest), which
+// tags each digest with the device it came from.
+static Preferences s_devicePrefs;
+
+// ESP32-S3's factory-programmed MAC-derived efuse ID -- stable for the
+// life of the chip, unique per device, needs no NVS write of its own
+// (unlike the friendly name below, which is user-set and persisted).
+static String chipIdHex() {
+    uint64_t mac = ESP.getEfuseMac();
+    char buf[17];
+    snprintf(buf, sizeof(buf), "%04X%08X", (uint16_t)(mac >> 32), (uint32_t)mac);
+    return String(buf);
+}
+
+static String jsonEscapeSimple(const String &s) {
+    String out;
+    out.reserve(s.length());
+    for (size_t i = 0; i < s.length(); i++) {
+        char c = s[i];
+        if (c == '"' || c == '\\') out += '\\';
+        out += c;
+    }
+    return out;
+}
+
+static void handleDeviceInfo() {
+    noteHttpActivity();
+    s_devicePrefs.begin("device", /*readOnly=*/true);
+    String name = s_devicePrefs.getString("name", "");
+    s_devicePrefs.end();
+    // Battery/power included directly here (not a separate call) -- the
+    // admin fleet page and the daily usage-report digest (see poller.py's
+    // _format_usage_digest) both just want one snapshot request per device.
+    String json = "{\"chip_id\":\"" + chipIdHex() + "\",\"name\":\"" + jsonEscapeSimple(name) +
+                  "\",\"version\":\"" FW_VERSION "\",\"batteryPct\":" + String(power_mgr_battery_pct()) +
+                  ",\"batteryMv\":" + String(power_mgr_battery_mv()) +
+                  ",\"externalPower\":" + String(power_mgr_on_external_power() ? "true" : "false") +
+                  ",\"uptimeMs\":" + String(millis()) + "}";
+    s_server.send(200, "application/json", json);
+}
+
+static void handleSetDeviceName() {
+    noteHttpActivity();
+    if (!s_server.hasArg("name")) {
+        s_server.send(400, "text/plain", "missing name");
+        return;
+    }
+    String name = s_server.arg("name");
+    s_devicePrefs.begin("device", /*readOnly=*/false);
+    s_devicePrefs.putString("name", name);
+    s_devicePrefs.end();
+    Serial.printf("wifi_sync: device friendly name set to \"%s\"\n", name.c_str());
+    s_server.send(200, "application/json", "{\"ok\":true}");
+}
+
 // Firmware auto-update, flashed to the inactive OTA partition (see
 // partitions.csv). Uses WebServer's two-callback multipart upload
 // mechanism (handleOtaUpload below, registered as the 4th arg to
@@ -354,6 +415,94 @@ static void handleOtaComplete() {
     s_server.client().flush();
     delay(500); // let the response actually reach the app before the radio drops
     ESP.restart();
+}
+
+// --- Jarvis spoken-reply playback -----------------------------------------
+// Same HTTPUpload multipart pattern as /ota above, but instead of flashing
+// firmware, buffers the WAV (header + 16-bit PCM, matching the codec's open
+// stereo/16kHz format -- see audio_bsp.c and recorder_play_wav's own
+// comment) into a growing PSRAM allocation and hands it to a dedicated
+// low-priority playback task once the whole file has arrived. jarvis.py's
+// send_audio_reply() is the sender. Capped at JARVIS_AUDIO_MAX_BYTES --
+// comfortably more than a realistic spoken reply needs -- so a runaway
+// upload can't exhaust PSRAM.
+static uint8_t *s_jarvisBuf = nullptr;
+static size_t s_jarvisLen = 0;
+static size_t s_jarvisCap = 0;
+static const size_t JARVIS_AUDIO_MAX_BYTES = 2UL * 1024 * 1024;
+
+struct JarvisPlaybackArgs {
+    uint8_t *data;
+    size_t len;
+};
+
+// Runs on core 1 at priority 1 -- same tier as indicatorTask/sleepWatchTask
+// in main.cpp, below buttonTask's priority 5, so a button press still
+// preempts a reply that's still speaking (recorder_play_wav's own
+// s_recording check handles the actual handoff).
+static void jarvisPlaybackTask(void *arg) {
+    JarvisPlaybackArgs *args = (JarvisPlaybackArgs *)arg;
+    recorder_play_wav(args->data, args->len);
+    heap_caps_free(args->data);
+    delete args;
+    vTaskDelete(NULL);
+}
+
+static void handleJarvisAudioUpload() {
+    HTTPUpload &upload = s_server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+        noteHttpActivity();
+        Serial.println("wifi_sync: Jarvis audio reply upload starting");
+        if (s_jarvisBuf) { heap_caps_free(s_jarvisBuf); s_jarvisBuf = nullptr; }
+        s_jarvisCap = 64 * 1024;
+        s_jarvisBuf = (uint8_t *)heap_caps_malloc(s_jarvisCap, MALLOC_CAP_SPIRAM);
+        s_jarvisLen = 0;
+        if (!s_jarvisBuf) {
+            Serial.println("wifi_sync: Jarvis audio reply -- initial PSRAM alloc failed");
+            s_jarvisCap = 0;
+        }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (!s_jarvisBuf) return;
+        if (s_jarvisLen + upload.currentSize > JARVIS_AUDIO_MAX_BYTES) {
+            Serial.println("wifi_sync: Jarvis audio reply exceeds max size, aborting");
+            heap_caps_free(s_jarvisBuf);
+            s_jarvisBuf = nullptr;
+            return;
+        }
+        if (s_jarvisLen + upload.currentSize > s_jarvisCap) {
+            size_t newCap = s_jarvisCap * 2;
+            while (newCap < s_jarvisLen + upload.currentSize) newCap *= 2;
+            uint8_t *grown = (uint8_t *)heap_caps_realloc(s_jarvisBuf, newCap, MALLOC_CAP_SPIRAM);
+            if (!grown) {
+                Serial.println("wifi_sync: Jarvis audio reply realloc failed, aborting");
+                heap_caps_free(s_jarvisBuf);
+                s_jarvisBuf = nullptr;
+                return;
+            }
+            s_jarvisBuf = grown;
+            s_jarvisCap = newCap;
+        }
+        memcpy(s_jarvisBuf + s_jarvisLen, upload.buf, upload.currentSize);
+        s_jarvisLen += upload.currentSize;
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+        if (s_jarvisBuf) { heap_caps_free(s_jarvisBuf); s_jarvisBuf = nullptr; }
+        Serial.println("wifi_sync: Jarvis audio reply upload aborted");
+    }
+}
+
+static void handleJarvisAudioComplete() {
+    if (!s_jarvisBuf || s_jarvisLen == 0) {
+        s_server.send(500, "text/plain", "jarvis audio upload failed");
+        return;
+    }
+    Serial.printf("wifi_sync: Jarvis audio reply received (%u bytes), starting playback\n", (unsigned)s_jarvisLen);
+    s_server.send(200, "text/plain", "ok (playing)");
+
+    JarvisPlaybackArgs *args = new JarvisPlaybackArgs{s_jarvisBuf, s_jarvisLen};
+    s_jarvisBuf = nullptr; // ownership transferred to the playback task
+    s_jarvisLen = 0;
+    s_jarvisCap = 0;
+    xTaskCreatePinnedToCore(jarvisPlaybackTask, "jarvisPlayback", 3 * 1024, args, 1, nullptr, 1);
 }
 
 // The Mac's poller calls this once a WiFi sync cycle finishes (nothing
@@ -653,7 +802,10 @@ void wifi_sync_init() {
     s_server.on("/wifi/scan", HTTP_POST, handleWifiScanStart);
     s_server.on("/wifi/scan", HTTP_GET, handleWifiScanStatus);
     s_server.on("/version", HTTP_GET, handleVersion);
+    s_server.on("/device/info", HTTP_GET, handleDeviceInfo);
+    s_server.on("/device/name", HTTP_POST, handleSetDeviceName);
     s_server.on("/ota", HTTP_POST, handleOtaComplete, handleOtaUpload);
+    s_server.on("/jarvis/audio", HTTP_POST, handleJarvisAudioComplete, handleJarvisAudioUpload);
     s_server.begin();
 
     // Radio-off by default: the server socket is registered (lwIP survives

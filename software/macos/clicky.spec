@@ -112,8 +112,14 @@ app = BUNDLE(
         # attributes correctly to Clicky.app rather than behaving
         # differently for a bundled helper -- worth confirming on first
         # real run.
-        'NSAppleEventsUsageDescription': "Clicky checks your browser's open tabs for an active Google Meet call, to auto-record ad-hoc meetings that have no calendar entry.",
-        'CFBundleShortVersionString': '0.1.0',
+        # Also covers Jarvis's voice-command actions (calendar_event/
+        # reminder/email_draft/qa-with-named-app): AppleScript automation of
+        # Calendar.app/Reminders.app/Mail.app/System Events, gated by this
+        # same Apple Events consent, prompted per target app the first time
+        # each is actually driven -- see jarvis.py's _osascript/
+        # _dispatch_gui_automation.
+        'NSAppleEventsUsageDescription': "Clicky checks your browser's open tabs for an active Google Meet call, to auto-record ad-hoc meetings that have no calendar entry, and drives Calendar/Reminders/Mail/other apps to carry out your Jarvis voice commands.",
+        'CFBundleShortVersionString': '0.5.0',
         'LSUIElement': False,
     },
 )

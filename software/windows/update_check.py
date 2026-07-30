@@ -164,3 +164,33 @@ def push_firmware_update_if_needed(base_url: str) -> bool:
         # check above no-ops once the device is actually updated.
         log.info("firmware push request ended without a clean response (%s) -- device may still be rebooting into it", e)
         return False
+
+
+def force_push_firmware(base_url: str) -> dict:
+    """Unconditional firmware push -- the admin fleet page's explicit
+    "flash this device" action (see app.py's /admin/flash), unlike
+    push_firmware_update_if_needed's opportunistic version-gated check.
+    Always uploads the bundled firmware.bin regardless of the device's
+    current version, since an admin flashing devices before shipping wants
+    every unit on the exact same build, not just "newer than what's
+    there"."""
+    firmware_path = os.path.join(config.FIRMWARE_DIR, "firmware.bin")
+    try:
+        with open(firmware_path, "rb") as f:
+            firmware_bytes = f.read()
+    except OSError as e:
+        return {"ok": False, "error": f"bundled firmware.bin missing or unreadable: {e}"}
+    try:
+        resp = requests.post(
+            f"{base_url}/ota",
+            files={"firmware": ("firmware.bin", firmware_bytes, "application/octet-stream")},
+            timeout=60,
+        )
+        if not resp.ok:
+            return {"ok": False, "error": f"device rejected push: {resp.status_code} {resp.text[:200]}"}
+        return {"ok": True}
+    except Exception as e:
+        # Same expected-happy-path note as push_firmware_update_if_needed:
+        # ESP.restart() right after responding can drop the connection even
+        # on a successful flash.
+        return {"ok": True, "note": f"connection ended without a clean response ({e}) -- device may still be rebooting into it"}

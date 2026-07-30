@@ -11,6 +11,7 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <Preferences.h>
 
 static const char *SDCARD_DIR = "/sdcard";
 
@@ -47,8 +48,29 @@ static volatile bool s_stopRequested = false;
 static volatile bool s_cancelRequested = false; // discard instead of save -- see recorder_cancel()
 static volatile bool s_recording = false;
 static bool s_lastWasSd = false;
+static bool s_lastWasCommand = false;
+static bool s_currentIsCommand = false;
 static String s_lastFile = "";
 static int s_recIndex = 0;
+
+// cmd_NNN.wav files are deleted from SD by the host right after processing
+// (see wifi_sync.cpp's force-delete route), unlike rec_NNN.wav which is a
+// permanent archive -- so ensureRecIndexInitialized()'s "scan the card for
+// the highest existing index" approach (see its own comment) cannot work
+// for commands: once every cmd file is gone, a scan would find nothing and
+// reset the counter back to 0, and the host's name+size dedup would then
+// silently skip a reused cmd_000.wav that happens to match an old one's
+// size -- the exact bug ensureRecIndexInitialized() was written to fix for
+// rec_ files, reintroduced for cmd_ files if this counter isn't persisted
+// independently. Stored in NVS instead, incremented monotonically.
+static Preferences s_cmdPrefs;
+static int s_cmdIndex = -1; // -1 == not yet loaded from NVS
+
+static void ensureCmdIndexInitialized() {
+    if (s_cmdIndex >= 0) return;
+    s_cmdPrefs.begin("jarvis", false);
+    s_cmdIndex = s_cmdPrefs.getInt("cmdIndex", 0);
+}
 
 static uint8_t *s_ramBuf = nullptr;      // header + PCM, preallocated once
 static size_t s_ramUsedBytes = 0;        // header + PCM written so far
@@ -199,11 +221,21 @@ static void ensureRecIndexInitialized() {
 }
 
 static void recordToSd(uint8_t *chunkBuf) {
-    ensureRecIndexInitialized();
-    evictOldestSdFileIfNeeded();
-
     char path[64];
-    snprintf(path, sizeof(path), "%s/rec_%03d.wav", SDCARD_DIR, s_recIndex++);
+    if (s_currentIsCommand) {
+        ensureCmdIndexInitialized();
+        snprintf(path, sizeof(path), "%s/cmd_%03d.wav", SDCARD_DIR, s_cmdIndex++);
+        s_cmdPrefs.putInt("cmdIndex", s_cmdIndex);
+        // Commands are deleted from SD by the host right after processing
+        // (see wifi_sync.cpp) rather than kept as a permanent archive, so
+        // they're deliberately excluded from evictOldestSdFileIfNeeded()'s
+        // FIFO (its scan only ever matches rec_%d.wav) and from the
+        // rec_-index scan/eviction below.
+    } else {
+        ensureRecIndexInitialized();
+        evictOldestSdFileIfNeeded();
+        snprintf(path, sizeof(path), "%s/rec_%03d.wav", SDCARD_DIR, s_recIndex++);
+    }
 
     FILE *f = fopen(path, "wb");
     if (!f) {
@@ -240,13 +272,18 @@ static void recordToSd(uint8_t *chunkBuf) {
     fclose(f);
 
     if (s_cancelRequested) {
-        // Cancelled mid-recording (BOOT press, see main.cpp) -- delete the
-        // file and free its index for reuse, as if it never happened.
+        // Cancelled mid-recording (the other button, see main.cpp) -- delete
+        // the file and free its index for reuse, as if it never happened.
         // s_lastWasSd stays as the caller set it (recordTask's optimistic
         // true) but s_lastFile stays empty, and nothing advertises a new
         // recording since the file is gone before any sync can list it.
         remove(path);
-        s_recIndex--;
+        if (s_currentIsCommand) {
+            s_cmdIndex--;
+            s_cmdPrefs.putInt("cmdIndex", s_cmdIndex);
+        } else {
+            s_recIndex--;
+        }
         s_lastFile = "";
         Serial.printf("recorder: recording cancelled, deleted %s\n", path);
         return;
@@ -255,7 +292,12 @@ static void recordToSd(uint8_t *chunkBuf) {
     if (totalDataBytes < MIN_RECORDING_DATA_BYTES) {
         // Same treatment as an explicit cancel -- see MIN_RECORDING_DATA_BYTES.
         remove(path);
-        s_recIndex--;
+        if (s_currentIsCommand) {
+            s_cmdIndex--;
+            s_cmdPrefs.putInt("cmdIndex", s_cmdIndex);
+        } else {
+            s_recIndex--;
+        }
         s_lastFile = "";
         Serial.printf("recorder: discarded %s (%lu bytes, under 1s -- likely an accidental press)\n",
                       path, (unsigned long)totalDataBytes);
@@ -265,6 +307,7 @@ static void recordToSd(uint8_t *chunkBuf) {
     Serial.printf("recorder: saved %s (%lu bytes audio)\n", path, (unsigned long)totalDataBytes);
     s_lastFile = String(path);
     s_lastWasSd = true;
+    s_lastWasCommand = s_currentIsCommand;
 }
 
 static void recordToRam(uint8_t *chunkBuf) {
@@ -314,6 +357,7 @@ static void recordToRam(uint8_t *chunkBuf) {
     s_ramHasRecording = true;
     s_lastWasSd = false;
     s_lastFile = "";
+    s_lastWasCommand = s_currentIsCommand;
     Serial.printf("recorder: saved %lu bytes audio to PSRAM\n", (unsigned long)totalDataBytes);
 }
 
@@ -366,12 +410,17 @@ void recorder_init() {
     }
 }
 
-void recorder_start() {
+void recorder_start(bool isCommand) {
     if (s_recording) return;
     s_stopRequested = false;
     s_cancelRequested = false;
+    s_currentIsCommand = isCommand;
     s_recording = true;
     xTaskCreatePinnedToCore(recordTask, "recorder", 4 * 1024, NULL, 4, &s_recTask, 1);
+}
+
+bool recorder_last_was_command() {
+    return s_lastWasCommand;
 }
 
 void recorder_stop() {
@@ -444,4 +493,38 @@ void recorder_notify_click() {
     audio_playback_write(buf, samples * CHANNELS * sizeof(int16_t));
     if (!wasPowered && !s_recording) audio_bsp_power_down();
     heap_caps_free(buf);
+}
+
+// WAV header layout must match the one this file writes (see WavHeader
+// above) -- the Mac side (jarvis.py's send_audio_reply) builds the same
+// 44-byte RIFF/WAVE/fmt/data layout at 16kHz/stereo/16-bit before upload,
+// so this just skips the header and streams the PCM straight through.
+void recorder_play_wav(const uint8_t *data, size_t len) {
+    // Record and playback share one I2S peripheral -- never run both from
+    // two tasks at once (same constraint as playTones()/recorder_notify_click()).
+    if (s_recording) {
+        Serial.println("recorder: dropping Jarvis audio reply, a recording is in progress");
+        return;
+    }
+    if (len <= sizeof(WavHeader)) return;
+
+    bool wasPowered = audio_bsp_is_powered();
+    if (!wasPowered) audio_bsp_power_up();
+
+    const uint8_t *pcm = data + sizeof(WavHeader);
+    size_t pcmLen = len - sizeof(WavHeader);
+    size_t offset = 0;
+    while (offset < pcmLen) {
+        if (s_recording) {
+            // A button press started a recording mid-playback -- bail
+            // immediately so the new recording gets the I2S peripheral.
+            Serial.println("recorder: Jarvis audio reply interrupted by a new recording");
+            break;
+        }
+        size_t chunk = (pcmLen - offset < CHUNK_BYTES) ? (pcmLen - offset) : CHUNK_BYTES;
+        audio_playback_write((void *)(pcm + offset), chunk);
+        offset += chunk;
+    }
+
+    if (!wasPowered && !s_recording) audio_bsp_power_down();
 }

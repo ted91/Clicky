@@ -1,0 +1,110 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Device Fleet — Clicky Admin</title>
+  <style>
+    :root { --bg: #fff; --fg: #1a1a1a; --border: #ddd; --muted: #666; --ok: #0a7; --warn: #c0392b; --card: #f9f9f9; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #121212; --fg: #eee; --border: #3a3a3a; --muted: #aaa; --ok: #4fd6a0; --warn: #ff6b5e; --card: #1c1c1c; }
+    }
+    :root[data-theme="dark"] { --bg: #121212; --fg: #eee; --border: #3a3a3a; --muted: #aaa; --ok: #4fd6a0; --warn: #ff6b5e; --card: #1c1c1c; }
+    :root[data-theme="light"] { --bg: #fff; --fg: #1a1a1a; --border: #ddd; --muted: #666; --ok: #0a7; --warn: #c0392b; --card: #f9f9f9; }
+
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, Segoe UI, sans-serif; margin: 0; background: var(--bg); color: var(--fg); display: flex; min-height: 100vh; }
+    .app-nav { width: 210px; flex-shrink: 0; background: #f5f5f5; border-right: 1px solid var(--border); padding: 0.75rem 0; }
+    @media (prefers-color-scheme: dark) { .app-nav { background: #1a1a1a; } }
+    :root[data-theme="dark"] .app-nav { background: #1a1a1a; }
+    :root[data-theme="light"] .app-nav { background: #f5f5f5; }
+    .app-nav-item {
+      display: flex; align-items: center; gap: 0.6rem; padding: 0.6rem 1.1rem;
+      font-size: 0.9rem; color: var(--fg); text-decoration: none; border-left: 3px solid transparent;
+      background: none; border-top: none; border-right: none; border-bottom: none; width: 100%; text-align: left; cursor: pointer; font: inherit;
+    }
+    .app-nav-item .icon { font-size: 1.1rem; width: 1.3rem; text-align: center; }
+    .app-nav-item:hover { background: rgba(128,128,128,0.12); }
+    .app-nav-item.active { background: rgba(128,128,128,0.12); border-left-color: var(--ok); font-weight: 600; }
+    .app-nav-logout { margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 0.9rem; }
+
+    .page-content { flex: 1; padding: 1.75rem 2rem; overflow-y: auto; max-width: 640px; }
+    h1 { font-size: 1.1rem; margin: 0 0 0.5rem; }
+    .note { color: var(--muted); font-size: 0.85rem; padding-bottom: 0.9rem; border-bottom: 1px solid var(--border); margin-bottom: 1.25rem; }
+    fieldset { border: 1px solid var(--border); border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+    label { display: block; font-size: 0.85rem; margin: 0.6rem 0 0.2rem; }
+    input[type=text] { width: 100%; padding: 0.5rem; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--fg); }
+    .actions { display: flex; gap: 0.5rem; margin-top: 0.75rem; flex-wrap: wrap; }
+    button { padding: 0.5rem 0.9rem; border: 1px solid var(--border); border-radius: 6px; background: var(--card); color: var(--fg); cursor: pointer; font-size: 0.85rem; }
+    button.primary { background: var(--ok); color: #fff; border-color: var(--ok); }
+    .result { margin-top: 1rem; padding: 0.9rem 1rem; border-radius: 8px; border: 1px solid var(--border); }
+    .result.ok { border-color: var(--ok); }
+    .result.error { border-color: var(--warn); }
+    .result pre { white-space: pre-wrap; font-size: 0.85rem; margin: 0.4rem 0 0; }
+  </style>
+</head>
+<body>
+  {% include "_nav.html" %}
+  <div class="page-content">
+    <h1>Device Fleet</h1>
+    <div class="note">
+      Local-network only — talks directly to whatever IP you enter below, no cloud relay. For naming and
+      flashing devices before shipping them out, or a returned unit reconnected to your LAN. A device already
+      out with a user isn't reachable here (see the daily usage-report email for that device's own usage/battery
+      data instead, sent from its own local Clicky app).
+    </div>
+
+    <form method="post" action="/admin/info">
+      <fieldset>
+        <legend>Device</legend>
+        <label for="ip">Device IP address</label>
+        <input type="text" id="ip" name="ip" value="{{ ip }}" placeholder="192.168.1.42" required>
+        <div class="actions">
+          <button type="submit">Get info</button>
+        </div>
+      </fieldset>
+    </form>
+
+    <form method="post" action="/admin/set-name">
+      <input type="hidden" name="ip" value="{{ ip }}">
+      <fieldset>
+        <legend>Set friendly name</legend>
+        <label for="device_name">Name</label>
+        <input type="text" id="device_name" name="device_name" placeholder="e.g. Sarah's Clicky" required>
+        <div class="actions">
+          <button type="submit" class="primary">Set name</button>
+        </div>
+      </fieldset>
+    </form>
+
+    <form method="post" action="/admin/flash">
+      <input type="hidden" name="ip" value="{{ ip }}">
+      <fieldset>
+        <legend>Flash firmware</legend>
+        <p style="font-size:0.85rem; color:var(--muted); margin:0 0 0.5rem;">
+          Pushes this app's bundled firmware.bin unconditionally, regardless of the device's current version.
+        </p>
+        <div class="actions">
+          <button type="submit" class="primary">Flash this device</button>
+        </div>
+      </fieldset>
+    </form>
+
+    {% if result %}
+      <div class="result {{ 'ok' if result.ok else 'error' }}">
+        {% if result.ok %}
+          {% if result.info %}
+            <strong>{{ result.info.name or "(unnamed)" }}</strong> — chip {{ result.info.chip_id }}<br>
+            firmware v{{ result.info.version }} · battery {{ result.info.batteryPct }}%
+            {{ '(charging)' if result.info.externalPower else '' }}
+          {% elif result.action == "flash" %}
+            Flash accepted (bundled v{{ result.bundled_version }}) — device is rebooting into it.
+            {% if result.note %}<br><span style="color:var(--muted);">{{ result.note }}</span>{% endif %}
+          {% endif %}
+        {% else %}
+          Failed: {{ result.error }}
+        {% endif %}
+      </div>
+    {% endif %}
+  </div>
+</body>
+</html>

@@ -196,6 +196,11 @@ def add_pending(name: str, size: int, content_hash: str, wav_bytes: bytes) -> di
         "size": size,
         "content_hash": content_hash,
         "wav_path": wav_path,
+        # "command" for a Jarvis voice command (cmd_*.wav, see recorder.cpp);
+        # routed to jarvis.process_command instead of the memo summarize()/
+        # Notion/Obsidian pipeline (see poller.process_once).
+        "kind": "command" if name.startswith("cmd_") else "memo",
+        "jarvis_result": None,  # set by mark_jarvis_processed() for kind=="command" records
         "status": "pending",  # -> "done" or "failed" once processing runs
         "transcript": None,
         "segments": None,  # speaker-diarized [{speaker_id,text,start,end}], if the STT provider supports it
@@ -256,6 +261,26 @@ def mark_processed(content_hash: str, transcript: str, segments,
         record["deepgram_insights"] = deepgram_insights
         record["stt_provider"] = stt_provider
         record["llm_provider"] = llm_provider
+        record["error"] = None
+        _save(records)
+
+
+def mark_jarvis_processed(content_hash: str, transcript: str, jarvis_result: dict, stt_provider: str):
+    """Jarvis command recordings (kind=="command") skip the memo
+    summarize()/Notion/Obsidian pipeline entirely -- see poller.process_once
+    -- so they need their own terminal state instead of mark_processed's
+    summary/llm_provider fields. jarvis_result is jarvis.process_command's
+    return dict ({transcript, action_type, ok, spoken}), shown on the
+    dashboard in place of a summary."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return
+        record["status"] = "done"
+        record["transcript"] = transcript
+        record["jarvis_result"] = jarvis_result
+        record["stt_provider"] = stt_provider
         record["error"] = None
         _save(records)
 

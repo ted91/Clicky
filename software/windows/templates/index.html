@@ -300,7 +300,19 @@
         </div>
         <div class="timestamp">{{ r.created_at }}</div>
 
-        {% if r.status == "done" %}
+        {% if r.status == "done" and r.kind == "command" %}
+        <div class="recording-columns">
+        <div class="summary-col">
+          <span class="badge sentiment-{{ 'positive' if r.jarvis_result.ok else 'negative' }}">
+            🗣️ Jarvis — {{ r.jarvis_result.action_type or "unknown" }}
+          </span>
+          <p><strong>Heard:</strong> {{ r.jarvis_result.transcript }}</p>
+          {% if r.jarvis_result.spoken %}
+            <p><strong>Replied:</strong> {{ r.jarvis_result.spoken }}</p>
+          {% endif %}
+        </div>
+        </div>
+        {% elif r.status == "done" %}
         <div class="recording-columns">
         <div class="summary-col">
           {% if r.deepgram_insights %}

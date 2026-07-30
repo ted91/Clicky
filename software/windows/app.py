@@ -520,6 +520,28 @@ def settings_notifications(
     return RedirectResponse("/settings?panel=notifications", status_code=303)
 
 
+@app.post("/settings/jarvis")
+def settings_jarvis(
+    request: Request,
+    jarvis_enabled: bool = Form(False),
+    jarvis_repo_path: str = Form(""),
+):
+    """jarvis_repo_path is only used by the code_task action (always the
+    real Claude Code CLI, invoked with cwd=jarvis_repo_path -- see
+    jarvis.py's _action_code_task) -- everything else Jarvis does (Q&A)
+    needs no path configured. Calendar/Reminders/Mail automation is
+    macOS-only for now (AppleScript) -- not yet available on Windows, see
+    jarvis.py's Windows action stubs."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    settings.update(
+        jarvis_enabled=jarvis_enabled,
+        jarvis_repo_path=jarvis_repo_path.strip() or None,
+    )
+    return RedirectResponse("/settings?panel=jarvis", status_code=303)
+
+
 @app.post("/settings/voice-id")
 def settings_voice_id(request: Request, voice_id_enabled: bool = Form(False)):
     redirect = _gate(request)
@@ -1010,6 +1032,70 @@ def x_disconnect(request: Request):
     return RedirectResponse("/integrations?panel=social", status_code=303)
 
 
+@app.get("/admin")
+def admin_page(request: Request):
+    """Fleet-management page for the app owner only -- gated by the same
+    _gate() as every other page here (this app is single-tenant per
+    install, so "admin-only" just means "behind the one login this
+    install already has", not a separate tier). Local-network only: talks
+    directly to whatever IP is entered, no cloud relay -- meant for naming
+    and flashing devices before shipping them out, or a returned unit
+    reconnected to your LAN, not for reaching a device already out with a
+    user on their own network."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    return templates.TemplateResponse(request, "admin.html", {"active_nav": "admin", "result": None, "ip": ""})
+
+
+@app.post("/admin/info")
+def admin_info(request: Request, ip: str = Form(...)):
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    import device_client
+    base_url = f"http://{ip}"
+    try:
+        info = device_client.get_device_info(base_url)
+        result = {"ok": True, "action": "info", "info": info}
+    except Exception as e:
+        result = {"ok": False, "action": "info", "error": str(e)}
+    return templates.TemplateResponse(request, "admin.html", {"active_nav": "admin", "result": result, "ip": ip})
+
+
+@app.post("/admin/set-name")
+def admin_set_name(request: Request, ip: str = Form(...), device_name: str = Form(...)):
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    import device_client
+    base_url = f"http://{ip}"
+    try:
+        device_client.set_device_name(device_name, base_url)
+        info = device_client.get_device_info(base_url)
+        result = {"ok": True, "action": "set-name", "info": info}
+    except Exception as e:
+        result = {"ok": False, "action": "set-name", "error": str(e)}
+    return templates.TemplateResponse(request, "admin.html", {"active_nav": "admin", "result": result, "ip": ip})
+
+
+@app.post("/admin/flash")
+def admin_flash(request: Request, ip: str = Form(...)):
+    """Unconditional push of this app's bundled firmware.bin (see
+    update_check.force_push_firmware) -- for flashing a batch of devices
+    onto the exact same build before shipping, regardless of whatever
+    version each one currently has."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    base_url = f"http://{ip}"
+    push_result = update_check.force_push_firmware(base_url)
+    result = {"ok": push_result.get("ok", False), "action": "flash",
+              "error": push_result.get("error"), "note": push_result.get("note"),
+              "bundled_version": update_check.get_bundled_firmware_version()}
+    return templates.TemplateResponse(request, "admin.html", {"active_nav": "admin", "result": result, "ip": ip})
+
+
 @app.get("/social")
 def social_page(request: Request):
     """Read-only mirror of the Notion Publications database -- approving,
@@ -1024,17 +1110,43 @@ def social_page(request: Request):
     redirect = _gate(request)
     if redirect:
         return redirect
+    saved = settings.get_all()
+    can_sync = bool(
+        (saved.get("notion_publications_database_id") and saved.get("notion_token"))
+        or saved.get("obsidian_vault_path")
+    )
     cards = []
     for record in storage.list_recordings():
         posts = record.get("social_posts") or {}
         if not posts:
             continue
+        synced = bool(record.get("notion_publication_page_id") or record.get("obsidian_publication_note_path"))
         cards.append({
             "name": record["name"],
             "content_hash": record["content_hash"],
             "posts": posts,
+            # Jarvis's "write me a post" action generates posts before any
+            # database is necessarily configured yet (dashboard-first, see
+            # jarvis.py's _action_social_post) -- synced is false and
+            # can_sync becomes true the moment the user configures a
+            # backend, showing the "Sync now" button below.
+            "synced": synced,
+            "can_sync": can_sync and not synced,
         })
     return templates.TemplateResponse(request, "social.html", {"cards": cards, "active_nav": "social"})
+
+
+@app.post("/social/sync-now/{content_hash}")
+def social_sync_now(request: Request, content_hash: str):
+    """Pushes a dashboard-only social post (generated before any Notion
+    Publications DB / Obsidian vault was configured -- see jarvis.py's
+    _action_social_post) to whichever backend is configured now."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    import poller
+    poller.push_social_posts_now(content_hash)
+    return RedirectResponse("/social", status_code=303)
 
 
 @app.get("/social/{content_hash}/medium.md")

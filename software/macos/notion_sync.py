@@ -623,6 +623,115 @@ def _find_person_by_email(email: str, database_id: str):
         cursor = data.get("next_cursor")
 
 
+def _page_plain_text(page_id: str) -> str:
+    """Concatenates a page's top-level block content into plain text --
+    used by query_pages_mentioning below since Notes/Journal pages have no
+    participant/person relation property to filter on (see push_recording's
+    docstring), only free text in the page body. One level deep only (no
+    recursion into nested blocks/toggles) -- Notes/Journal pages built by
+    this project are flat (headings + paragraphs), not nested."""
+    parts = []
+    cursor = None
+    while True:
+        params = {"page_size": 100}
+        if cursor:
+            params["start_cursor"] = cursor
+        resp = requests.get(f"{API_BASE}/blocks/{page_id}/children", headers=_headers(), params=params, timeout=15)
+        if not resp.ok:
+            return ""
+        data = resp.json()
+        for block in data.get("results", []):
+            block_type = block.get("type")
+            rich_text = (block.get(block_type) or {}).get("rich_text", [])
+            parts.append("".join(t.get("plain_text", "") for t in rich_text))
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    return "\n".join(parts)
+
+
+def query_pages_mentioning(person_name: str, start: str = None, end: str = None) -> list:
+    """New cross-page retrieval for jarvis.py's find_person_context -- NOT
+    a rename of an existing lookup. Notes/Journal pages have no participant/
+    person relation property (see push_recording's docstring: that was a
+    deliberate removal), so this can't filter server-side by "who's
+    mentioned" the way a People-database relation could. Instead: queries
+    each configured database (Notes via notion_database_id, Journal via
+    notion_journal_database_id) with a server-side Date-range filter when
+    given, then does a client-side case-insensitive substring match of
+    person_name against each candidate page's title + Speaker N properties
+    + full block-content text (see _page_plain_text). Returns
+    [{"source": "notion", "date": "YYYY-MM-DD", "text": "..."}, ...]."""
+    saved = settings.get_all()
+    needle = person_name.strip().lower()
+    results = []
+
+    for db_key in ("notion_database_id", "notion_journal_database_id"):
+        database_id = saved.get(db_key)
+        if not database_id:
+            continue
+        try:
+            ds_id = _data_source_id(database_id)
+        except Exception as e:
+            log.debug("query_pages_mentioning: could not resolve data source for %s: %s", db_key, e)
+            continue
+
+        date_filter = None
+        if start or end:
+            conditions = []
+            if start:
+                conditions.append({"property": "Date", "date": {"on_or_after": start}})
+            if end:
+                conditions.append({"property": "Date", "date": {"on_or_before": end}})
+            date_filter = {"and": conditions} if len(conditions) > 1 else conditions[0]
+
+        cursor = None
+        while True:
+            body = {"page_size": 100}
+            if date_filter:
+                body["filter"] = date_filter
+            if cursor:
+                body["start_cursor"] = cursor
+            try:
+                resp = requests.post(f"{API_BASE}/data_sources/{ds_id}/query", headers=_headers(), json=body, timeout=15)
+            except requests.RequestException as e:
+                log.debug("query_pages_mentioning: query failed for %s: %s", db_key, e)
+                break
+            if not resp.ok:
+                # A database without a "Date" property (e.g. a user's own
+                # Journal template, see push_journal's schema-adaptive
+                # handling) would 400 on the filter above -- fall back to
+                # an unfiltered query rather than silently returning nothing.
+                if date_filter:
+                    body.pop("filter", None)
+                    resp = requests.post(f"{API_BASE}/data_sources/{ds_id}/query", headers=_headers(), json=body, timeout=15)
+                if not resp.ok:
+                    break
+            data = resp.json()
+            for page in data.get("results", []):
+                props = page.get("properties", {})
+                title_prop = props.get("Name", {}).get("title", [])
+                title = "".join(t.get("plain_text", "") for t in title_prop).strip()
+                speaker_values = [
+                    "".join(t.get("plain_text", "") for t in v.get("rich_text", []))
+                    for k, v in props.items() if k.startswith("Speaker ")
+                ]
+                date = (props.get("Date", {}).get("date") or {}).get("start") or ""
+                haystack = (title + " " + " ".join(speaker_values)).lower()
+                text = ""
+                matched = needle in haystack
+                if not matched:
+                    text = _page_plain_text(page["id"])
+                    matched = needle in text.lower()
+                if matched:
+                    results.append({"source": "notion", "date": date[:10] if date else None, "text": text or title})
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+
+    return results
+
+
 def _find_all_person_pages_by_name(name: str, database_id: str) -> list:
     """Like _find_person_page, but returns every matching page instead of
     just the first -- needed to tell "exactly one existing person shares

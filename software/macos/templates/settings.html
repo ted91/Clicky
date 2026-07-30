@@ -117,6 +117,10 @@
         <span class="icon">🎙️</span> Speaker Identification
         <span class="status-dot {{ 'connected' if current.get('voice_id_enabled', True) }}"></span>
       </div>
+      <div class="sidebar-item" data-panel="jarvis">
+        <span class="icon">🗣️</span> Jarvis
+        <span class="status-dot {{ 'connected' if current.jarvis_enabled }}"></span>
+      </div>
 
       <div class="sidebar-group-label">Integrations</div>
       <div class="sidebar-item" data-panel="notion">
@@ -551,6 +555,37 @@
         {% else %}
           <a href="/google/connect" style="text-decoration:none;"><button type="button">Connect Google Calendar</button></a>
         {% endif %}
+      </div>
+
+      <!-- Jarvis -->
+      <div class="panel" data-panel="jarvis">
+        <h2>Jarvis</h2>
+        <p class="desc">
+          Press BOOT to capture a spoken command (finish with BOOT again, same as PWR/Record) — the device
+          speaks a reply back through its own speaker. Only "Q&amp;A" questions use the LLM provider configured
+          under Providers; calendar events, reminders, and email drafts are handled entirely by local Mac apps
+          (Calendar.app, Reminders.app, Mail.app) via AppleScript automation — the first time each is used,
+          macOS will prompt for Automation permission (and, for naming a different assistant app like ChatGPT,
+          Accessibility permission too) in System Settings → Privacy &amp; Security. Genuine coding requests
+          ("build this feature in...", "fix the bug in...") always go through the real
+          <a href="https://docs.claude.com/en/docs/claude-code" target="_blank">Claude Code CLI</a>, scoped to the
+          repo folder below — install it separately if you haven't already. Every Jarvis command is also logged as
+          a note under a "Jarvis" folder in your Obsidian vault, if one is connected below.
+        </p>
+        <p class="desc" style="background:var(--card); border-radius:6px; padding:0.75rem 1rem;">
+          <strong>Obsidian</strong> stores everything locally on this computer — high privacy, but you can't
+          access the data without this machine. <strong>Notion</strong> stores data in the cloud — not local, but
+          you can reach it from anywhere.
+        </p>
+        <form method="post" action="/settings/jarvis">
+          <fieldset>
+            <legend>Jarvis</legend>
+            <label><input type="checkbox" name="jarvis_enabled" {{ "checked" if current.jarvis_enabled }}> Enable Jarvis</label>
+            <label for="jarvis_repo_path">Repo path (for coding requests)</label>
+            <input type="text" id="jarvis_repo_path" name="jarvis_repo_path" value="{{ current.jarvis_repo_path or '' }}" placeholder="/Users/you/code/myrepo">
+          </fieldset>
+          <button type="submit" class="full-width">Save Jarvis settings</button>
+        </form>
       </div>
 
       <!-- Obsidian -->

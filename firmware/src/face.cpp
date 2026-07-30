@@ -319,6 +319,15 @@ static void drawRecording() {
     drawTextCentered("RECORDING", 110, 3);
 }
 
+// Jarvis voice-command capture scene -- visually distinct from a plain memo
+// recording (ring instead of a filled dot, "JARVIS" label) so it's obvious
+// at a glance which button's capture is live.
+static void drawJarvis() {
+    drawRing(EPD_WIDTH / 2, 70, 16, 4, 0, 360);
+    drawTextCentered("JARVIS", 110, 3);
+    drawTextWrapped("LISTENING, PRESS AGAIN WHEN DONE.", 128, 1, 10, EPD_WIDTH - 12);
+}
+
 // Each status gets a distinct simple face (reusing the same primitives as
 // the idle smiley) plus a short text label underneath. Face is confined to
 // the top 70% of the panel (y 0-140) and the label to the bottom 30%
@@ -411,22 +420,21 @@ static void drawTextAt(int x, int y, const char *text, int scale) {
     }
 }
 
-// "Status" button-function legend — labels what the BOOT button currently
-// does, since it's multi-function depending on state (see main.cpp's
-// bootButtonTask): cycles the status face when idle, dismisses a
-// notification when one's showing, or cancels the in-progress recording
-// while one's active (see recorder_cancel()). PWR's own "Record"/"Stop"
-// legend now lives in the bottom indicator strip instead (see
-// drawIndicatorStrip) -- pulled up here on its own since it no longer
-// needs to sit directly above a second line.
+// BOOT-button-function legend — labels what BOOT currently does, since it's
+// multi-function depending on state (see main.cpp's bootButtonTask):
+// starts/finishes a Jarvis capture when idle/Jarvis-recording, cancels a
+// live memo recording instead (started by PWR), or dismisses a pending
+// notification. PWR's own "Record"/"Stop"/"Cancel" legend lives in the
+// bottom indicator strip instead (see drawIndicatorStrip).
 static const int STATUS_LEGEND_LABEL_Y = 148;
 
-static void drawButtonLabels(bool recording, bool notificationActive) {
+static void drawButtonLabels(bool recording, bool jarvisActive, bool notificationActive) {
     // Recording takes priority over a pending notification here too (same
-    // precedence as face_update()'s own scene selection) -- while
-    // recording, BOOT cancels that recording, not whatever notification
-    // might also be waiting underneath it.
-    const char *statusLabel = recording ? "CANCEL" : (notificationActive ? "CLEAR" : "STATUS");
+    // precedence as face_update()'s own scene selection).
+    const char *statusLabel = jarvisActive ? "STOP"
+                             : recording ? "CANCEL"
+                             : notificationActive ? "CLEAR"
+                             : "JARVIS";
     int statusWidth = (int)strlen(statusLabel) * 6 - 1; // (5+1)*scale1 - 1
     drawTextAt(EPD_WIDTH - 4 - statusWidth, STATUS_LEGEND_LABEL_Y, statusLabel, 1);
 }
@@ -464,6 +472,9 @@ static bool s_currentRecording = false; // set by face_update(); read here since
                                          // face_update_indicators()'s own periodic
                                          // caller (main.cpp's indicatorTask) doesn't
                                          // otherwise know recording state
+static bool s_currentJarvisActive = false; // set by face_update(); PWR's bottom-strip
+                                            // legend shows "CANCEL" instead of "RECORD"/
+                                            // "STOP" while a Jarvis capture is live
 static const int INDICATOR_CLEAR_Y = 180;
 static const int INDICATOR_BOX_SIZE = 8;
 // Single row, vertically centering the 8px checkbox and the 7px-tall font
@@ -504,7 +515,10 @@ static void drawIndicatorStrip(bool bleConnected, bool wifiConnected, bool syncA
     x = drawIndicatorItem(x, "WIFI", wifiConnected) + 8;
     x = drawIndicatorItem(x, "SYNC", syncActive);
 
-    const char *recordLabel = s_currentRecording ? "STOP" : "RECORD";
+    // PWR is the memo Record button, but while a Jarvis capture (BOOT) is
+    // live, PWR's role flips to cancelling it -- symmetric with BOOT's own
+    // legend flipping to "CANCEL" while a memo recording is live instead.
+    const char *recordLabel = s_currentJarvisActive ? "CANCEL" : (s_currentRecording ? "STOP" : "RECORD");
     int recordLabelWidth = (int)strlen(recordLabel) * 6 - 1;
     drawTextAt(EPD_WIDTH - 2 - recordLabelWidth, INDICATOR_TEXT_Y, recordLabel, 1);
 }
@@ -592,31 +606,35 @@ void face_init(epaper_driver_display *driver) {
     s_lastWifiIndicator = false;
     s_lastSyncIndicator = false;
     s_currentRecording = false;
+    s_currentJarvisActive = false;
     s_lastBatteryPct = -1;
     s_customStatusIndex = -1;
     loadCustomStatuses();
 }
 
-void face_update(bool recording) {
+void face_update(bool recording, bool jarvisActive) {
     if (!s_driver) return;
 
     // Kept current unconditionally, even on the early-return below --
-    // drawIndicatorStrip() reads this directly, and it can be invoked from
+    // drawIndicatorStrip() reads these directly, and it can be invoked from
     // face_update_indicators()'s own independent periodic tick (see
     // indicatorTask in main.cpp), which has no other way to know recording
     // state.
     s_currentRecording = recording;
+    s_currentJarvisActive = jarvisActive;
 
-    // Encode (recording, notification, status) as a single comparable
-    // value so any change in any of them triggers exactly one redraw.
-    // Recording outranks a notification (you pressed the button, you know
-    // what you're doing); a notification outranks the status face and
-    // idle smiley until BOOT-dismissed. 2000+seq keeps replacing
-    // notifications distinct from each other.
+    // Encode (recording, jarvisActive, notification, status) as a single
+    // comparable value so any change in any of them triggers exactly one
+    // redraw. Recording outranks a notification (you pressed the button,
+    // you know what you're doing); a notification outranks the status face
+    // and idle smiley until BOOT-dismissed. 1000 vs 1001 keeps a Jarvis
+    // capture's scene distinct from a plain memo recording's. 2000+seq
+    // keeps replacing notifications distinct from each other.
     // 3000+index keeps distinct custom statuses distinct from each other
     // (and from the plain (int)Status::CUSTOM value, which alone wouldn't
     // change when cycling between two different custom slots).
-    int wanted = recording ? 1000
+    int wanted = jarvisActive ? 1001
+               : recording ? 1000
                : s_notifActive ? 2000 + s_notifSeq
                : (s_currentStatus == Status::CUSTOM) ? 3000 + s_customStatusIndex
                : (int)s_currentStatus;
@@ -624,7 +642,9 @@ void face_update(bool recording) {
     s_lastRecording = wanted;
 
     s_driver->EPD_Clear();
-    if (recording) {
+    if (jarvisActive) {
+        drawJarvis();
+    } else if (recording) {
         drawRecording();
     } else if (s_notifActive) {
         drawNotification();
@@ -637,7 +657,7 @@ void face_update(bool recording) {
     } else {
         drawSmiley();
     }
-    drawButtonLabels(recording, s_notifActive);
+    drawButtonLabels(recording, jarvisActive, s_notifActive);
     // Reapply the last-known indicator state immediately -- otherwise the
     // strip would sit blank for up to a second until indicatorTask's next
     // tick, since EPD_Clear() above just wiped it along with everything else.

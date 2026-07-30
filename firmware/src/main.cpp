@@ -14,24 +14,37 @@
 #include "power_mgr.h"
 #include "esp_ota_ops.h"
 
-// PWR button: single click toggles recording on/off (same click sound on
-// both start and stop, see recorder.cpp's playClick()).
+// PWR button: single click toggles memo recording on/off (same click sound
+// on both start and stop, see recorder.cpp's playClick()). While a Jarvis
+// voice command is being captured (BOOT was pressed first), PWR instead
+// CANCELS that Jarvis capture -- the two buttons are independent, symmetric
+// capture controls, and each one cancels the other's in-progress capture
+// rather than being ignored.
 // Holding PWR for ~3s to power the board on/off is handled entirely by the
 // board's own power circuit before firmware is even running -- nothing to
 // do here for that.
 //
-// BOOT button: while a recording is live, single click CANCELS it -- the
+// BOOT button: dedicated Jarvis button, symmetric with PWR/Record. Single
+// click with nothing in progress starts a Jarvis voice-command capture
+// (drawJarvis() scene); single click again finishes it, same
+// start/stop-on-same-button behavior as PWR/Record. While a memo recording
+// is live instead (PWR was pressed first), BOOT cancels that memo -- the
 // audio is discarded entirely (SD file deleted / PSRAM never offered, see
 // recorder_cancel()), with a descending tone instead of the save click.
-// Otherwise, single click cycles through the status faces (DND/HI/NOPE/
-// BUSY/FOCUS, wrapping back to the default smiley); a long press jumps
-// straight back to the default smiley from anywhere.
+// Status cycling has been dropped from both buttons entirely (custom
+// statuses are now Settings-dashboard-only, not physically cycled) -- BOOT
+// no longer has an idle-state fallback action beyond starting Jarvis.
 
 enum class AppState { IDLE, RECORDING, SYNCING };
 
 static epaper_driver_display *s_epd = nullptr;
 static board_power_bsp_t s_power(EPD_PWR_PIN, Audio_PWR_PIN, VBAT_PWR_PIN);
 static AppState s_state = AppState::IDLE;
+// Which kind of capture AppState::RECORDING currently means -- lets PWR and
+// BOOT tell a memo apart from a Jarvis command so each button can cancel
+// the *other* button's in-progress capture correctly (see recorder_start's
+// isCommand param and both button tasks below).
+static bool s_jarvisActive = false;
 
 // initDisplay=false skips the e-paper hardware entirely -- used for a
 // timer-triggered wake from deep sleep (see power_mgr's duty-cycled
@@ -113,6 +126,7 @@ static void buttonTask(void *arg) {
             if (s_state == AppState::IDLE) {
                 Serial.println("main: PWR click -> start recording");
                 s_state = AppState::RECORDING;
+                s_jarvisActive = false;
                 // I2S capture is DMA-driven (not CPU-throughput-bound), and
                 // SD writes already go through a 16KB buffered writer (see
                 // recorder.cpp's setvbuf), which is exactly the mitigation
@@ -125,11 +139,18 @@ static void buttonTask(void *arg) {
                 // idle. Needs a real recording to confirm no audio quality
                 // regression -- revert to HIGH_240 here if one turns up.
                 power_mgr_set_profile(PowerProfile::LOW_80, "recording");
-                recorder_start();
-            } else if (s_state == AppState::RECORDING) {
+                recorder_start(false);
+            } else if (s_state == AppState::RECORDING && !s_jarvisActive) {
                 Serial.println("main: PWR click -> stop recording");
                 recorder_stop();
                 s_state = AppState::SYNCING;
+            } else if (s_state == AppState::RECORDING && s_jarvisActive) {
+                // A Jarvis capture is live (BOOT started it) -- PWR cancels
+                // it instead of being ignored, symmetric with BOOT
+                // cancelling a live memo below.
+                Serial.println("main: PWR click -> cancel Jarvis capture");
+                recorder_cancel();
+                s_state = AppState::SYNCING; // syncWatchTask returns to IDLE once the task winds down
             }
             // A click while SYNCING is ignored -- wait for the current
             // recording to finish saving before starting another.
@@ -137,39 +158,39 @@ static void buttonTask(void *arg) {
     }
 }
 
-// Polls the BOOT button's event group: while recording, single click
-// cancels the recording (audio discarded entirely); otherwise single click
-// cycles the status face, long press clears it back to the default smiley.
+// Polls the BOOT button's event group: dedicated Jarvis button. IDLE ->
+// starts a Jarvis voice-command capture; RECORDING (Jarvis) -> finishes it;
+// RECORDING (memo, started by PWR) -> cancels the memo instead, symmetric
+// with PWR cancelling a live Jarvis capture above. A showing notification
+// still claims the click first (dismiss), same as before. Status cycling
+// has been dropped entirely -- statuses are Settings-dashboard-only now.
 static void bootButtonTask(void *arg) {
     for (;;) {
         EventBits_t bits = xEventGroupWaitBits(boot_groups, set_bit_all, pdTRUE, pdFALSE, pdMS_TO_TICKS(200));
 
         if (bits) power_mgr_note_activity();
         if (get_bit_button(bits, 0)) { // single click
-            if (s_state == AppState::RECORDING) {
-                // A live recording claims the click: cancel and discard.
-                // Status cycling resumes once the recording is over.
+            if (s_state == AppState::RECORDING && !s_jarvisActive) {
+                // A live memo recording claims the click: cancel and
+                // discard (unchanged from before Jarvis existed).
                 Serial.println("main: BOOT click -> cancel recording (discard)");
                 recorder_cancel();
                 s_state = AppState::SYNCING; // syncWatchTask returns to IDLE once the task winds down
+            } else if (s_state == AppState::RECORDING && s_jarvisActive) {
+                Serial.println("main: BOOT click -> finish Jarvis capture");
+                recorder_stop();
+                s_state = AppState::SYNCING;
             } else if (face_notification_active()) {
-                // A showing notification claims the click: dismiss it and
-                // return to whatever face was underneath -- status cycling
-                // only resumes once nothing is showing.
+                // A showing notification claims the click: dismiss it.
                 Serial.println("main: BOOT click -> dismiss notification");
                 face_dismiss_notification();
-            } else {
-                Status prev = face_current_status();
-                if (prev == Status::PAIRING) ble_sync_stop_pairing();
-                Status s = face_next_status();
-                if (s == Status::PAIRING) ble_sync_start_pairing();
-                Serial.printf("main: BOOT click -> status %d\n", (int)s);
+            } else if (s_state == AppState::IDLE) {
+                Serial.println("main: BOOT click -> start Jarvis capture");
+                s_state = AppState::RECORDING;
+                s_jarvisActive = true;
+                power_mgr_set_profile(PowerProfile::LOW_80, "jarvis capture");
+                recorder_start(true);
             }
-        } else if (get_bit_button(bits, 1)) { // long-press-start
-            Serial.println("main: BOOT long-press -> clear status");
-            if (face_current_status() == Status::PAIRING) ble_sync_stop_pairing();
-            face_dismiss_notification();
-            face_clear_status();
         }
     }
 }
@@ -203,6 +224,7 @@ static void syncWatchTask(void *arg) {
             // and downloadable at this point regardless of WiFi state.
             vTaskDelay(pdMS_TO_TICKS(wifi_sync_is_connected() ? 4000 : 1500));
             s_state = AppState::IDLE;
+            s_jarvisActive = false;
         }
         vTaskDelay(pdMS_TO_TICKS(200));
     }
@@ -215,7 +237,7 @@ static void faceTask(void *arg) {
             ble_sync_stop_pairing();
             face_clear_status();
         }
-        face_update(s_state == AppState::RECORDING);
+        face_update(s_state == AppState::RECORDING, s_jarvisActive);
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 }

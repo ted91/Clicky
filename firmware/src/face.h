@@ -53,8 +53,11 @@ void face_init(epaper_driver_display *driver);
 
 // Call frequently; only actually redraws the panel when something visible
 // changed, since e-paper refreshes are slow (~0.3s partial) and there's no
-// point re-pushing the same image every tick.
-void face_update(bool recording);
+// point re-pushing the same image every tick. jarvisActive distinguishes a
+// live Jarvis voice-command capture (BOOT-started) from a live memo
+// recording (PWR-started) -- both pass recording=true, but show a
+// different scene/button legend (see main.cpp's s_jarvisActive).
+void face_update(bool recording, bool jarvisActive = false);
 
 // BOOT button: single click advances to the next status in the list
 // (wrapping back to NONE after the last one); returns the new status.

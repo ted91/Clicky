@@ -60,6 +60,34 @@ function renderRecording(r) {
     `;
   }
 
+  if (r.kind === "command") {
+    // Jarvis voice commands skip the memo summarize() pipeline entirely
+    // (see poller.process_once) -- r.summary stays null, so this must be
+    // handled before any r.summary.* access below runs, or a Jarvis
+    // recording would throw on every poll-refresh.
+    const jr = r.jarvis_result || {};
+    return `
+      <div class="recording">
+        <div class="recording-row">
+          ${left}
+          <div class="recording-right">
+            <div class="recording-header">
+              <h3>${escapeHtml(r.name)}</h3>
+            </div>
+            <div class="timestamp">${escapeHtml(r.created_at)}</div>
+            <div class="recording-columns">
+              <div class="summary-col">
+                <span class="badge sentiment-${jr.ok ? "positive" : "negative"}">🗣️ Jarvis — ${escapeHtml(jr.action_type || "unknown")}</span>
+                <p><strong>Heard:</strong> ${escapeHtml(jr.transcript || "")}</p>
+                ${jr.spoken ? `<p><strong>Replied:</strong> ${escapeHtml(jr.spoken)}</p>` : ""}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   const actionItems = (r.summary.action_items || [])
     .map(item => `<li>${escapeHtml(item.text)}${item.owner ? ` &mdash; <span class="owner">${escapeHtml(item.owner)}</span>` : ""}${item.due_date ? ` <span class="due">(due ${escapeHtml(item.due_date)})</span>` : ""}</li>`)
     .join("");
