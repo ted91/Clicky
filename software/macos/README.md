@@ -9,6 +9,12 @@ local/Ollama path).
 
 ## Install & run
 
+Just want the app, not to run from source? Download the packaged build from
+[GitHub Releases](https://github.com/ted91/Clicky/releases/latest) and see
+[INSTALL.md](INSTALL.md) for the DMG install steps.
+
+To run from source instead:
+
 ```
 cd pipeline
 python3 -m venv .venv && source .venv/bin/activate
