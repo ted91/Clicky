@@ -18,7 +18,7 @@ load_dotenv(os.path.join(_env_dir, ".env"))
 # against GitHub Releases' latest tag to show the Settings "update
 # available" banner. Kept as a plain module constant (not settings.json)
 # since it describes the running binary, not user-editable state.
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 
 # Private for now (see this project's distribution-planning conversation --
 # no paid Apple Developer ID yet, demo-scale only) -- update_check.py's
