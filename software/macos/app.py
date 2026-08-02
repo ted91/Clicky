@@ -15,6 +15,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 import secrets
 
+import paths
 import config
 import google_client
 import linkedin_client
@@ -29,7 +30,17 @@ from poller import poll_forever
 import voice_id
 import update_check
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+import os as _os
+# The packaged .app is launched via `open`/Launch Services with no attached
+# terminal, so plain stdout (basicConfig's default) goes nowhere anyone can
+# read -- a background-task exception (e.g. voice-ID enrollment failing
+# silently after a rename) was previously undiagnosable outside a dev venv.
+# A real file next to the rest of the pipeline's persistent data fixes that.
+_log_path = _os.path.join(paths.APP_DATA_DIR, "clicky.log")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler(_log_path)],
+)
 log = logging.getLogger("app")
 
 PROVIDERS_NEEDING_KEY = {
@@ -45,6 +56,15 @@ PROVIDERS_NEEDING_KEY = {
 async def lifespan(app: FastAPI):
     meeting_recorder.launch()  # persistent menu-bar agent, lives for the app's lifetime
     task = asyncio.create_task(poll_forever())
+    # Backfill: process_once() only ever computes a recording's voice-ID
+    # suggestions/candidates once, at original processing time (see its
+    # docstring on rescan_voice_suggestions) -- otherwise a recording
+    # transcribed before the matching voiceprint existed (or before its
+    # score happened to clear a threshold) shows "no voice match" forever,
+    # even after later enrollments should have fixed it. Previously this
+    # only re-ran right after a fresh enroll_or_update() call; nothing ever
+    # retried it for the app's entire existing history on its own.
+    asyncio.create_task(poller.rescan_voice_suggestions())
     yield
     task.cancel()
     meeting_recorder.shutdown()
@@ -54,6 +74,21 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(SessionMiddleware, secret_key=settings.session_secret())
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
+
+# Device Fleet is for the app author only, not every Clicky user -- gated on
+# a specific configured owner_email (Settings -> Account) rather than just
+# the app's regular login, since every install has its own independent
+# password. Registered as a Jinja global (not threaded through every route's
+# context dict) so _nav.html can call is_admin() directly regardless of
+# which route rendered the page.
+ADMIN_EMAIL = "sanchit.gupta01@gmail.com"
+
+
+def _is_admin() -> bool:
+    return (settings.get_all().get("owner_email") or "").strip().lower() == ADMIN_EMAIL
+
+
+templates.env.globals["is_admin"] = _is_admin
 
 
 def _gate(request: Request):
@@ -113,10 +148,14 @@ def index(request: Request):
     redirect = _gate(request)
     if redirect:
         return redirect
+    # Jarvis voice commands get their own page (see /jarvis) -- they aren't
+    # a recording in the memo/journal sense (no speakers/summary/action
+    # items), so they no longer render inline in the main list here.
+    recordings = [r for r in _recordings_for_display() if r.get("kind") != "command"]
     return templates.TemplateResponse(
         request,
         "index.html",
-        {"recordings": _recordings_for_display(), "sync_transport": config.SYNC_TRANSPORT, "active_nav": "transcription",
+        {"recordings": recordings, "sync_transport": config.SYNC_TRANSPORT, "active_nav": "transcription",
          "voice_id_enabled": voice_id.is_enabled()},
     )
 
@@ -126,7 +165,7 @@ def api_recordings(request: Request):
     redirect = _gate(request)
     if redirect:
         return redirect
-    return JSONResponse(_recordings_for_display())
+    return JSONResponse([r for r in _recordings_for_display() if r.get("kind") != "command"])
 
 
 @app.get("/audio/{content_hash}.wav")
@@ -349,6 +388,7 @@ def setup_submit(
     request: Request,
     password: str = Form(""),
     owner_name: str = Form(""),
+    owner_email: str = Form(""),
     stt_provider: str = Form(...),
     llm_provider: str = Form(...),
     sync_transport: str = Form(...),
@@ -382,6 +422,7 @@ def setup_submit(
         # (which round-trips owner_name through a visible, prefilled input,
         # not a masked one) doesn't accidentally require retyping it.
         "owner_name": owner_name or current.get("owner_name"),
+        "owner_email": owner_email or current.get("owner_email"),
         "mistral_api_key": mistral_api_key or None,
         "openai_api_key": openai_api_key or None,
         "anthropic_api_key": anthropic_api_key or None,
@@ -463,6 +504,23 @@ def pair_submit(request: Request, address: str = Form(...), next: str = Form("/"
     if redirect:
         return redirect
     settings.update(paired_ble_address=address)
+    config.reload_settings()
+    return RedirectResponse(next, status_code=303)
+
+
+@app.post("/settings/ble/forget")
+def settings_ble_forget(request: Request, next: str = Form("/settings?panel=device")):
+    """Clears the stored paired_ble_address entirely (settings.delete(), not
+    update(paired_ble_address=None) -- see settings.py's docstring on why
+    those aren't equivalent). Needed because a stale address from a
+    previously-paired device (e.g. swapped for a new physical unit) just
+    sits there forever otherwise -- pairing a NEW device overwrites it fine,
+    but there was previously no way to just go back to "not paired" without
+    pairing something else first."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    settings.delete("paired_ble_address")
     config.reload_settings()
     return RedirectResponse(next, status_code=303)
 
@@ -800,6 +858,7 @@ def _settings_context(active_panel: str = "device", wifi_msg: str = "", saved: b
         "x_configured": x_client.has_client_credentials(),
         "substack_connected": substack_client.is_connected(),
         "device_id": settings.get_or_create_device_id(),
+        "jarvis_device_api_key": settings.get_or_create_jarvis_device_api_key(),
         "voiceprints": voice_id.list_voiceprints(),
         "app_update": update_check.check_app_update(),
         "app_version": config.APP_VERSION,
@@ -960,6 +1019,70 @@ def integrations_setup_publications(
         return templates.TemplateResponse(request, "settings.html", _settings_context("social-accounts", saved=False, setup_error=str(e)))
 
 
+@app.post("/integrations/setup-jarvis")
+def integrations_setup_jarvis(
+    request: Request,
+    notion_parent_page_id: str = Form(...),
+):
+    """One-off: creates the Jarvis database (see
+    notion_setup.create_jarvis_database) under the same parent page the
+    rest of the workspace lives in. Independent of the Notes database --
+    Jarvis commands are their own log, not related back to Notes."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    saved = settings.get_all()
+    notion_token = saved.get("notion_token")
+    if not notion_token:
+        return templates.TemplateResponse(request, "settings.html",
+            _settings_context("jarvis", setup_error="Set up Notion first, then add the Jarvis database."))
+    import notion_setup
+    try:
+        page_id = _extract_notion_id(notion_parent_page_id)
+        ids = notion_setup.create_jarvis_database(notion_token, page_id)
+        settings.update(**ids)
+        return templates.TemplateResponse(request, "settings.html", _settings_context("jarvis", saved=True, setup_error=None))
+    except notion_setup.NotionSetupError as e:
+        return templates.TemplateResponse(request, "settings.html", _settings_context("jarvis", saved=False, setup_error=str(e)))
+
+
+@app.post("/jarvis/enable-live-agent")
+def jarvis_enable_live_agent(request: Request, groq_api_key: str = Form("")):
+    """Pushes the device the config it needs to start using the live
+    Deepgram Voice Agent path (voice_agent.cpp) instead of always
+    recording Jarvis commands to SD -- see device_client.set_jarvis_config's
+    docstring for why only groq_api_key is ever new user input here."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    saved = settings.get_all()
+    deepgram_key = saved.get("deepgram_api_key") or ""
+    if not deepgram_key:
+        return templates.TemplateResponse(request, "settings.html",
+            _settings_context("jarvis", setup_error="Set a Deepgram API key under Settings -> Providers first."))
+    if groq_api_key:
+        settings.update(groq_api_key=groq_api_key)
+    else:
+        groq_api_key = saved.get("groq_api_key") or ""
+    if not groq_api_key:
+        return templates.TemplateResponse(request, "settings.html",
+            _settings_context("jarvis", setup_error="A Groq API key is required (free tier) -- enter one below."))
+
+    mac_base_url = poller.wifi_base_url_if_reachable()
+    if not mac_base_url:
+        return templates.TemplateResponse(request, "settings.html",
+            _settings_context("jarvis", setup_error="Device isn't reachable over WiFi right now -- try again once it is."))
+
+    device_key = settings.get_or_create_jarvis_device_api_key()
+    import device_client
+    try:
+        device_client.set_jarvis_config(deepgram_key, groq_api_key, mac_base_url, device_key, base_url=mac_base_url)
+    except Exception as e:
+        return templates.TemplateResponse(request, "settings.html",
+            _settings_context("jarvis", setup_error=f"Couldn't push config to the device: {e}"))
+    return templates.TemplateResponse(request, "settings.html", _settings_context("jarvis", saved=True, setup_error=None))
+
+
 @app.get("/linkedin/connect")
 def linkedin_connect(request: Request):
     redirect = _gate(request)
@@ -1034,27 +1157,62 @@ def x_disconnect(request: Request):
     return RedirectResponse("/settings?panel=social-accounts", status_code=303)
 
 
-@app.get("/admin")
-def admin_page(request: Request):
-    """Fleet-management page for the app owner only -- gated by the same
-    _gate() as every other page here (this app is single-tenant per
-    install, so "admin-only" just means "behind the one login this
-    install already has", not a separate tier). Local-network only: talks
-    directly to whatever IP is entered, no cloud relay -- meant for naming
-    and flashing devices before shipping them out, or a returned unit
-    reconnected to your LAN, not for reaching a device already out with a
-    user on their own network."""
+def _admin_gate(request: Request):
+    """Device Fleet is for the app author only (ADMIN_EMAIL), not every
+    Clicky user -- every install has its own independent login, so the
+    regular _gate() alone doesn't distinguish "the author's own install"
+    from "a user's install". Redirects to Settings' Account panel (where
+    owner_email is set) rather than a bare 404, so a legitimate owner who
+    hasn't set it yet finds their way there instead of a dead end."""
     redirect = _gate(request)
     if redirect:
         return redirect
-    return templates.TemplateResponse(request, "admin.html", {"active_nav": "admin", "result": None, "ip": ""})
+    if not _is_admin():
+        return RedirectResponse("/settings?panel=account", status_code=303)
+    return None
+
+
+def _admin_context(result=None, ip=""):
+    import firmware_flash
+    detected_dir = firmware_flash.firmware_binaries_dir()
+    if not ip:
+        # Default to whatever IP the poller's own sync loop currently knows
+        # the device by (same source Settings' Device panel uses) -- saves
+        # re-typing an address you can already see live-tracked elsewhere
+        # in the app, and stays correct across DHCP re-leases without
+        # editing anything here.
+        wifi_url = poller.wifi_base_url_if_reachable()
+        if wifi_url:
+            ip = wifi_url.split("://", 1)[-1].rstrip("/")
+    return {
+        "active_nav": "admin", "result": result, "ip": ip,
+        "serial_ports": firmware_flash.list_serial_ports(),
+        "usb_flash_available": detected_dir is not None,
+        "firmware_binaries_dir": detected_dir or "",
+    }
+
+
+@app.get("/admin")
+def admin_page(request: Request):
+    """Fleet-management page for the app owner only -- see _admin_gate().
+    Local-network only: talks directly to whatever IP is entered, no cloud
+    relay -- meant for naming and flashing devices before shipping them
+    out, or a returned unit reconnected to your LAN, not for reaching a
+    device already out with a user on their own network."""
+    redirect = _admin_gate(request)
+    if redirect:
+        return redirect
+    return templates.TemplateResponse(request, "admin.html", _admin_context())
 
 
 @app.post("/admin/info")
-def admin_info(request: Request, ip: str = Form(...)):
-    redirect = _gate(request)
+def admin_info(request: Request, ip: str = Form("")):
+    redirect = _admin_gate(request)
     if redirect:
         return redirect
+    if not ip.strip():
+        return templates.TemplateResponse(request, "admin.html",
+            _admin_context(result={"ok": False, "action": "info", "error": "Enter a device IP address first"}, ip=ip))
     import device_client
     base_url = f"http://{ip}"
     try:
@@ -1062,14 +1220,17 @@ def admin_info(request: Request, ip: str = Form(...)):
         result = {"ok": True, "action": "info", "info": info}
     except Exception as e:
         result = {"ok": False, "action": "info", "error": str(e)}
-    return templates.TemplateResponse(request, "admin.html", {"active_nav": "admin", "result": result, "ip": ip})
+    return templates.TemplateResponse(request, "admin.html", _admin_context(result=result, ip=ip))
 
 
 @app.post("/admin/set-name")
-def admin_set_name(request: Request, ip: str = Form(...), device_name: str = Form(...)):
-    redirect = _gate(request)
+def admin_set_name(request: Request, ip: str = Form(""), device_name: str = Form("")):
+    redirect = _admin_gate(request)
     if redirect:
         return redirect
+    if not ip.strip() or not device_name.strip():
+        return templates.TemplateResponse(request, "admin.html",
+            _admin_context(result={"ok": False, "action": "set-name", "error": "Enter both a device IP and a name"}, ip=ip))
     import device_client
     base_url = f"http://{ip}"
     try:
@@ -1078,24 +1239,144 @@ def admin_set_name(request: Request, ip: str = Form(...), device_name: str = For
         result = {"ok": True, "action": "set-name", "info": info}
     except Exception as e:
         result = {"ok": False, "action": "set-name", "error": str(e)}
-    return templates.TemplateResponse(request, "admin.html", {"active_nav": "admin", "result": result, "ip": ip})
+    return templates.TemplateResponse(request, "admin.html", _admin_context(result=result, ip=ip))
 
 
 @app.post("/admin/flash")
-def admin_flash(request: Request, ip: str = Form(...)):
+def admin_flash(request: Request, ip: str = Form("")):
     """Unconditional push of this app's bundled firmware.bin (see
     update_check.force_push_firmware) -- for flashing a batch of devices
     onto the exact same build before shipping, regardless of whatever
     version each one currently has."""
-    redirect = _gate(request)
+    redirect = _admin_gate(request)
     if redirect:
         return redirect
+    if not ip.strip():
+        return templates.TemplateResponse(request, "admin.html",
+            _admin_context(result={"ok": False, "action": "flash", "error": "Enter a device IP address first"}, ip=ip))
     base_url = f"http://{ip}"
     push_result = update_check.force_push_firmware(base_url)
     result = {"ok": push_result.get("ok", False), "action": "flash",
               "error": push_result.get("error"), "note": push_result.get("note"),
               "bundled_version": update_check.get_bundled_firmware_version()}
-    return templates.TemplateResponse(request, "admin.html", {"active_nav": "admin", "result": result, "ip": ip})
+    return templates.TemplateResponse(request, "admin.html", _admin_context(result=result, ip=ip))
+
+
+@app.post("/admin/flash-usb")
+def admin_flash_usb(request: Request, port: str = Form(""), binaries_dir: str = Form("")):
+    """Full USB flash (bootloader + partition table + app) for a brand-new
+    device that's never run any firmware, or any board you have physical
+    access to -- unlike /admin/flash (OTA over WiFi), this doesn't need
+    the device to already be running firmware or have a known IP. Uses
+    the three binaries bundled into config.FIRMWARE_DIR alongside the
+    app-partition firmware.bin already shipped for OTA (see
+    firmware_flash.py's module docstring), so this works in the packaged
+    app for any user -- not just a dev checkout with PlatformIO installed."""
+    redirect = _admin_gate(request)
+    if redirect:
+        return redirect
+    if not port.strip():
+        return templates.TemplateResponse(request, "admin.html",
+            _admin_context(result={"ok": False, "action": "flash-usb", "error": "Select or enter a serial port first"}))
+    import firmware_flash
+    flash_result = firmware_flash.flash_full(port, binaries_dir_override=binaries_dir)
+    result = {"ok": flash_result.get("ok", False), "action": "flash-usb",
+              "error": flash_result.get("error"), "output": flash_result.get("output")}
+    return templates.TemplateResponse(request, "admin.html", _admin_context(result=result))
+
+
+@app.post("/jarvis/execute-decision")
+async def jarvis_execute_decision(request: Request):
+    """Called BY THE DEVICE (not a browser) -- the first route in this app
+    that the ESP32 calls into, rather than the Mac pulling from the device.
+    An on-device live agent (Deepgram Voice Agent, streaming BOOT-captured
+    audio) decides an action in real time and forwards just the structured
+    fields here for execution, skipping jarvis.decide_action()'s own
+    classification call since that already happened on-device.
+
+    No session cookie exists on the firmware side, so this can't use
+    _gate() -- instead it requires the shared secret from
+    settings.get_or_create_jarvis_device_api_key() in the X-Jarvis-Key
+    header. Without this, any device on the same WiFi could hit this route
+    and make the app draft emails / add calendar events."""
+    expected_key = settings.get_or_create_jarvis_device_api_key()
+    if request.headers.get("X-Jarvis-Key") != expected_key:
+        return JSONResponse({"ok": False, "error": "invalid or missing X-Jarvis-Key"}, status_code=401)
+
+    try:
+        decision = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid JSON body"}, status_code=400)
+
+    import jarvis
+    try:
+        result = await asyncio.to_thread(jarvis.execute_decided_action, decision)
+    except Exception as e:
+        log.warning("execute_decided_action failed: %s", e)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    return JSONResponse(result)
+
+
+@app.post("/jarvis/search-memory")
+async def jarvis_search_memory(request: Request):
+    """Called BY THE DEVICE -- the live Voice Agent's search_memory function
+    (see voice_agent.cpp), forwarded here to actually run the semantic
+    search (rag_index.py) since the ESP32 has no embedding model of its
+    own. Returns {"result": "<text>"} for the agent's live turn to
+    incorporate. Same X-Jarvis-Key auth as /jarvis/execute-decision."""
+    expected_key = settings.get_or_create_jarvis_device_api_key()
+    if request.headers.get("X-Jarvis-Key") != expected_key:
+        return JSONResponse({"result": "Search unavailable -- invalid key."}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"result": "Search failed -- invalid request."}, status_code=400)
+
+    # The device already resolves relative dates itself (Deepgram's own LLM
+    # turn fills date_start/date_end as concrete ISO dates, not a label like
+    # "last week"), so this calls rag_index directly rather than
+    # jarvis.search_memory() (which expects a time_range *label* to parse).
+    import rag_index
+    try:
+        results = await asyncio.to_thread(
+            rag_index.search, body.get("query") or "",
+            5, body.get("date_start"), body.get("date_end"), body.get("speaker"),
+        )
+    except Exception as e:
+        log.warning("search_memory (from device) failed: %s", e)
+        return JSONResponse({"result": "Search failed."})
+    if not results:
+        return JSONResponse({"result": "Nothing found."})
+    combined = " / ".join(f"[{r.get('date') or 'unknown date'}] {r['text'][:400]}" for r in results[:3])
+    return JSONResponse({"result": combined})
+
+
+@app.get("/jarvis/memory-facts")
+def jarvis_memory_facts(request: Request):
+    """Called BY THE DEVICE once per live session (voice_agent.cpp's
+    fetchMemoryFacts(), before streaming starts) to inject memory_store's
+    always-known facts into the agent's own prompt -- distinct from
+    search_memory's on-demand retrieval. Same X-Jarvis-Key auth."""
+    expected_key = settings.get_or_create_jarvis_device_api_key()
+    if request.headers.get("X-Jarvis-Key") != expected_key:
+        return Response("", status_code=401)
+
+    import memory_store
+    return Response(memory_store.facts_context(), media_type="text/plain")
+
+
+@app.get("/jarvis")
+def jarvis_page(request: Request):
+    """Jarvis voice commands, kept off the main dashboard (see index()) --
+    they aren't a recording in the memo/journal sense (no speakers/summary/
+    action items), so they get the same top-level-page treatment /social
+    already established for a different non-memo recording kind."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    commands = [r for r in _recordings_for_display() if r.get("kind") == "command"]
+    return templates.TemplateResponse(request, "jarvis.html", {"commands": commands, "active_nav": "jarvis"})
 
 
 @app.get("/social")

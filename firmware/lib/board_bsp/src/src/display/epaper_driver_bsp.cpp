@@ -1,34 +1,35 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <Arduino.h> // millis()/Serial -- read_busy()'s timing instrumentation below
 #include "freertos/FreeRTOS.h"
 #include "epaper_driver_bsp.h"
 #include "esp_log.h"
 
-#include "esp_heap_caps.h" 
+#include "esp_heap_caps.h"
 
 static const char *TAG = "driver";
 
 const uint8_t WF_Full_1IN54[159] =
-{											
+{
     0x80,	0x48,	0x40,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,
     0x40,	0x48,	0x80,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,
     0x80,	0x48,	0x40,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,
     0x40,	0x48,	0x80,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,
     0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,
-    0xA,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,					
-    0x8,	0x1,	0x0,	0x8,	0x1,	0x0,	0x2,					
-    0xA,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,					
-    0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,					
-    0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,					
-    0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,					
-    0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,					
-    0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,					
-    0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,					
-    0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,					
-    0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,					
-    0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,					
-    0x22,	0x22,	0x22,	0x22,	0x22,	0x22,	0x0,	0x0,	0x0,			
+    0xA,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,
+    0x8,	0x1,	0x0,	0x8,	0x1,	0x0,	0x2,
+    0xA,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,
+    0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,
+    0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,
+    0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,
+    0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,
+    0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,
+    0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,
+    0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,
+    0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,
+    0x0,	0x0,	0x0,	0x0,	0x0,	0x0,	0x0,
+    0x22,	0x22,	0x22,	0x22,	0x22,	0x22,	0x0,	0x0,	0x0,
     0x22,	0x17,	0x41,	0x0,	0x32,	0x20
 };
 
@@ -55,7 +56,7 @@ unsigned char WF_PARTIAL_1IN54_0[159] =
     0x02,0x17,0x41,0xB0,0x32,0x28,
 };
 
-epaper_driver_display::epaper_driver_display(int width, int height,custom_lcd_spi_t _lcd_spi_data) : 
+epaper_driver_display::epaper_driver_display(int width, int height,custom_lcd_spi_t _lcd_spi_data) :
     lcd_spi_data(_lcd_spi_data),
     Width(width),
     Height(height) {
@@ -118,19 +119,11 @@ void epaper_driver_display::spi_port_init() {
   	ESP_ERROR_CHECK(ret);
 }
 
-void epaper_driver_display::read_busy() {
-    int busy = lcd_spi_data.busy;
-    while(gpio_get_level((gpio_num_t)busy) == 1) 
-	{
-        vTaskDelay(pdMS_TO_TICKS(5));   //LOW: idle, HIGH: busy
-    }
-}
-
 void epaper_driver_display::SPI_SendByte(uint8_t data) {
     esp_err_t ret;
-  	spi_transaction_t t; 
+  	spi_transaction_t t;
   	memset(&t, 0, sizeof(t));
-  	t.length = 8;      
+  	t.length = 8;
   	t.tx_buffer = &data;
   	ret = spi_device_polling_transmit(spi, &t); //Transmit!
   	assert(ret == ESP_OK);                      //Should have had no issues.
@@ -154,9 +147,9 @@ void epaper_driver_display::writeBytes(uint8_t *buffer,int len) {
     set_dc_1();
   	set_cs_0();
   	esp_err_t ret;
-  	spi_transaction_t t; 
+  	spi_transaction_t t;
   	memset(&t, 0, sizeof(t));
-  	t.length = 8 * len;      
+  	t.length = 8 * len;
   	t.tx_buffer = buffer;
   	ret = spi_device_polling_transmit(spi, &t); //Transmit!
   	assert(ret == ESP_OK);
@@ -167,9 +160,9 @@ void epaper_driver_display::writeBytes(const uint8_t *buffer, int len) {
     set_dc_1();
   	set_cs_0();
   	esp_err_t ret;
-  	spi_transaction_t t; 
+  	spi_transaction_t t;
   	memset(&t, 0, sizeof(t));
-  	t.length = 8 * len;      
+  	t.length = 8 * len;
   	t.tx_buffer = buffer;
   	ret = spi_device_polling_transmit(spi, &t); //Transmit!
   	assert(ret == ESP_OK);
@@ -181,7 +174,7 @@ void epaper_driver_display::EPD_SetWindows(uint16_t Xstart, uint16_t Ystart, uin
     EPD_SendCommand(0x44);  // SET_RAM_X_ADDRESS_START_END_POSITION
     EPD_SendData((Xstart>>3) & 0xFF);
     EPD_SendData((Xend>>3) & 0xFF);
-	
+
     EPD_SendCommand(0x45);  // SET_RAM_Y_ADDRESS_START_END_POSITION
     EPD_SendData(Ystart & 0xFF);
     EPD_SendData((Ystart >> 8) & 0xFF);
@@ -203,13 +196,13 @@ void epaper_driver_display::EPD_SetLut(const uint8_t *lut) {
 	EPD_SendCommand(0x32);
     writeBytes(lut,153);
 	read_busy();
-	
+
     EPD_SendCommand(0x3f);
     EPD_SendData(lut[153]);
-	
+
     EPD_SendCommand(0x03);
     EPD_SendData(lut[154]);
-	
+
     EPD_SendCommand(0x04);
     EPD_SendData(lut[155]);
 	EPD_SendData(lut[156]);
@@ -217,6 +210,32 @@ void epaper_driver_display::EPD_SetLut(const uint8_t *lut) {
 
 	EPD_SendCommand(0x2c);
     EPD_SendData(lut[158]);
+}
+
+void epaper_driver_display::read_busy() {
+    int busy = lcd_spi_data.busy;
+    uint32_t start = millis();
+    // Bounded -- this loop used to be unbounded and there's real history of
+    // it hanging a task forever on this exact board (a stuck BUSY line from
+    // a bad init/wiring state never came back low). 2000ms is comfortably
+    // above the ~580ms a normal partial refresh has been measured taking
+    // live on this hardware, with headroom for a slower full refresh.
+    // Timing out here means "give up and move on," not "panel is fine" --
+    // the warning print is intentional so this is visible in serial logs.
+    const uint32_t kBusyTimeoutMs = 2000;
+    while(gpio_get_level((gpio_num_t)busy) == 1)
+	{
+        if (millis() - start > kBusyTimeoutMs) {
+            Serial.printf("epaper: read_busy() timed out after %lums -- forcing return (panel may be stuck)\n",
+                          (unsigned long)(millis() - start));
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));   //LOW: idle, HIGH: busy
+    }
+    uint32_t elapsed = millis() - start;
+    if (elapsed > 20) { // don't spam the log for a busy-wait that's essentially instant
+        Serial.printf("timing: read_busy waited %lums\n", (unsigned long)elapsed);
+    }
 }
 
 void epaper_driver_display::EPD_TurnOnDisplay() {
@@ -267,7 +286,7 @@ void epaper_driver_display::EPD_Init() {
 
     EPD_SetCursor(0, Height-1);
 	read_busy();
-	
+
 	EPD_SetLut(WF_Full_1IN54);
 }
 
@@ -303,27 +322,27 @@ void epaper_driver_display::EPD_Init_Partial() {
   	vTaskDelay(pdMS_TO_TICKS(50));
 
 	read_busy();
-	
+
 	EPD_SetLut(WF_PARTIAL_1IN54_0);
 
-    EPD_SendCommand(0x37); 
-    EPD_SendData(0x00);  
-    EPD_SendData(0x00);  
-    EPD_SendData(0x00);  
-    EPD_SendData(0x00); 
-    EPD_SendData(0x00);  	
-    EPD_SendData(0x40);  
-    EPD_SendData(0x00);  
-    EPD_SendData(0x00);   
-    EPD_SendData(0x00);  
+    EPD_SendCommand(0x37);
     EPD_SendData(0x00);
-	
+    EPD_SendData(0x00);
+    EPD_SendData(0x00);
+    EPD_SendData(0x00);
+    EPD_SendData(0x00);
+    EPD_SendData(0x40);
+    EPD_SendData(0x00);
+    EPD_SendData(0x00);
+    EPD_SendData(0x00);
+    EPD_SendData(0x00);
+
     EPD_SendCommand(0x3C); //BorderWavefrom
     EPD_SendData(0x80);
-	
-	EPD_SendCommand(0x22); 
-	EPD_SendData(0xc0); 
-	EPD_SendCommand(0x20); 
+
+	EPD_SendCommand(0x22);
+	EPD_SendData(0xc0);
+	EPD_SendCommand(0x20);
 	read_busy();
 }
 
@@ -338,7 +357,7 @@ void epaper_driver_display::EPD_DrawColorPixel(uint16_t x, uint16_t y,uint8_t co
     if (x >= Width || y >= Height)
     {
         ESP_LOGE("EPD", "Out of bounds pixel: (%d,%d)", x, y);
-        return; 
+        return;
     }
 
     uint16_t index = y * 25 + (x >> 3); //25是200/8

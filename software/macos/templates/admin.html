@@ -89,6 +89,39 @@
       </fieldset>
     </form>
 
+    <form method="post" action="/admin/flash-usb">
+      <fieldset>
+        <legend>Flash via USB (new/blank device)</legend>
+        <p style="font-size:0.85rem; color:var(--muted); margin:0 0 0.5rem;">
+          Full flash (bootloader + partition table + app) over USB — the only way to get firmware onto a
+          chip that's never run any before. Plug the device in first. Takes 1-2 minutes.
+        </p>
+        {% if not usb_flash_available %}
+          <label for="binaries_dir">Firmware binaries folder (bootloader.bin, partitions.bin, firmware.bin)</label>
+          <input type="text" id="binaries_dir" name="binaries_dir" value="{{ firmware_binaries_dir }}"
+                 placeholder="/path/to/firmware/.pio/build/esp32-s3-epaper" required>
+          <p style="font-size:0.8rem; color:var(--warn); margin:0.3rem 0 0;">
+            Bundled binaries not found (or incomplete) — enter a folder containing all three files once and it's saved.
+          </p>
+        {% endif %}
+
+        <label for="port">Serial port</label>
+        {% if serial_ports %}
+          <select id="port" name="port" style="width:100%; padding:0.5rem; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--fg);">
+            {% for p in serial_ports %}
+              <option value="{{ p }}">{{ p }}</option>
+            {% endfor %}
+          </select>
+        {% else %}
+          <input type="text" id="port" name="port" placeholder="/dev/cu.usbmodem101" required>
+          <p style="font-size:0.8rem; color:var(--muted); margin:0.3rem 0 0;">No device detected — plug it in, then reload this page. Or enter the port manually.</p>
+        {% endif %}
+        <div class="actions">
+          <button type="submit" class="primary" {{ 'disabled' if not serial_ports }}>Flash this device</button>
+        </div>
+      </fieldset>
+    </form>
+
     {% if result %}
       <div class="result {{ 'ok' if result.ok else 'error' }}">
         {% if result.ok %}
@@ -99,9 +132,17 @@
           {% elif result.action == "flash" %}
             Flash accepted (bundled v{{ result.bundled_version }}) — device is rebooting into it.
             {% if result.note %}<br><span style="color:var(--muted);">{{ result.note }}</span>{% endif %}
+          {% elif result.action == "flash-usb" %}
+            USB flash complete — device is rebooting into it. Re-pair WiFi/BLE if this was a new/blank device.
           {% endif %}
         {% else %}
           Failed: {{ result.error }}
+        {% endif %}
+        {% if result.output %}
+          <details style="margin-top:0.6rem;">
+            <summary style="cursor:pointer; font-size:0.85rem; color:var(--muted);">esptool output</summary>
+            <pre>{{ result.output }}</pre>
+          </details>
         {% endif %}
       </div>
     {% endif %}

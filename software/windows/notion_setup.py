@@ -129,6 +129,12 @@ def create_workspace(token: str, parent_page_id: str) -> dict:
     # name/shape, added here too so new workspaces get it from creation
     # instead of waiting for the runtime migration to add it lazily).
     speaker_props["Generate Social Media"] = {"checkbox": {}}
+    # Deepgram Audio Intelligence, added here too so new workspaces get it
+    # from creation instead of waiting for notion_sync.ensure_insight_properties'
+    # runtime migration to add it lazily.
+    speaker_props["Topics"] = {"multi_select": {}}
+    speaker_props["Intents"] = {"multi_select": {}}
+    speaker_props["Deepgram Summary"] = {"rich_text": {}}
     patch = requests.patch(
         f"{API_BASE}/data_sources/{notes_ds_id}", headers=_headers(token),
         json={"properties": speaker_props}, timeout=15,
@@ -209,3 +215,25 @@ def create_publications_database(token: str, parent_page_id: str, notes_database
     _add_relation(token, pubs_db["id"], notes_ds_id, "Source Recording")
 
     return {"notion_publications_database_id": pubs_db["id"]}
+
+
+def create_jarvis_database(token: str, parent_page_id: str) -> dict:
+    """One-off setup for Jarvis voice commands, same after-the-fact pattern
+    as create_publications_database -- Jarvis commands previously had no
+    Notion presence at all (see notion_sync.push_command), just an inline
+    card on the main dashboard alongside regular recordings. This gives them
+    their own database, structured the same way Notes/Publications are:
+    one page per command, named by its action type + date so the database
+    reads like a log, not a pile of identical "New page" titles."""
+    jarvis_db = _create_database(token, parent_page_id, "Jarvis", {
+        "Date": {"date": {}},
+        "Action Type": {"select": {"options": [
+            {"name": "open_app"}, {"name": "calendar_event"}, {"name": "reminder"},
+            {"name": "email_draft"}, {"name": "social_post"}, {"name": "qa"},
+            {"name": "code_task"}, {"name": "save_snippet"}, {"name": "unknown"},
+        ]}},
+        "Heard": {"rich_text": {}},
+        "Replied": {"rich_text": {}},
+        "OK": {"checkbox": {}},
+    })
+    return {"notion_jarvis_database_id": jarvis_db["id"]}

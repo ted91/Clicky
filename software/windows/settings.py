@@ -92,6 +92,19 @@ def get_or_create_device_id() -> str:
         return data["device_id"]
 
 
+def get_or_create_jarvis_device_api_key() -> str:
+    """Generated once, persisted -- a shared secret the device (ESP32) must
+    send when forwarding an already-decided Jarvis action to this app's
+    /jarvis/execute-decision route (see app.py). See macOS settings.py for
+    the full rationale."""
+    with _lock:
+        data = _load()
+        if "jarvis_device_api_key" not in data:
+            data["jarvis_device_api_key"] = secrets.token_hex(16)
+            _save(data)
+        return data["jarvis_device_api_key"]
+
+
 def hash_password(password: str, salt: bytes = None) -> str:
     salt = salt or secrets.token_bytes(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)

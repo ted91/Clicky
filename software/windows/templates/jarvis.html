@@ -1,0 +1,115 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Jarvis — Clicky Notes</title>
+  <style>
+    :root { --bg: #fff; --fg: #1a1a1a; --border: #ddd; --muted: #666; --ok: #0a7; --warn: #c0392b; --card: #f9f9f9; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #121212; --fg: #eee; --border: #3a3a3a; --muted: #aaa; --ok: #4fd6a0; --warn: #ff6b5e; --card: #1c1c1c; }
+    }
+    :root[data-theme="dark"] { --bg: #121212; --fg: #eee; --border: #3a3a3a; --muted: #aaa; --ok: #4fd6a0; --warn: #ff6b5e; --card: #1c1c1c; }
+    :root[data-theme="light"] { --bg: #fff; --fg: #1a1a1a; --border: #ddd; --muted: #666; --ok: #0a7; --warn: #c0392b; --card: #f9f9f9; }
+
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, sans-serif; margin: 0; background: var(--bg); color: var(--fg); display: flex; min-height: 100vh; }
+
+    .app-nav { width: 210px; flex-shrink: 0; background: #f5f5f5; border-right: 1px solid var(--border); padding: 0.75rem 0; }
+    @media (prefers-color-scheme: dark) { .app-nav { background: #1a1a1a; } }
+    :root[data-theme="dark"] .app-nav { background: #1a1a1a; }
+    :root[data-theme="light"] .app-nav { background: #f5f5f5; }
+    .app-nav-item {
+      display: flex; align-items: center; gap: 0.6rem; padding: 0.6rem 1.1rem;
+      font-size: 0.9rem; color: var(--fg); text-decoration: none; border-left: 3px solid transparent;
+      background: none; border-top: none; border-right: none; border-bottom: none; width: 100%; text-align: left; cursor: pointer; font: inherit;
+    }
+    .app-nav-item .icon { font-size: 1.1rem; width: 1.3rem; text-align: center; }
+    .app-nav-item:hover { background: rgba(128,128,128,0.12); }
+    .app-nav-item.active { background: rgba(128,128,128,0.12); border-left-color: var(--ok); font-weight: 600; }
+    .app-nav-logout { margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 0.9rem; }
+
+    .page-content { flex: 1; padding: 1.75rem 2rem; overflow-y: auto; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
+    .topbar h1 { font-size: 1.1rem; margin: 0; }
+    .note { color: var(--muted); font-size: 0.85rem; padding-bottom: 0.9rem; border-bottom: 1px solid var(--border); margin-bottom: 1.25rem; }
+
+    .command { margin-bottom: 1.1rem; border: 1px solid var(--border); border-radius: 10px; padding: 0.9rem 1rem; }
+    .command-header { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; margin-bottom: 0.4rem; }
+    .command-header h3 { margin: 0; font-size: 0.95rem; }
+    .timestamp { font-size: 0.78rem; color: var(--muted); margin-bottom: 0.5rem; }
+    .badge { display: inline-block; font-size: 0.78rem; padding: 0.15rem 0.6rem; border-radius: 999px; border: 1px solid var(--border); }
+    .badge.ok { color: var(--ok); border-color: var(--ok); }
+    .badge.fail { color: var(--warn); border-color: var(--warn); }
+    .quick-open-links a { font-size: 0.8rem; margin-left: 0.6rem; }
+    .empty { padding: 2rem; text-align: center; color: var(--muted); }
+    audio { height: 30px; max-width: 220px; }
+    .controls { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.5rem; }
+    button.md-download, a.md-download { font-size: 0.78rem; padding: 0.3rem 0.6rem; border: 1px solid var(--border); border-radius: 6px; background: var(--card); color: var(--fg); cursor: pointer; text-decoration: none; }
+    button.danger { color: var(--warn); border-color: var(--warn); }
+  </style>
+</head>
+<body>
+  {% include "_nav.html" %}
+  <div class="page-content">
+  <div class="topbar">
+    <h1>Jarvis</h1>
+  </div>
+  <div class="note">
+    Every BOOT-captured voice command, kept separate from regular recordings since a command isn't a memo
+    (no speakers/summary/action items) -- just what was heard, what Jarvis decided to do, and what it replied.
+    Configure Jarvis itself, and its Notion/Obsidian destinations, under Settings → Jarvis.
+  </div>
+
+  {% if not commands %}
+    <div class="empty">No Jarvis commands yet — press BOOT on the device to capture one.</div>
+  {% endif %}
+
+  {% for c in commands %}
+  <div class="command">
+    <div class="command-header">
+      <h3>{{ c.name }}
+        {% if c.status == "pending" %}<span class="badge">Processing&hellip;</span>{% endif %}
+        {% if c.status == "failed" %}<span class="badge fail">Processing failed</span>{% endif %}
+      </h3>
+      <span class="quick-open-links">
+        {% if c.notion_url %}<a href="{{ c.notion_url }}" target="_blank" rel="noopener">Open in Notion</a>{% endif %}
+        {% if c.obsidian_url %}<a href="{{ c.obsidian_url }}">Open in Obsidian</a>{% endif %}
+      </span>
+    </div>
+    <div class="timestamp">{{ c.created_at }}</div>
+    {% if c.status == "done" %}
+      <span class="badge {{ 'ok' if c.jarvis_result.ok else 'fail' }}">
+        🗣️ {{ c.jarvis_result.action_type or "unknown" }}
+      </span>
+      <p><strong>Heard:</strong> {{ c.jarvis_result.transcript }}</p>
+      {% if c.jarvis_result.spoken %}
+        <p><strong>Replied:</strong> {{ c.jarvis_result.spoken }}</p>
+      {% endif %}
+    {% endif %}
+    <div class="controls">
+      <audio controls preload="none" src="/audio/{{ c.content_hash }}.wav"></audio>
+      <a class="md-download" href="/audio/{{ c.content_hash }}.wav?download=1" download title="Download original recording">Download</a>
+      <button class="md-download danger delete-btn" data-hash="{{ c.content_hash }}" data-name="{{ c.name }}">Delete</button>
+      <button class="md-download danger delete-device-btn" data-hash="{{ c.content_hash }}" data-name="{{ c.name }}">Delete from device</button>
+    </div>
+  </div>
+  {% endfor %}
+  </div>
+  <script>
+    document.querySelectorAll(".delete-btn").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        if (!confirm(`Delete ${btn.dataset.name} from the dashboard? (keeps the file on the device)`)) return;
+        await fetch(`/recordings/${btn.dataset.hash}`, {method: "DELETE"});
+        location.reload();
+      });
+    });
+    document.querySelectorAll(".delete-device-btn").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        if (!confirm(`Permanently delete ${btn.dataset.name} from the device's SD card? This cannot be undone.`)) return;
+        await fetch(`/recordings/${btn.dataset.hash}/device`, {method: "DELETE"});
+        location.reload();
+      });
+    });
+  </script>
+</body>
+</html>

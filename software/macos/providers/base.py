@@ -132,7 +132,7 @@ def build_summary_prompt(transcript: str, deepgram_insights: dict = None, meetin
     before the transcript, each as its own labeled block:
 
     - deepgram_insights: Deepgram Audio Intelligence (entities/topics/
-      intents/sentiment) -- lets the LLM use already-detected facts rather
+      intents/summary) -- lets the LLM use already-detected facts rather
       than re-deriving them from raw text.
     - meeting: calendar event metadata (title + attendee name/email list,
       see google_client.current_or_next_event) -- steers "speaker_names"
@@ -149,10 +149,9 @@ def build_summary_prompt(transcript: str, deepgram_insights: dict = None, meetin
 
     if deepgram_insights:
         lines = ["[Deepgram Audio Intelligence — use this as a reliable reference:]"]
-        sentiment = deepgram_insights.get("sentiment")
-        if sentiment:
-            score = deepgram_insights.get("sentiment_score", "")
-            lines.append(f"Overall sentiment: {sentiment}" + (f" (score {score})" if score else ""))
+        dg_summary = deepgram_insights.get("summary")
+        if dg_summary:
+            lines.append(f"Deepgram's own summary: {dg_summary}")
         topics = deepgram_insights.get("topics") or []
         if topics:
             lines.append(f"Detected topics: {', '.join(topics[:8])}")
@@ -546,16 +545,18 @@ def format_transcript_with_speakers(text: str, segments, speaker_names: dict = N
 
 
 def _denull(value):
-    """LLMs sometimes emit the literal string "null" (or "none"/"n/a")
-    instead of JSON null for an unfilled optional field, despite the
-    prompt saying to use null -- caught in the wild via a "speaker_names"
-    guess that came back as {"speaker_1": "null"} instead of omitting the
-    key. Recursively normalizes those to real None/absent, since every
-    caller downstream (notion_sync.py, poller.py) treats a non-empty
-    string as real data with `if value:` checks and can't tell a
-    hallucinated "null" from an actual name."""
+    """LLMs sometimes emit the literal string "null" (or "none"/"n/a"/
+    "unknown") instead of JSON null for an unfilled optional field, despite
+    the prompt saying to use null -- caught in the wild via a
+    "speaker_names" guess that came back as {"speaker_1": "unknown"}
+    (and a "stakeholders" entry with name "unknown") instead of omitting
+    the unidentified speaker entirely. Recursively normalizes those to
+    real None/absent, since every caller downstream (notion_sync.py,
+    poller.py, the dashboard templates) treats a non-empty string as real
+    data with `if value:` checks and can't tell a hallucinated "unknown"
+    from an actual name."""
     if isinstance(value, str):
-        return None if value.strip().lower() in ("null", "none", "n/a", "") else value
+        return None if value.strip().lower() in ("null", "none", "n/a", "unknown", "") else value
     if isinstance(value, dict):
         cleaned = {k: _denull(v) for k, v in value.items()}
         return {k: v for k, v in cleaned.items() if v is not None}

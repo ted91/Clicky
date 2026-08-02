@@ -199,10 +199,8 @@ def _build_blocks(record: dict) -> list:
     # the STT provider and the response included intelligence features).
     insights = record.get("deepgram_insights") or {}
     insight_lines = []
-    if insights.get("sentiment"):
-        score = insights.get("sentiment_score", "")
-        label = f"{insights['sentiment'].capitalize()}" + (f" ({score})" if score else "")
-        insight_lines.append(f"Sentiment: {label}")
+    if insights.get("summary"):
+        insight_lines.append(f"Deepgram summary: {insights['summary']}")
     if insights.get("topics"):
         insight_lines.append(f"Topics: {', '.join(insights['topics'][:8])}")
     if insights.get("intents"):
@@ -305,6 +303,8 @@ def push_recording(record: dict) -> str:
     if not database_id:
         raise RuntimeError("Notion isn't configured — set a database ID in /integrations")
 
+    ensure_insight_properties(database_id)
+
     title = record.get("summary", {}).get("summary") or record["name"]
     title = title[:200]  # Notion title property practical limit
 
@@ -317,6 +317,7 @@ def push_recording(record: dict) -> str:
     }
     if record.get("created_at"):
         properties["Date"] = {"date": {"start": record["created_at"][:10]}}
+    properties.update(_insight_properties(record))
 
     for speaker_id, speaker_name in (record.get("speaker_names") or {}).items():
         idx = speaker_slot_index(speaker_id)
@@ -332,7 +333,56 @@ def push_recording(record: dict) -> str:
     resp = requests.post(f"{API_BASE}/pages", headers=_headers(), json=payload, timeout=15)
     if not resp.ok:
         raise RuntimeError(f"Notion API error {resp.status_code}: {resp.text[:300]}")
+    page_id = resp.json()["id"]
     log.info("pushed %s to Notion", record["name"])
+
+    try:
+        import rag_index
+        index_text = f"{title}\n\n{_page_plain_text(page_id)}"
+        rag_index.index_text("notion", page_id, index_text, date=(record.get("created_at") or "")[:10] or None)
+    except Exception as e:
+        log.warning("rag_index indexing failed for Notion page %s (non-fatal): %s", page_id, e)
+
+    return page_id
+
+
+def push_command(record: dict, jarvis_result: dict) -> str:
+    """Creates a new page in the dedicated Jarvis database (see
+    notion_setup.create_jarvis_database) for one voice command -- Jarvis
+    commands previously had no Notion presence at all, only an inline card
+    on the main dashboard. Mirrors push_recording()'s shape (title + Date
+    property + a simple body) but against its own database, since a
+    command isn't a recording in the Notes sense (no speakers/summary/
+    action items) and doesn't belong mixed into that database.
+    Best-effort: caller (poller.py) should treat a failure here as
+    non-fatal, same as every other optional sync destination."""
+    database_id = settings.get_all().get("notion_jarvis_database_id")
+    if not database_id:
+        raise RuntimeError("Jarvis Notion database isn't configured — set it up in Settings -> Jarvis")
+
+    action_type = jarvis_result.get("action_type") or "unknown"
+    transcript = jarvis_result.get("transcript") or ""
+    spoken = jarvis_result.get("spoken") or ""
+    title = f"{action_type} — {transcript[:150]}" if transcript else action_type
+
+    properties = {
+        "Name": {"title": [{"type": "text", "text": {"content": title[:200]}}]},
+        "Action Type": {"select": {"name": action_type}},
+        "Heard": {"rich_text": [{"type": "text", "text": {"content": transcript[:MAX_TEXT_LEN]}}]},
+        "Replied": {"rich_text": [{"type": "text", "text": {"content": spoken[:MAX_TEXT_LEN]}}]},
+        "OK": {"checkbox": bool(jarvis_result.get("ok"))},
+    }
+    if record.get("created_at"):
+        properties["Date"] = {"date": {"start": record["created_at"][:10]}}
+
+    payload = {
+        "parent": {"database_id": database_id, "type": "database_id"},
+        "properties": properties,
+    }
+    resp = requests.post(f"{API_BASE}/pages", headers=_headers(), json=payload, timeout=15)
+    if not resp.ok:
+        raise RuntimeError(f"Notion API error {resp.status_code}: {resp.text[:300]}")
+    log.info("pushed Jarvis command %s to Notion", record["name"])
     return resp.json()["id"]
 
 
@@ -1569,6 +1619,54 @@ def ensure_generate_social_trigger_property(database_id: str):
     _generate_social_trigger_ensured.add(database_id)
 
 
+_insight_properties_ensured = set()
+
+
+def ensure_insight_properties(database_id: str):
+    """Idempotently adds Topics/Intents/Deepgram Summary properties to a
+    Notes or Journal database -- these used to only ever be baked into the
+    LLM prompt (providers.base.build_summary_prompt) and the page body
+    text (see _build_blocks), never queryable/filterable as real database
+    columns. Same gate-and-PATCH pattern as ensure_publication_properties.
+    Only meaningful when Deepgram is the STT provider (see
+    deepgram_provider.py) -- harmless no-op columns otherwise."""
+    if not database_id or database_id in _insight_properties_ensured:
+        return
+    ds_id = _data_source_id(database_id)
+    resp = requests.patch(
+        f"{API_BASE}/data_sources/{ds_id}", headers=_headers(),
+        json={"properties": {
+            "Topics": {"multi_select": {}},
+            "Intents": {"multi_select": {}},
+            "Deepgram Summary": {"rich_text": {}},
+        }},
+        timeout=15,
+    )
+    if not resp.ok:
+        log.warning("failed to add insight properties to database %s: %s %s",
+                    database_id, resp.status_code, resp.text[:300])
+        return
+    _insight_properties_ensured.add(database_id)
+
+
+def _insight_properties(record: dict) -> dict:
+    """Shared by push_recording/push_journal -- Topics/Intents/Deepgram
+    Summary properties built from record["deepgram_insights"], if any."""
+    insights = record.get("deepgram_insights") or {}
+    properties = {}
+    # Notion's multi_select option names can't contain a comma -- Deepgram's
+    # topic/intent phrases occasionally do (e.g. "project planning, budget").
+    topics = insights.get("topics") or []
+    if topics:
+        properties["Topics"] = {"multi_select": [{"name": t.replace(",", "/")[:100]} for t in topics[:20]]}
+    intents = insights.get("intents") or []
+    if intents:
+        properties["Intents"] = {"multi_select": [{"name": i.replace(",", "/")[:100]} for i in intents[:20]]}
+    if insights.get("summary"):
+        properties["Deepgram Summary"] = {"rich_text": [{"type": "text", "text": {"content": insights["summary"][:MAX_TEXT_LEN]}}]}
+    return properties
+
+
 def is_generate_social_triggered(page_id: str) -> bool:
     """Reads whether a recording's Notes or Journal page has the
     "Generate Social Media" checkbox currently checked."""
@@ -1867,6 +1965,16 @@ def push_journal(record: dict, note_page_id: str = None):
         properties["Date"] = {"date": {"start": record["created_at"][:10]}}
     if schema.get("Related Note") == "relation" and note_page_id:
         properties["Related Note"] = {"relation": [{"id": note_page_id}]}
+    # Same conservative, adapt-don't-force approach as Date/Related Note
+    # above -- only set these if the user's own Journal database already
+    # happens to have them, rather than force-adding new columns to a
+    # database we don't own the schema of (unlike the app's own Notes
+    # database, see ensure_insight_properties/push_recording).
+    insight_props = _insight_properties(record)
+    for name, value in insight_props.items():
+        prop_type = "multi_select" if name in ("Topics", "Intents") else "rich_text"
+        if schema.get(name) == prop_type:
+            properties[name] = value
 
     payload = {
         "parent": {"database_id": database_id, "type": "database_id"},
@@ -1876,5 +1984,14 @@ def push_journal(record: dict, note_page_id: str = None):
     resp = requests.post(f"{API_BASE}/pages", headers=_headers(), json=payload, timeout=15)
     if not resp.ok:
         raise RuntimeError(f"Notion API error {resp.status_code}: {resp.text[:300]}")
+    page_id = resp.json()["id"]
     log.info("pushed %s to Notion Journal", record["name"])
-    return resp.json()["id"]
+
+    try:
+        import rag_index
+        index_text = f"{title}\n\n{_page_plain_text(page_id)}"
+        rag_index.index_text("notion", page_id, index_text, date=(record.get("created_at") or "")[:10] or None)
+    except Exception as e:
+        log.warning("rag_index indexing failed for Notion Journal page %s (non-fatal): %s", page_id, e)
+
+    return page_id

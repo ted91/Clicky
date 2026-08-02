@@ -23,9 +23,12 @@ follow-up if Obsidian-backed notes aren't enough."""
 import json
 import logging
 import os
+import re
 import subprocess
 from datetime import datetime, timedelta, timezone
 
+import memory_store
+import rag_index
 import settings
 import storage
 from providers import get_completer
@@ -73,7 +76,7 @@ def _parse_decision_json(raw_text: str) -> dict:
             "action_type": "unknown", "continues_session": False, "app_name": None,
             "title": None, "date": None, "time": None, "recipient_name": None,
             "referenced_person": None, "referenced_topic": None, "referenced_time_range": None,
-            "target_app": None, "query": raw_text.strip(),
+            "target_app": None, "query": raw_text.strip(), "direct_answer": None, "snippet_text": None,
         }
     return {
         "action_type": data.get("action_type") or "unknown",
@@ -88,6 +91,8 @@ def _parse_decision_json(raw_text: str) -> dict:
         "referenced_time_range": data.get("referenced_time_range") or None,
         "target_app": data.get("target_app") or None,
         "query": data.get("query") or raw_text.strip(),
+        "direct_answer": data.get("direct_answer") or None,
+        "snippet_text": data.get("snippet_text") or None,
     }
 
 
@@ -97,6 +102,7 @@ def decide_action(transcript: str, session: dict = None) -> dict:
     user's explicit choice that continuation be context-based rather than a
     fixed timeout."""
     session = session or {}
+    facts_block = memory_store.facts_context()
     context_block = ""
     if session:
         context_block = "\n\n[An action flow is currently open: " + json.dumps(session.get("context", {})) + \
@@ -104,7 +110,7 @@ def decide_action(transcript: str, session: dict = None) -> dict:
     prompt = (
         "You route one spoken voice command for a personal-assistant device to exactly one action "
         "type. Return ONLY JSON (no markdown fences, no commentary) matching exactly:\n"
-        '{"action_type": "open_app" | "calendar_event" | "reminder" | "email_draft" | "social_post" | "qa" | "code_task" | "unknown", '
+        '{"action_type": "open_app" | "calendar_event" | "reminder" | "email_draft" | "social_post" | "qa" | "code_task" | "save_snippet" | "unknown", '
         '"continues_session": true or false, '
         '"app_name": "app name or null", '
         '"title": "event/reminder title or null", '
@@ -112,11 +118,22 @@ def decide_action(transcript: str, session: dict = None) -> dict:
         '"time": "HH:MM or null", '
         '"recipient_name": "person name or null (email_draft recipient)", '
         '"referenced_person": "person name or null (if this references a past conversation with someone)", '
-        '"referenced_topic": "a project/topic name or null (if this references past recordings about a '
-        'subject rather than a specific person, e.g. \\"the Clicky project\\", \\"my trip planning\\")", '
+        '"referenced_topic": "a SPECIFIC, NAMED project/topic or null -- e.g. \\"the Clicky project\\", '
+        '\\"my trip planning\\". Must be null for a generic, self-referential phrase with no specific '
+        'subject named, such as \\"my journal\\", \\"our previous conversation\\", \\"previous journals\\", '
+        '\\"past entries\\", or \\"what we talked about\\" -- these mean \\"my journal history in general\\", '
+        'not a named topic, and forcing one of these phrases into this field breaks retrieval (there is no '
+        'recording literally titled or about \\"previous journals\\"). Leave this null for those cases; the '
+        'fallback path already searches recent journal entries generically.", '
         '"referenced_time_range": "e.g. \\"last week\\"/\\"yesterday\\"/\\"last month\\", or null", '
         '"target_app": "an assistant/app name the user explicitly named (e.g. ChatGPT, Cursor), or null", '
-        '"query": "the actual question/instruction text to act on"}\n'
+        '"query": "the actual question/instruction text to act on", '
+        '"direct_answer": "ONLY for action_type=qa with no target_app -- your own terse spoken answer to '
+        'the question RIGHT NOW, in the fewest words possible (a number/fact gets just the value and unit, '
+        'e.g. \\"18 degrees\\", never a full sentence; no pleasantries, no follow-up offers). null for '
+        'anything needing retrieval from past recordings, a named assistant, or any non-qa action_type." '
+        '"snippet_text": "ONLY for action_type=save_snippet -- the actual content being saved, e.g. what was '
+        'just said or referenced (\\"save this\\"/\\"remember that\\"/\\"save that snippet\\"). null otherwise."}\n'
         "action_type meanings: open_app = launch a named app. calendar_event = add a calendar event. "
         "reminder = add a reminder. email_draft = compose an email (recipient_name is who the email goes "
         "TO -- separate from referenced_person, who the command's CONTEXT comes from, e.g. \"based on the "
@@ -126,9 +143,13 @@ def decide_action(transcript: str, session: dict = None) -> dict:
         "\"my journal\"/their own recent reflections). "
         "qa = a general question, a pure recall request (\"remind me what we discussed with X\"), or a "
         "request to continue a chat with a named assistant (target_app). code_task = build/fix/write code "
-        "or continue a coding project. unknown = doesn't clearly fit any of the above.\n"
+        "or continue a coding project. save_snippet = an explicit instruction to save/remember a piece of "
+        "content just said or referenced (\"save this\", \"remember that\", \"save that snippet\") -- not a "
+        "general note-taking request, only this specific save/remember phrasing. unknown = doesn't clearly "
+        "fit any of the above.\n"
         f"Resolve relative dates against today's actual date: {datetime.now():%Y-%m-%d}."
         + context_block +
+        (f"\n\n{facts_block}" if facts_block else "") +
         f"\n\nCommand: \"{transcript}\""
     )
     _, complete = get_completer()
@@ -160,113 +181,36 @@ def _parse_time_range(label):
     return None, None
 
 
-def _search_local_recordings(keyword: str, start=None, end=None) -> list:
-    """Matches `keyword` against a recording's speaker/stakeholder names
-    AND its full recording name/transcript/summary text -- broad on
-    purpose, so this same function serves a person's name, a project name,
-    a topic, or any other phrase the user references ("based on my
-    journal", "the Clicky project", "that conversation about X"), not just
-    people. This is the "give Jarvis access to all transcripts by name,
-    date, conversation, project" retrieval the user asked for."""
-    needle = keyword.strip().lower()
-    matches = []
-    for record in storage.list_recordings():
-        date = (record.get("created_at") or "")[:10]
-        if start and date < start:
-            continue
-        if end and date > end:
-            continue
-        names = [n.lower() for n in (record.get("speaker_names") or {}).values()]
-        stakeholders = [(s.get("name") or "").lower() for s in ((record.get("summary") or {}).get("stakeholders") or [])]
-        transcript = (record.get("transcript") or "")
-        summary_text = (record.get("summary") or {}).get("summary") or ""
-        haystack = f"{record.get('name', '')} {transcript} {summary_text}".lower()
-        if needle in names or needle in stakeholders or needle in haystack:
-            text = summary_text or transcript
-            if text:
-                matches.append({"source": "local", "date": date, "text": text})
-    return matches
-
-
-def _search_obsidian_vault(keyword: str, start=None, end=None) -> list:
-    vault_path = settings.get_all().get("obsidian_vault_path")
-    if not vault_path or not os.path.isdir(vault_path):
-        return []
-    needle = keyword.lower()
-    matches = []
-    for root, _dirs, files in os.walk(vault_path):
-        for fname in files:
-            if not fname.endswith(".md"):
-                continue
-            path = os.path.join(root, fname)
-            try:
-                mtime = datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc).date().isoformat()
-                if start and mtime < start:
-                    continue
-                if end and mtime > end:
-                    continue
-                with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                    text = f.read()
-            except OSError:
-                continue
-            if needle in text.lower():
-                matches.append({"source": "obsidian", "date": mtime, "text": text[:2000]})
-    return matches
-
-
-def find_context(keyword: str, time_range: str = None):
-    """Real retrieval across everything the pipeline already writes to --
-    local recordings store (by name, date, transcript, or summary text),
-    Notion (Notes/Journal, via a substring match on page content -- see
-    notion_sync.query_pages_mentioning), Obsidian vault -- merged, deduped,
-    and (if more than one match) summarized into one string via the
-    configured LLM. `keyword` can be a person's name, a project name, a
-    topic, or any other phrase -- this is intentionally general (not
-    person-specific) so Jarvis can pull context from any past conversation,
-    not just ones naming a specific person. Returns None if nothing found
-    anywhere."""
-    if not keyword:
+def search_memory(query: str, time_range: str = None, speaker: str = None):
+    """Real semantic retrieval across everything the pipeline indexes --
+    see macOS jarvis.py for the full rationale. Returns None if nothing
+    scores above rag_index.MIN_SCORE."""
+    if not query:
         return None
     start, end = _parse_time_range(time_range)
-    results = _search_local_recordings(keyword, start, end)
-
-    try:
-        import notion_sync
-        results.extend(notion_sync.query_pages_mentioning(keyword, start, end))
-    except Exception as e:
-        log.debug("Notion context search for %r failed: %s", keyword, e)
-
-    try:
-        results.extend(_search_obsidian_vault(keyword, start, end))
-    except Exception as e:
-        log.debug("Obsidian context search for %r failed: %s", keyword, e)
-
+    results = rag_index.search(query, date_start=start, date_end=end, speaker=speaker)
     if not results:
         return None
 
-    seen = set()
-    deduped = []
-    for r in results:
-        key = (r.get("date"), (r.get("text") or "")[:80])
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(r)
+    if len(results) == 1:
+        return results[0]["text"]
 
-    if len(deduped) == 1:
-        return deduped[0]["text"]
-
-    combined = "\n\n".join(f"[{r.get('date', 'unknown date')}] {r['text']}" for r in deduped)
+    combined = "\n\n".join(f"[{r.get('date') or 'unknown date'}] {r['text']}" for r in results)
     _, complete = get_completer()
     prompt = (
-        f"Summarize these notes related to \"{keyword}\" into one concise paragraph, "
-        "suitable to be read aloud or acted on:\n\n" + combined
+        f"Summarize these notes related to \"{query}\" into one concise paragraph, "
+        "suitable to be acted on:\n\n" + combined
     )
     try:
         return complete(prompt).strip()
     except Exception as e:
         log.debug("context summarization failed, returning raw combined text: %s", e)
         return combined
+
+
+# Old name, kept as a thin alias -- see macOS jarvis.py.
+def find_context(keyword: str, time_range: str = None):
+    return search_memory(keyword, time_range)
 
 
 def find_person_context(person_name: str, time_range: str = None):
@@ -302,29 +246,21 @@ def _parse_subject_body(raw_text: str, recipient_name: str, fallback_query: str)
 # no vault configured those actions genuinely can't do anything on this
 # platform, so this is the difference between "not available" and "works."
 
-def _obsidian_jarvis_dir():
-    vault_path = settings.get_all().get("obsidian_vault_path")
-    if not vault_path or not os.path.isdir(vault_path):
-        return None
-    jarvis_dir = os.path.join(vault_path, "Jarvis")
-    os.makedirs(jarvis_dir, exist_ok=True)
-    return jarvis_dir
-
-
 def _write_obsidian_note(action_type: str, frontmatter_extra: dict, body_lines: list) -> bool:
-    jarvis_dir = _obsidian_jarvis_dir()
-    if not jarvis_dir:
+    """Routed through obsidian_sync's shared _vault_subfolder/_write_note
+    (same helpers Tasks/People/Calendar/Journal/Publications notes use --
+    a "Jarvis" subfolder is exactly the same pattern as "Journal") instead
+    of hand-rolling vault path resolution and raw frontmatter strings."""
+    import obsidian_sync
+    try:
+        jarvis_dir = obsidian_sync._vault_subfolder("Jarvis")
+    except RuntimeError:
         return False
     try:
         now = datetime.now()
         fname = f"{now:%Y-%m-%d-%H%M%S}-{action_type}.md"
-        path = os.path.join(jarvis_dir, fname)
-        lines = ["---", f"date: {now:%Y-%m-%d %H:%M:%S}", f"action_type: {action_type}"]
-        for k, v in frontmatter_extra.items():
-            lines.append(f"{k}: {v}")
-        lines += ["---", ""] + body_lines
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+        frontmatter = {"date": now.strftime("%Y-%m-%d %H:%M:%S"), "action_type": action_type, **frontmatter_extra}
+        obsidian_sync._write_note(jarvis_dir, fname, frontmatter, "\n".join(body_lines))
         return True
     except Exception as e:
         log.warning("Obsidian note write failed: %s", e)
@@ -337,7 +273,7 @@ def _log_to_obsidian(action_type: str, decision: dict, result: dict):
     that DIDN'T already write their own note above (calendar_event/
     reminder/email_draft write directly in their own handler instead, so
     this doesn't double-log them)."""
-    if action_type in ("calendar_event", "reminder", "email_draft"):
+    if action_type in ("calendar_event", "reminder", "email_draft", "save_snippet"):
         return
     body = [f"**Heard:** {decision.get('query') or ''}", ""]
     if result.get("spoken"):
@@ -350,17 +286,17 @@ def _log_to_obsidian(action_type: str, decision: dict, result: dict):
 def _action_open_app(decision: dict) -> dict:
     app_name = decision.get("app_name") or decision.get("query")
     if not app_name:
-        return {"ok": False, "spoken": "I didn't catch which app to open."}
+        return {"ok": False, "spoken": "Not done -- didn't catch which app."}
     try:
         # Windows has no direct equivalent of macOS's "open -a <app name>"
         # (fuzzy app-name resolution) -- `start` via the shell resolves a
         # registered app name/executable on PATH, which covers the common
         # case (browsers, Office, etc.) without needing a full path.
         subprocess.run(f'start "" "{app_name}"', shell=True, check=True, timeout=10)
-        return {"ok": True, "spoken": f"Opened {app_name}."}
+        return {"ok": True, "spoken": "Done."}
     except Exception as e:
         log.warning("open_app failed for %r: %s", app_name, e)
-        return {"ok": False, "spoken": f"Couldn't open {app_name}."}
+        return {"ok": False, "spoken": f"Not done -- couldn't open {app_name}."}
 
 
 def _action_calendar_event(decision: dict) -> dict:
@@ -371,16 +307,20 @@ def _action_calendar_event(decision: dict) -> dict:
     title = decision.get("title") or decision.get("query") or "New event"
     when = " ".join(filter(None, [decision.get("date"), decision.get("time")]))
     if _write_obsidian_note("calendar_event", {}, [f"**{title}**" + (f" — {when}" if when else ""), ""]):
-        return {"ok": True, "spoken": f"Added {title} to your Jarvis notes in Obsidian" + (f" for {when}" if when else "") + ".", "session": None}
-    return {"ok": False, "spoken": "Calendar events via Jarvis need Obsidian connected on Windows (Settings -> Obsidian) -- Outlook automation isn't available yet.", "session": None}
+        spoken = "Done." if when else "Done -- no date given."
+        return {"ok": True, "spoken": spoken, "session": None}
+    return {"ok": False, "spoken": "Not done -- needs Obsidian connected (Settings -> Obsidian).", "session": None}
 
 
 def _action_reminder(decision: dict) -> dict:
     """Same Obsidian-backed approach as _action_calendar_event."""
     title = decision.get("title") or decision.get("query") or "New reminder"
     if _write_obsidian_note("reminder", {}, [f"**{title}**", ""]):
-        return {"ok": True, "spoken": f"Added a reminder to your Jarvis notes in Obsidian: {title}.", "session": None}
-    return {"ok": False, "spoken": "Reminders via Jarvis need Obsidian connected on Windows (Settings -> Obsidian) -- Outlook automation isn't available yet.", "session": None}
+        return {"ok": True, "spoken": "Done.", "session": None}
+    return {"ok": False, "spoken": "Not done -- needs Obsidian connected (Settings -> Obsidian).", "session": None}
+
+
+_EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
 def _action_email_draft(decision: dict, session: dict) -> dict:
@@ -391,7 +331,15 @@ def _action_email_draft(decision: dict, session: dict) -> dict:
     multi-turn "read it back / send it" session here -- the note is the
     final artifact."""
     recipient_name = decision.get("recipient_name") or ""
-    to_email = _lookup_email_for_name(recipient_name) if recipient_name else ""
+    # A spoken command can already contain a literal email address (e.g.
+    # "email sanchit.gupta01@gmail.com about...") -- decide_action still
+    # puts that into recipient_name, and routing it through
+    # _lookup_email_for_name (a Notion People NAME lookup) would fail since
+    # an address is never a stored person's Name. Mirrors macOS's fix.
+    if _EMAIL_RE.match(recipient_name.strip()):
+        to_email = recipient_name.strip()
+    else:
+        to_email = _lookup_email_for_name(recipient_name) if recipient_name else ""
     context_keyword = decision.get("referenced_person") or decision.get("referenced_topic")
     context_text = find_context(context_keyword, decision.get("referenced_time_range")) if context_keyword else None
 
@@ -405,7 +353,7 @@ def _action_email_draft(decision: dict, session: dict) -> dict:
         raw = complete(compose_prompt)
     except Exception as e:
         log.warning("email compose failed: %s", e)
-        return {"ok": False, "spoken": "I couldn't draft that email just now.", "session": None}
+        return {"ok": False, "spoken": "Not done -- couldn't draft it.", "session": None}
     subject, body = _parse_subject_body(raw, recipient_name, decision.get("query") or "")
 
     note_body = [
@@ -413,15 +361,16 @@ def _action_email_draft(decision: dict, session: dict) -> dict:
         f"**Subject:** {subject}", "", body, "",
     ]
     if _write_obsidian_note("email_draft", {}, note_body):
-        return {"ok": True, "spoken": f"Drafted an email to {recipient_name} about {subject} -- saved to your Jarvis notes in Obsidian to send from your own email client.", "session": None}
-    return {"ok": False, "spoken": "Email drafting via Jarvis needs Obsidian connected on Windows (Settings -> Obsidian) -- Outlook automation isn't available yet.", "session": None}
+        spoken = "Done." if to_email else "Done -- email address is missing, check the note."
+        return {"ok": True, "spoken": spoken, "session": None}
+    return {"ok": False, "spoken": "Not done -- needs Obsidian connected (Settings -> Obsidian).", "session": None}
 
 
 def _dispatch_gui_automation(target_app: str, text: str) -> dict:
     """Not yet implemented on Windows -- see module docstring. A real
     version would need a Windows UI-automation equivalent of AppleScript's
     System Events keystroke approach (e.g. pywinauto)."""
-    return {"ok": False, "spoken": f"Sending to {target_app} isn't available on Windows yet.", "session": None}
+    return {"ok": False, "spoken": f"Not done -- {target_app} isn't available on Windows yet.", "session": None}
 
 
 def _recent_journal_context(time_range=None) -> str:
@@ -468,23 +417,19 @@ def _action_social_post(decision: dict, record: dict) -> dict:
         source_label = "your recent journal entries"
 
     if not source_text:
-        return {"ok": False, "spoken": f"I couldn't find {source_label} to base a post on.", "session": None}
+        return {"ok": False, "spoken": f"Not done -- couldn't find {source_label}.", "session": None}
 
     try:
         posts = poller.generate_social_posts(source_text, meeting=None)
     except Exception as e:
         log.warning("social post generation failed: %s", e)
-        return {"ok": False, "spoken": "I couldn't generate a post from that just now.", "session": None}
+        return {"ok": False, "spoken": "Not done -- generation failed.", "session": None}
     if not posts:
-        return {"ok": False, "spoken": "There wasn't enough there to turn into a real post.", "session": None}
+        return {"ok": False, "spoken": "Not done -- not enough material.", "session": None}
 
     storage.set_social_posts(record["content_hash"], posts)
-    push_result = poller.push_social_posts_now(record["content_hash"])
-    if push_result.get("pushed"):
-        spoken = f"Drafted a post based on {source_label} and saved it to your notes -- check the Social Posts page to review and publish."
-    else:
-        spoken = f"Drafted a post based on {source_label} -- it's on your Clicky dashboard's Social Posts page. Connect Notion or Obsidian in Settings to sync it there too."
-    return {"ok": True, "spoken": spoken, "session": None}
+    poller.push_social_posts_now(record["content_hash"])
+    return {"ok": True, "spoken": "Done -- check the Social Posts page.", "session": None}
 
 
 def _action_qa(decision: dict, session: dict) -> dict:
@@ -500,6 +445,13 @@ def _action_qa(decision: dict, session: dict) -> dict:
     # Jarvis access to the whole recordings corpus by name, date,
     # conversation, or project -- not just person-referenced context.
     context_keyword = decision.get("referenced_person") or decision.get("referenced_topic")
+    # decide_action() already answered this in its own single completion call
+    # when it's a contextless factual/chat question (see its prompt's
+    # "direct_answer" field) -- skip the second, sequential Mistral
+    # round-trip entirely for that common case.
+    if decision.get("direct_answer") and not context_keyword and not (session and session.get("kind") == "qa"):
+        return {"ok": True, "spoken": decision["direct_answer"], "session": None}
+
     context_text = None
     if context_keyword:
         context_text = find_context(context_keyword, decision.get("referenced_time_range"))
@@ -518,6 +470,8 @@ def _action_qa(decision: dict, session: dict) -> dict:
         prompt = f"Context from past recordings related to \"{context_keyword}\":\n{context_text}\n\nQuestion: {prompt}"
     if prior:
         prompt = f"Prior conversation:\n{prior}\n\n{prompt}"
+    prompt += ("\n\nAnswer in the fewest words possible for a spoken reply -- a fact/number gets just the "
+               "value and unit, no filler, no pleasantries, no follow-up offers unless asked for detail.")
 
     _, complete = get_completer()
     try:
@@ -570,6 +524,27 @@ def _action_code_task(decision: dict) -> dict:
     return {"ok": True, "spoken": "Claude Code finished working on that.", "session": None}
 
 
+def _action_save_snippet(decision: dict) -> dict:
+    """"Save this" / "remember that" / "save that snippet" -- writes the
+    referenced content as its own note in the Jarvis Obsidian folder (same
+    _write_obsidian_note used by every other Jarvis action here)."""
+    snippet = decision.get("snippet_text") or decision.get("query") or ""
+    if not snippet.strip():
+        return {"ok": False, "spoken": "Not done -- I didn't catch what to save.", "session": None}
+    snippet = snippet.strip()
+
+    # Memory (memory_store) always gets this -- see macOS jarvis.py for the
+    # full rationale. The Obsidian note below is a separate, human-readable
+    # record of the same save, not a duplicate mechanism.
+    try:
+        memory_store.add_fact(snippet)
+    except Exception as e:
+        log.warning("memory_store write failed (non-fatal): %s", e)
+
+    _write_obsidian_note("save_snippet", {}, [snippet, ""])
+    return {"ok": True, "spoken": "Saved.", "session": None}
+
+
 # --- speech I/O --------------------------------------------------------------
 
 def speak(text: str) -> bytes:
@@ -582,6 +557,22 @@ def speak(text: str) -> bytes:
     rather than shipping a mismatched-sample-rate reply that would play at
     the wrong speed/pitch on the device."""
     raise NotImplementedError("Jarvis spoken replies aren't implemented on Windows yet")
+
+
+def send_ack():
+    """Quick tactile "done" click -- sent right after the decided action
+    finishes executing, before the slower (and separately fallible) full
+    spoken TTS reply. Best-effort: skipped silently if WiFi isn't reachable,
+    same as send_audio_reply() -- there's no BLE equivalent for this yet."""
+    import poller
+    base_url = poller.wifi_base_url_if_reachable()
+    if not base_url:
+        return
+    import device_client
+    try:
+        device_client.send_jarvis_ack(base_url)
+    except Exception as e:
+        log.debug("Jarvis ack click failed (non-fatal): %s", e)
 
 
 def send_audio_reply(wav_bytes: bytes):
@@ -603,45 +594,38 @@ def send_audio_reply(wav_bytes: bytes):
 
 # --- top-level entry point ----------------------------------------------------
 
-def process_command(record: dict, transcript: str) -> dict:
+def process_command(record: dict, transcript: str, suppress_reply: bool = False) -> dict:
     """Called from poller.process_once() for kind=="command" recordings
     instead of the memo summarize()/Notion/Obsidian pipeline. Returns a dict
     describing what happened (transcript + decided action + result) for the
-    dashboard to show in place of a summary."""
+    dashboard to show in place of a summary.
+
+    suppress_reply=True is used when this command is part of an offline
+    backlog -- see macOS jarvis.py for the parity version/full rationale.
+    Backlogged actions still execute for real, but get one short batch
+    summary from the caller instead of each getting its own descriptive
+    spoken reply. A qa command is never answered late -- a stale answer to
+    an old question is worse than no answer, so a backlogged qa skips
+    execution entirely."""
     global _session
     decision = decide_action(transcript, _session if _session.get("kind") else None)
 
     if not decision.get("continues_session"):
         _session = {}
 
-    action_type = decision.get("action_type")
-    if action_type == "open_app":
-        result = _action_open_app(decision)
-    elif action_type == "calendar_event":
-        result = _action_calendar_event(decision)
-    elif action_type == "reminder":
-        result = _action_reminder(decision)
-    elif action_type == "email_draft":
-        result = _action_email_draft(decision, _session)
-    elif action_type == "social_post":
-        result = _action_social_post(decision, record)
-    elif action_type == "qa":
-        result = _action_qa(decision, _session)
-    elif action_type == "code_task":
-        result = _action_code_task(decision)
-    else:
-        result = {"ok": False, "spoken": "I didn't understand that command."}
-    result.setdefault("session", None)
+    action_type, result = _dispatch_decision(decision, record, suppress_reply)
 
-    _session = result.get("session") or {}
+    if not suppress_reply:
+        try:
+            send_ack()
+        except Exception as e:
+            log.debug("Jarvis ack click failed (non-fatal): %s", e)
 
-    _log_to_obsidian(action_type, decision, result)
-
-    try:
-        wav_bytes = speak(result.get("spoken") or "")
-        send_audio_reply(wav_bytes)
-    except Exception as e:
-        log.warning("Jarvis spoken reply failed (action still executed): %s", e)
+        try:
+            wav_bytes = speak(result.get("spoken") or "")
+            send_audio_reply(wav_bytes)
+        except Exception as e:
+            log.warning("Jarvis spoken reply failed (action still executed): %s", e)
 
     try:
         import analytics
@@ -655,3 +639,64 @@ def process_command(record: dict, transcript: str) -> dict:
         "ok": result.get("ok", False),
         "spoken": result.get("spoken"),
     }
+
+
+def _dispatch_decision(decision: dict, record: dict, suppress_reply: bool = False) -> tuple:
+    """The actual action_type routing, factored out of process_command() so
+    execute_decided_action() can reuse the exact same dispatch/logging
+    without duplicating it -- see macOS jarvis.py for the parity version.
+    Returns (action_type, result)."""
+    global _session
+    action_type = decision.get("action_type")
+    if suppress_reply and action_type == "qa":
+        result = {"ok": False, "spoken": None, "session": None}
+    elif action_type == "open_app":
+        result = _action_open_app(decision)
+    elif action_type == "calendar_event":
+        result = _action_calendar_event(decision)
+    elif action_type == "reminder":
+        result = _action_reminder(decision)
+    elif action_type == "email_draft":
+        result = _action_email_draft(decision, _session)
+    elif action_type == "social_post":
+        result = _action_social_post(decision, record or {})
+    elif action_type == "qa":
+        result = _action_qa(decision, _session)
+    elif action_type == "code_task":
+        result = _action_code_task(decision)
+    elif action_type == "save_snippet":
+        result = _action_save_snippet(decision)
+    else:
+        result = {"ok": False, "spoken": "I didn't understand that command."}
+    result.setdefault("session", None)
+
+    _session = result.get("session") or {}
+
+    _log_to_obsidian(action_type, decision, result)
+    return action_type, result
+
+
+def execute_decided_action(decision: dict) -> dict:
+    """Executes an action already classified elsewhere (an on-device live
+    agent's function-calling) -- see macOS jarvis.py for the full
+    rationale. Skips decide_action() and this app's own spoken reply (the
+    device/live-agent side owns that)."""
+    action_type, result = _dispatch_decision(decision, record=None, suppress_reply=False)
+
+    if settings.get_all().get("notion_jarvis_database_id"):
+        try:
+            import notion_sync
+            fake_record = {"name": "live-command", "created_at": datetime.now(timezone.utc).isoformat()}
+            jarvis_result = {"action_type": action_type, "transcript": decision.get("query") or "",
+                              "ok": result.get("ok", False), "spoken": result.get("spoken")}
+            notion_sync.push_command(fake_record, jarvis_result)
+        except Exception as e:
+            log.warning("Notion push for live-forwarded Jarvis command failed (non-fatal): %s", e)
+
+    try:
+        import analytics
+        analytics.track_event("jarvis_commands")
+    except Exception:
+        pass
+
+    return {"action_type": action_type, "ok": result.get("ok", False), "spoken": result.get("spoken")}

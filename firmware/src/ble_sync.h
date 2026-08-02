@@ -68,4 +68,15 @@ void ble_sync_reconcile_advertising();
 // back to NONE on its own (independent of BOOT-button activity).
 bool ble_sync_pairing_timed_out();
 
+// Explicit pause/resume around light sleep (main.cpp's sleepWatchTask) --
+// same underlying stopAdvertising()/resumeIdleAdvertising() pair
+// wifi_sync.cpp already uses around an HTTP/BLE transfer, exposed here
+// since main.cpp isn't a NimBLE caller itself. Whether the NimBLE
+// controller actually needs this pause before esp_light_sleep_start() is
+// unverified (not documented locally either way) -- cheap and always-safe
+// to do regardless of the real answer, so do it unconditionally rather
+// than gambling on it being unnecessary.
+void ble_sync_pause_advertising_for_sleep();
+void ble_sync_resume_advertising_after_sleep();
+
 #endif

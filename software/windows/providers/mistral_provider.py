@@ -4,15 +4,25 @@ summarization. EU-hosted. SDK: pip install mistralai
 import config
 from providers.base import build_summary_prompt, parse_summary_json
 
+_client_instance = None
+_client_api_key = None
+
 
 def _client():
     # mistralai>=2.x moved the client class under .client -- pinning the
     # import here (not just "from mistralai import Mistral") since that
     # top-level re-export doesn't exist in the version actually installed.
-    from mistralai.client import Mistral
+    global _client_instance, _client_api_key
     if not config.MISTRAL_API_KEY:
         raise RuntimeError("MISTRAL_API_KEY is not set in .env")
-    return Mistral(api_key=config.MISTRAL_API_KEY)
+    # Reused across calls (Jarvis commonly makes several completions per
+    # voice turn) instead of re-instantiating per call; re-created only if
+    # the configured key changes at runtime.
+    if _client_instance is None or _client_api_key != config.MISTRAL_API_KEY:
+        from mistralai.client import Mistral
+        _client_instance = Mistral(api_key=config.MISTRAL_API_KEY)
+        _client_api_key = config.MISTRAL_API_KEY
+    return _client_instance
 
 
 def transcribe(wav_bytes: bytes) -> dict:

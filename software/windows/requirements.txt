@@ -20,6 +20,11 @@ pyyaml                # obsidian_sync.py's frontmatter read/write (was an implic
 speechbrain
 torch
 
+# Local semantic search over recordings/Obsidian/Notion (rag_index.py) --
+# reuses the torch runtime already bundled above for voice_id.py. Local/
+# offline embedding model (sentence-transformers/all-MiniLM-L6-v2, ~80MB).
+sentence-transformers
+
 # Provider SDKs — only install the ones for the provider(s) you set in
 # .env (STT_PROVIDER / LLM_PROVIDER). Uncomment as needed:
 # mistralai            # STT_PROVIDER=mistral or LLM_PROVIDER=mistral

@@ -139,11 +139,15 @@ def wifi_base_url_if_reachable():
 
 
 def get_device_firmware_version():
-    """Best-effort current firmware version string from the paired device
-    (see wifi_sync.cpp's /version route), or None if it's not reachable
-    over WiFi right now. Used by Settings' Device panel -- reuses the same
-    throttled reachability check _get_transport() does, so this doesn't add
-    its own extra BLE/network round trip beyond what's already cached."""
+    """WiFi-only, near-instant fail if not reachable -- used by Settings'
+    Device panel (a synchronous page render; see app.py's _settings_context)
+    where blocking on a live BLE scan would make every Settings page load
+    take up to QUICK_CALL_TIMEOUT_SECONDS (confirmed live: a real regression
+    the first version of the BLE fallback below introduced -- switching to
+    Settings took 15+ seconds whenever WiFi wasn't reachable). Returns None
+    if WiFi isn't reachable right now; see get_device_firmware_version_
+    with_ble_fallback for the background-only version that's allowed to
+    block."""
     base_url = _wifi_base_url_if_reachable()
     if not base_url:
         return None
@@ -152,7 +156,28 @@ def get_device_firmware_version():
         if resp.ok:
             return resp.json().get("version")
     except Exception as e:
-        log.debug("device firmware version check failed (non-fatal): %s", e)
+        log.debug("device firmware version check (WiFi) failed (non-fatal): %s", e)
+    return None
+
+
+def get_device_firmware_version_with_ble_fallback():
+    """Same as get_device_firmware_version(), plus a BLE fallback (can block
+    up to ble_device_client.QUICK_CALL_TIMEOUT_SECONDS) when WiFi isn't
+    reachable -- the firmware keeps its WiFi radio off by default except
+    during an active sync session (battery), so a WiFi-only check would show
+    "unknown" most of the time the device is just idle, even though BLE
+    stays continuously reachable while paired. Only safe to call from a
+    background context that can afford to block (e.g. check_usage_report_
+    once's daily digest) -- NEVER from a synchronous page render, see
+    get_device_firmware_version()'s own doc for why."""
+    version = get_device_firmware_version()
+    if version:
+        return version
+    try:
+        import ble_device_client
+        return ble_device_client.get_wifi_status().get("version")
+    except Exception as e:
+        log.debug("device firmware version check (BLE) failed (non-fatal): %s", e)
     return None
 
 
@@ -221,6 +246,11 @@ async def sync_once():
     if recordings:  # avoid spamming the log every 3s when there's nothing to report
         log.info("device /list: %s", recordings)
 
+    # Jarvis voice commands (cmd_*.wav) download first -- a live, waited-on
+    # interaction, unlike a memo/meeting recording processed in the
+    # background. Matches storage.get_unprocessed()'s command-first order.
+    recordings = sorted(recordings, key=lambda e: not e["name"].startswith("cmd_"))
+
     for entry in recordings:
         name = entry["name"]
         size = entry.get("size")
@@ -237,6 +267,26 @@ async def sync_once():
         if name != RAM_RECORDING_NAME and storage.is_known_by_size(name, size):
             log.info("skipping %s (%s bytes) -- already synced a recording with this exact name+size before; "
                       "if this is actually new audio, see poller.py's is_known_by_size note", name, size)
+            continue
+
+        # A zero-byte file on SD (crash/power-loss mid-recording before any
+        # audio was written) has nothing to transcribe AND poisons the whole
+        # sync queue: confirmed live, downloading one hung a full 5 minutes
+        # before failing, and since /list order put it ahead of the genuinely
+        # new recordings, EVERY poll cycle re-stalled on it before reaching
+        # them -- reading to the user as "nothing is syncing at all". Skip it
+        # outright and best-effort delete it from the card so it stops
+        # re-appearing in /list (deleting a 0-byte file is safe by
+        # definition -- there is no audio in it to lose).
+        if name != RAM_RECORDING_NAME and not size:
+            log.warning("skipping %s (0 bytes -- corrupt/empty, likely a crash mid-recording); "
+                        "deleting it from the SD card so it stops blocking the sync queue", name)
+            try:
+                delete_from_sd = getattr(transport, "delete_recording_from_sd", None)
+                if delete_from_sd:
+                    await asyncio.to_thread(delete_from_sd, name)
+            except Exception as e:
+                log.debug("could not delete empty %s from SD (will keep skipping it): %s", name, e)
             continue
 
         try:
@@ -581,7 +631,17 @@ async def process_once():
     if retry_due:
         _last_retry_attempt = now
 
-    for record in storage.get_unprocessed():
+    # Batch-reply detection: more than one queued Jarvis command in the same
+    # pass signals these were recorded while the Mac was unreachable and are
+    # only being executed now as a backlog -- see macOS poller.py for the
+    # parity version/full rationale.
+    unprocessed = storage.get_unprocessed()
+    pending_commands = [r for r in unprocessed if r.get("kind") == "command"]
+    is_command_batch = len(pending_commands) > 1
+    batch_ok = 0
+    batch_failed = 0
+
+    for record in unprocessed:
         if record["status"] == "failed" and not retry_due:
             continue
         content_hash = record["content_hash"]
@@ -619,9 +679,77 @@ async def process_once():
             # two wasted memo-pipeline LLM calls (type classification +
             # summarize) before being dispatched.
             if record.get("kind") == "command":
+                # Voice commands never go through the memo pipeline's own
+                # voice-ID block below (this branch `continue`s before
+                # reaching it), so without this a command always showed the
+                # generic "Speaker speaker_1:" label even when the owner's
+                # voiceprint is already enrolled (from a meeting recording,
+                # or a memo rename) -- confirmed live, reported by user.
+                # Unlike the memo pipeline (suggestion-only, multi-speaker,
+                # dashboard-confirmed), a command is a direct, single-user
+                # interaction with no rename UI to confirm through, so a
+                # confident match is applied straight to the transcript
+                # rather than left as an unused suggestion.
+                import voice_id
+                if segments and voice_id.is_enabled():
+                    try:
+                        speaker_ids = [sid for sid in dict.fromkeys(seg.get("speaker_id") for seg in segments) if sid is not None]
+                        command_speaker_names = {}
+                        for sid in speaker_ids:
+                            embedding = voice_id.embedding_for_speaker(wav_bytes, segments, sid)
+                            if not embedding:
+                                continue
+                            result = voice_id.match(embedding)
+                            if not result:
+                                # DEFAULT_MATCH_THRESHOLD (0.75) is tuned for
+                                # longer memo/meeting clips -- a short BOOT
+                                # command often scores lower on a genuinely
+                                # correct match (see COMMAND_MATCH_THRESHOLD's
+                                # docstring), so fall back to the top
+                                # candidate here specifically rather than
+                                # leaving a confirmed-enrolled owner's voice
+                                # unlabeled.
+                                cands = voice_id.match_candidates(embedding, top_n=1, min_score=voice_id.COMMAND_MATCH_THRESHOLD)
+                                if cands:
+                                    result = cands[0]
+                            if result:
+                                _, display_name, _score = result
+                                command_speaker_names[sid] = display_name
+                            elif len(speaker_ids) == 1 and not voice_id.get_voiceprint(voice_id.OWNER_KEY):
+                                # Bootstrap case: a BOOT-button voice command
+                                # is inherently a solo, owner-only interaction
+                                # -- if the owner has never been enrolled at
+                                # all, silently seed the owner voiceprint
+                                # from the very first command rather than
+                                # requiring a meeting to happen first.
+                                owner_display = settings.get_all().get("owner_name") or "You"
+                                voice_id.enroll_or_update(voice_id.OWNER_KEY, embedding, display_name=owner_display)
+                        if command_speaker_names:
+                            formatted = format_transcript_with_speakers(transcript, segments, command_speaker_names)
+                    except Exception as e:
+                        log.warning("voice-ID match for command failed (non-fatal, generic speaker label kept): %s", e)
+
                 import jarvis
-                jarvis_result = await asyncio.to_thread(jarvis.process_command, record, formatted)
+                jarvis_result = await asyncio.to_thread(
+                    jarvis.process_command, record, formatted, is_command_batch,
+                )
                 storage.mark_jarvis_processed(content_hash, transcript, jarvis_result, stt_name)
+                if is_command_batch:
+                    if jarvis_result.get("ok"):
+                        batch_ok += 1
+                    else:
+                        batch_failed += 1
+
+                # Jarvis commands get their own Notion database (see
+                # notion_setup.create_jarvis_database) -- best-effort/
+                # non-fatal, same as every other optional sync destination.
+                if settings.get_all().get("notion_jarvis_database_id"):
+                    try:
+                        import notion_sync
+                        await asyncio.to_thread(notion_sync.push_command, storage.get_recording(content_hash), jarvis_result)
+                    except Exception as e:
+                        log.warning("Notion push for Jarvis command %s failed (non-fatal): %s", record["name"], e)
+
                 status.update(sync_ok=True)
                 continue
 
@@ -737,6 +865,13 @@ async def process_once():
             storage.mark_processed(content_hash, transcript, segments, summary, stt_name, llm_name,
                                     deepgram_insights=insights)
             storage.apply_speaker_name_guesses(content_hash, summary.get("speaker_names"))
+
+            try:
+                import rag_index
+                rag_index.add_recording(storage.get_recording(content_hash))
+            except Exception as e:
+                log.warning("rag_index indexing failed for %s (non-fatal): %s", record["name"], e)
+
             log.info("processed %s via stt=%s llm=%s%s%s", record["name"], stt_name, llm_name,
                       " (diarized)" if segments else "",
                       " (deepgram-insights)" if insights else "")
@@ -757,6 +892,18 @@ async def process_once():
             analytics.track_event("processing_failures")
         finally:
             status.update(sync_in_progress=False)
+
+    if is_command_batch and (batch_ok or batch_failed):
+        import jarvis
+        try:
+            if batch_failed:
+                summary = f"{batch_ok} previously assigned tasks done, {batch_failed} failed."
+            else:
+                summary = f"{batch_ok} previously assigned tasks done."
+            wav_bytes = jarvis.speak(summary)
+            jarvis.send_audio_reply(wav_bytes)
+        except Exception as e:
+            log.warning("Jarvis batch summary reply failed (non-fatal, actions already executed): %s", e)
 
 
 async def distribute_once():
@@ -1461,20 +1608,6 @@ _PREP_WINDOW_MIN = 20   # look this far ahead for an upcoming meeting
 _PREP_MIN_LEAD_MIN = 8  # ...but don't fire until it's within this many minutes (avoids notifying way too early)
 
 
-_STOPWORDS = {"the", "a", "an", "and", "or", "with", "for", "of", "to", "on", "in",
-              "meeting", "sync", "call", "chat", "catch", "up", "weekly", "monthly"}
-
-
-def _title_words(title: str) -> set:
-    """Lowercased significant words from a meeting title, for a cheap
-    deterministic topic-relevance signal -- common filler words ("sync",
-    "meeting", "weekly") are stripped so two meetings both titled "Weekly
-    Sync" don't look topically related just because they share that noise."""
-    if not title:
-        return set()
-    return {w for w in title.lower().split() if len(w) > 2 and w not in _STOPWORDS}
-
-
 def _relative_date(iso_str: str) -> str:
     """Human-friendly recency label ("today", "3 days ago", "2 months ago")
     -- staleness matters a lot for how much weight to put on old context;
@@ -1500,23 +1633,24 @@ def _past_context_for_attendees(attendees: list, meeting_title: str = None, limi
     """Scans processed recordings for past meetings involving any of the
     given attendee emails (matched via record["meeting"]["attendees"], the
     same field Notion People email-matching uses -- see notion_sync.py's
-    _attendee_email_for_name), ranks them by topic relevance to the
-    upcoming meeting (title word overlap) then recency, and collects a
-    dated summary + open action items owned by them. Also pulls each
-    person's Notion People "Note" (role/relationship), if the People
-    database is configured, so the note isn't just a bare name.
+    _attendee_email_for_name), ranks them by SEMANTIC relevance to the
+    upcoming meeting (rag_index.rank_by_similarity, not literal title-word
+    overlap -- see macOS poller.py for the full rationale) then recency,
+    and collects a dated summary + open action items owned by them. Also
+    pulls each person's Notion People "Note" (role/relationship), if the
+    People database is configured, so the note isn't just a bare name.
 
-    Deterministic, no LLM call -- keeps this cheap enough to run every poll
-    cycle. Returns {email: {"name", "role", "items": [{"text","date_label",
-    "relevant"}], "open_items": [...]}}, only for attendees who actually
-    have prior history (a first-time meeting with someone correctly yields
-    nothing for them, rather than fabricated context)."""
+    Attendee matching itself stays exact -- only the ranking among
+    already-matched candidates is fuzzy/semantic. Returns {email: {"name",
+    "role", "items": [{"text","date_label","relevant"}], "open_items":
+    [...]}}, only for attendees who actually have prior history."""
+    import rag_index
+
     emails = {a["email"].lower(): a.get("name", a["email"]) for a in attendees if a.get("email")}
     if not emails:
         return {}
 
-    upcoming_words = _title_words(meeting_title)
-    candidates = {email: [] for email in emails}  # email -> list of (relevance, created_at, record)
+    candidates = {email: [] for email in emails}  # email -> list of [created_at, summary] (relevance filled in after the loop)
     open_items = {email: [] for email in emails}
 
     for record in storage.list_recordings():
@@ -1530,16 +1664,24 @@ def _past_context_for_attendees(attendees: list, meeting_title: str = None, limi
         if not matched:
             continue
 
-        record_words = _title_words(meeting.get("title"))
-        relevance = len(upcoming_words & record_words) if upcoming_words else 0
         summary = (record.get("summary") or {}).get("summary", "")
 
         for email in matched:
             if summary:
-                candidates[email].append((relevance, record.get("created_at", ""), summary))
+                candidates[email].append([record.get("created_at", ""), summary])
             for item in (record.get("summary") or {}).get("action_items", []):
                 if (item.get("owner") or "").strip().lower() == emails[email].strip().lower():
                     open_items[email].append(item.get("text", ""))
+
+    all_summaries = [summary for items in candidates.values() for _created_at, summary in items]
+    try:
+        scores = rag_index.rank_by_similarity(meeting_title or "", all_summaries) if meeting_title else [0.0] * len(all_summaries)
+    except Exception as e:
+        log.warning("semantic ranking for pre-meeting prep failed (falling back to recency-only): %s", e)
+        scores = [0.0] * len(all_summaries)
+    score_iter = iter(scores)
+    for email, items in candidates.items():
+        candidates[email] = [(next(score_iter), created_at, summary) for created_at, summary in items]
 
     context = {}
     for email, name in emails.items():
@@ -1552,7 +1694,7 @@ def _past_context_for_attendees(attendees: list, meeting_title: str = None, limi
         context[email] = {
             "name": name,
             "role": role,
-            "items": [{"text": summary, "date_label": _relative_date(created_at), "relevant": rel > 0}
+            "items": [{"text": summary, "date_label": _relative_date(created_at), "relevant": rel >= rag_index.MIN_SCORE}
                       for rel, created_at, summary in ranked],
             "open_items": open_items[email],
         }
@@ -2282,7 +2424,33 @@ def check_notifications_once():
         log.warning("notifications check failed: %s", e)
 
 
+_VOICE_RESCAN_INTERVAL_SECONDS = 600  # 10 min
+_last_voice_rescan = 0.0
+
+
 async def poll_forever():
     while True:
         await poll_once()
+
+        # rescan_voice_suggestions() used to only ever run once, at app
+        # startup (see app.py's lifespan) -- confirmed live: a recording
+        # that arrives later in a long-running session and doesn't get a
+        # confident match at its own processing time (e.g. the enrolled
+        # voiceprint's average was a bit further off that day) stayed
+        # stuck on "No voice match" forever, with no periodic retry ever
+        # happening again until the next restart. The underlying
+        # match/match_candidates logic itself is correct (confirmed by
+        # manually re-running it against several "stuck" recordings and
+        # getting real 0.5+ candidate scores back) -- it just never got
+        # asked again. Runs every 10 min, same non-blocking best-effort
+        # pattern as poll_once() itself.
+        global _last_voice_rescan
+        now = time.monotonic()
+        if now - _last_voice_rescan > _VOICE_RESCAN_INTERVAL_SECONDS:
+            _last_voice_rescan = now
+            try:
+                await rescan_voice_suggestions()
+            except Exception as e:
+                log.warning("periodic voice-ID rescan failed (non-fatal): %s", e)
+
         await asyncio.sleep(config.POLL_INTERVAL_SECONDS)

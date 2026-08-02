@@ -84,9 +84,6 @@
     .badge.pending { background: #e0ac5c33; color: var(--due); }
     .badge.failed { background: #e0525233; color: #e05252; }
     .badge.dest { background: var(--owner); color: #fff; opacity: 0.85; }
-    .badge.sentiment-positive { background: #22c55e22; color: #16a34a; }
-    .badge.sentiment-neutral  { background: #6b728022; color: #6b7280; }
-    .badge.sentiment-negative { background: #e0525222; color: #e05252; }
     .topics { display: flex; flex-wrap: wrap; gap: 0.3rem; margin: 0.4rem 0 0.2rem; }
     .topic-chip { font-size: 0.7rem; padding: 0.1rem 0.45rem; border-radius: 999px;
                   background: var(--pre-bg); border: 1px solid var(--border); color: var(--muted); }
@@ -127,10 +124,12 @@
     .speaker-slot-input:focus { border-color: var(--owner); outline: none; }
     .speaker-slot-status { font-size: 0.75rem; color: var(--muted2); min-width: 3.5rem; }
     .speaker-slot-input.speaker-suggested { border-color: var(--owner); background: color-mix(in srgb, var(--owner) 8%, transparent); }
+    .speaker-slot-input.speaker-guessed { border-color: var(--warn, #c0392b); background: color-mix(in srgb, var(--warn, #c0392b) 6%, transparent); border-style: dashed; }
     .speaker-suggestion-tag {
       font-size: 0.65rem; color: var(--owner); border: 1px solid var(--owner);
       border-radius: 3px; padding: 0.05rem 0.3rem; white-space: nowrap;
     }
+    .speaker-guess-tag { color: var(--warn, #c0392b); border-color: var(--warn, #c0392b); }
     .speaker-candidates-hint, .speaker-slot-hint { font-size: 0.75rem; color: var(--muted2); }
     .speaker-candidate-chip { color: var(--owner); text-decoration: none; }
     .speaker-candidate-chip:hover { text-decoration: underline; }
@@ -300,29 +299,14 @@
         </div>
         <div class="timestamp">{{ r.created_at }}</div>
 
-        {% if r.status == "done" and r.kind == "command" %}
-        <div class="recording-columns">
-        <div class="summary-col">
-          <span class="badge sentiment-{{ 'positive' if r.jarvis_result.ok else 'negative' }}">
-            🗣️ Jarvis — {{ r.jarvis_result.action_type or "unknown" }}
-          </span>
-          <p><strong>Heard:</strong> {{ r.jarvis_result.transcript }}</p>
-          {% if r.jarvis_result.spoken %}
-            <p><strong>Replied:</strong> {{ r.jarvis_result.spoken }}</p>
-          {% endif %}
-        </div>
-        </div>
-        {% elif r.status == "done" %}
+        {# Jarvis voice commands (kind=="command") no longer appear in this
+           list at all -- index()/api_recordings() filter them out; they
+           have their own page now (see /jarvis, templates/jarvis.html). #}
+        {% if r.status == "done" %}
         <div class="recording-columns">
         <div class="summary-col">
           {% if r.deepgram_insights %}
             {% set ins = r.deepgram_insights %}
-            {% if ins.sentiment %}
-              <span class="badge sentiment-{{ ins.sentiment }}">
-                {% if ins.sentiment == "positive" %}😊{% elif ins.sentiment == "negative" %}😔{% else %}😐{% endif %}
-                {{ ins.sentiment | capitalize }}
-              </span>
-            {% endif %}
             {% if ins.topics %}
               <div class="topics">
                 {% for topic in ins.topics[:6] %}
@@ -396,26 +380,30 @@
                   {% set has_name = r.get('speaker_names', {}).get(sid) %}
                   {% set candidates = ((r.summary or {}).get('speaker_name_candidates') or {}).get(sid) %}
                   <li>
+                    {% set top_candidate = candidates[0] if candidates else None %}
                     <span class="speaker-slot-label">{{ r.get('speaker_names', {}).get(sid) or ("Speaker " ~ sid) }}</span>
-                    <input type="text" class="speaker-slot-input{{ ' speaker-suggested' if (suggestion and not has_name) else '' }}" data-speaker-id="{{ sid }}"
-                           value="{{ has_name or (suggestion.name if (suggestion and not has_name) else '') }}"
+                    <input type="text" class="speaker-slot-input{{ ' speaker-suggested' if (suggestion and not has_name) else (' speaker-guessed' if (top_candidate and not has_name) else '') }}" data-speaker-id="{{ sid }}"
+                           value="{{ has_name or (suggestion.name if (suggestion and not has_name) else (top_candidate.name if (top_candidate and not has_name) else '')) }}"
                            placeholder="Speaker {{ sid }}">
                     {% if suggestion and not has_name %}
                       {% set pct = (suggestion.score * 100) | round %}
                       {% set conf_class = 'confidence-green' if suggestion.score >= 0.9 else ('confidence-yellow' if suggestion.score >= 0.75 else 'confidence-red') %}
                       <span class="confidence-bar" title="{{ pct }}% match"><span class="confidence-bar-fill {{ conf_class }}" style="width: {{ pct }}%;"></span></span>
                       <span class="speaker-suggestion-tag" title="Recognized from voice ({{ pct }}% match) -- confirm or correct">recognized</span>
-                    {% elif candidates and not has_name %}
-                      <span class="speaker-candidates-hint">
-                        Might be:
-                        {% for c in candidates %}
-                          {% set c_pct = (c.score * 100) | round %}
-                          {% set c_conf_class = 'confidence-green' if c.score >= 0.9 else ('confidence-yellow' if c.score >= 0.75 else 'confidence-red') %}
-                          <span class="confidence-bar" title="{{ c_pct }}% match"><span class="confidence-bar-fill {{ c_conf_class }}" style="width: {{ c_pct }}%;"></span></span>
-                          <a href="javascript:void(0)" class="speaker-candidate-chip" data-speaker-id="{{ sid }}" data-name="{{ c.name }}" title="{{ c_pct }}% match">{{ c.name }}</a>{{ ", " if not loop.last }}
-                        {% endfor %}
-                        <span class="speaker-candidates-or">— or type a new name below</span>
-                      </span>
+                    {% elif top_candidate and not has_name %}
+                      {% set pct = (top_candidate.score * 100) | round %}
+                      {% set conf_class = 'confidence-green' if top_candidate.score >= 0.9 else ('confidence-yellow' if top_candidate.score >= 0.75 else 'confidence-red') %}
+                      <span class="confidence-bar" title="{{ pct }}% match"><span class="confidence-bar-fill {{ conf_class }}" style="width: {{ pct }}%;"></span></span>
+                      <span class="speaker-suggestion-tag speaker-guess-tag" title="Below the confident-match threshold -- please confirm or correct">possible match — {{ pct }}%, please confirm</span>
+                      {% if candidates | length > 1 %}
+                        <span class="speaker-candidates-hint">
+                          or:
+                          {% for c in candidates[1:] %}
+                            {% set c_pct = (c.score * 100) | round %}
+                            <a href="javascript:void(0)" class="speaker-candidate-chip" data-speaker-id="{{ sid }}" data-name="{{ c.name }}" title="{{ c_pct }}% match">{{ c.name }}</a>{{ ", " if not loop.last }}
+                          {% endfor %}
+                        </span>
+                      {% endif %}
                     {% elif not has_name and voice_id_enabled %}
                       <span class="speaker-slot-hint">No voice match — type a name to add them</span>
                     {% endif %}

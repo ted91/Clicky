@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include "secrets.h"
 #include "recorder.h"
+#include "voice_agent.h"
 #include "face.h"
 #include "power_mgr.h"
 #include "fw_version.h"
@@ -63,7 +64,30 @@ static uint32_t s_syncedAtMs = 0;
 static const uint32_t SYNC_INACTIVITY_MS = 120000; // no-HTTP fallback timeout
 static const uint32_t SYNCED_LINGER_MS = 2000;     // let the /synced response flush
 
-static void noteHttpActivity() { s_lastHttpMs = millis(); }
+// Set only once an HTTP request has actually been served over the CURRENT
+// WiFi association -- WiFi.status()==WL_CONNECTED alone just means the
+// device associated with an AP and got an IP, which client-isolated guest
+// networks (common at coworking spaces/cafes) happily report as true while
+// silently blocking device-to-device LAN traffic. Without this distinction,
+// BLE's "stay silent while WiFi is connected" logic (see
+// ble_sync.cpp's resumeIdleAdvertising()) would suppress the one working
+// transport a Mac has left on such a network, stranding the device on
+// neither -- confirmed live: a device on a client-isolated guest network
+// reported WiFi connected with a real IP, yet was unreachable by the Mac
+// over WiFi, while BLE had already gone silent because WiFi looked fine
+// from the device's own side. Reset on every new connection attempt (see
+// beginConnectAttempt()) so a fresh association has to re-earn "proven
+// reachable" rather than carrying it over from a previous, different network.
+static bool s_httpProvenReachable = false;
+
+static void noteHttpActivity() {
+    s_lastHttpMs = millis();
+    s_httpProvenReachable = true;
+}
+
+bool wifi_sync_http_proven_reachable() {
+    return s_httpProvenReachable;
+}
 
 // Credentials live in NVS (Preferences), not just secrets.h's compile-time
 // defaults -- so a user can (re)configure WiFi from the dashboard/BLE
@@ -76,6 +100,21 @@ static String s_password;
 static bool isWavFile(const char *name) {
     size_t len = strlen(name);
     return len > 4 && strcasecmp(name + len - 4, ".wav") == 0;
+}
+
+bool wifi_sync_has_pending_recordings() {
+    size_t ramLen = 0;
+    if (recorder_ram_wav_data(&ramLen)) return true;
+
+    DIR *dir = opendir(SDCARD_DIR);
+    if (!dir) return false;
+    struct dirent *entry;
+    bool found = false;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (isWavFile(entry->d_name)) { found = true; break; }
+    }
+    closedir(dir);
+    return found;
 }
 
 static void handleRoot() {
@@ -285,6 +324,19 @@ static void handleNotify() {
     s_server.send(200, "text/plain", "ok");
 }
 
+// Quick tactile "done" feedback for a Jarvis command -- the same short
+// damped click already used for AI-pager notifications (recorder_notify_
+// click(), ~18ms), but WITHOUT touching the notification/face state. Sent
+// by jarvis.py as soon as the decided action finishes executing, well
+// before the (much slower, and separately fallible) full spoken TTS reply
+// upload -- so the user gets immediate confirmation Jarvis actually did
+// something, even if the spoken reply is still on its way or fails outright.
+static void handleJarvisAck() {
+    noteHttpActivity();
+    recorder_notify_click();
+    s_server.send(200, "text/plain", "ok");
+}
+
 static void handleWifiStatus() {
     noteHttpActivity();
     s_server.send(200, "application/json", wifi_sync_status_json());
@@ -354,6 +406,24 @@ static void handleSetDeviceName() {
     s_devicePrefs.putString("name", name);
     s_devicePrefs.end();
     Serial.printf("wifi_sync: device friendly name set to \"%s\"\n", name.c_str());
+    s_server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// Pushes the config voice_agent.cpp needs (Deepgram/Groq API keys, the
+// Mac's base URL, and the shared device-auth key) into NVS -- see
+// voice_agent.h's getters. Called from the Mac's Settings -> Jarvis panel
+// (see software/*/device_client.py's set_jarvis_config()) once WiFi is
+// already up, since none of this matters until the device can reach
+// Deepgram/the Mac anyway (unlike WiFi credentials themselves, which need
+// BLE for bootstrap before any of this exists).
+static void handleSetJarvisConfig() {
+    noteHttpActivity();
+    String deepgramKey = s_server.hasArg("deepgram_api_key") ? s_server.arg("deepgram_api_key") : "";
+    String llmKey = s_server.hasArg("llm_api_key") ? s_server.arg("llm_api_key") : "";
+    String macBaseUrl = s_server.hasArg("mac_base_url") ? s_server.arg("mac_base_url") : "";
+    String macDeviceKey = s_server.hasArg("mac_device_key") ? s_server.arg("mac_device_key") : "";
+    voice_agent_set_config(deepgramKey.c_str(), llmKey.c_str(), macBaseUrl.c_str(), macDeviceKey.c_str());
+    Serial.println("wifi_sync: Jarvis voice-agent config updated");
     s_server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -585,6 +655,7 @@ static const uint32_t BACKOFF_MS = 30000;          // pause between attempts (ra
 
 static void beginConnectAttempt() {
     Serial.printf("wifi_sync: connecting to SSID \"%s\"...\n", s_ssid.c_str());
+    s_httpProvenReachable = false; // fresh association has to re-earn this (see its own doc)
     WiFi.disconnect(true);
     WiFi.mode(WIFI_STA);
     // Confirmed live (Serial showing NO_AP_FOUND/STA_LEAVING every ~5s,
@@ -686,6 +757,15 @@ String wifi_sync_status_json() {
     json += ",\"batteryPct\":" + String(power_mgr_battery_pct());
     json += ",\"batteryMv\":" + String(power_mgr_battery_mv());
     json += ",\"externalPower\":" + String(power_mgr_on_external_power() ? "true" : "false");
+    // Firmware version included here too (not just /version over HTTP) so
+    // Settings' device-version display works over BLE as well -- the
+    // firmware's WiFi radio is off by default except during an active sync
+    // session (battery), so a WiFi-only version check would show "unknown"
+    // most of the time the device is just sitting idle. This same JSON blob
+    // is already polled over both HTTP and BLE (WIFI_STATUS characteristic)
+    // regardless of connection state, so no new endpoint/characteristic
+    // needed.
+    json += ",\"version\":\"" FW_VERSION "\"";
     json += "}";
     return json;
 }
@@ -797,6 +877,8 @@ void wifi_sync_init() {
     s_server.on("/rec", HTTP_GET, handleGetFile);
     s_server.on("/rec", HTTP_DELETE, handleDeleteFile);
     s_server.on("/notify", HTTP_POST, handleNotify);
+    s_server.on("/jarvis/ack", HTTP_POST, handleJarvisAck);
+    s_server.on("/jarvis/config", HTTP_POST, handleSetJarvisConfig);
     s_server.on("/wifi/status", HTTP_GET, handleWifiStatus);
     s_server.on("/wifi/connect", HTTP_POST, handleWifiConnect);
     s_server.on("/wifi/scan", HTTP_POST, handleWifiScanStart);
@@ -821,6 +903,13 @@ void wifi_sync_init() {
     } else {
         Serial.println("wifi_sync: radio off (battery) -- turns on after each recording, off again once synced");
     }
+}
+
+void wifi_sync_reinit_after_light_sleep() {
+    Serial.println("wifi_sync: re-settling lwIP/TCP-IP task state after light sleep");
+    WiFi.mode(WIFI_STA);
+    WiFi.mode(WIFI_OFF);
+    s_state = WifiState::OFF;
 }
 
 void wifi_sync_set_task_handle(TaskHandle_t handle) {

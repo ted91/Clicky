@@ -6,6 +6,28 @@
 # Clicky.app` on the built app) until this is code-signed and notarized
 # with an Apple Developer account.
 
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+
+# speechbrain ships non-Python data alongside its code (lobes/ -- YAML
+# model-definition files its EncoderClassifier loads at runtime, see
+# voice_id.py's _load_model) that PyInstaller's default Analysis doesn't
+# pick up on its own -- confirmed live: the packaged app silently failed
+# EVERY voice embedding computation with "No such file or directory:
+# .../Frameworks/speechbrain/lobes", so voice ID never enrolled or
+# recognized anything outside a dev venv, with no visible error anywhere
+# (only surfaced once clicky.log started capturing background-task
+# warnings). collect_submodules covers speechbrain's own extensive
+# dynamic-import patterns the same way the hiddenimports list below
+# already tries to, more completely.
+# include_py_files=True: speechbrain's HyperPyYAML configs resolve
+# !include: references to lobes/*.py as real files relative to the
+# package directory at runtime, not via Python's import system -- the
+# default (data files only) left `lobes` empty on disk in the bundle
+# even though the modules were still separately frozen into the PYZ
+# archive as importable code.
+speechbrain_datas = collect_data_files('speechbrain', include_py_files=True)
+speechbrain_hidden = collect_submodules('speechbrain')
+
 a = Analysis(
     ['main_packaged.py'],
     pathex=[],
@@ -31,7 +53,7 @@ a = Analysis(
         # need this -- those are entered per-user via /setup and persisted
         # to settings.json, never read from .env at packaged runtime.
         ('.env', '.'),
-    ],
+    ] + speechbrain_datas,
     hiddenimports=[
         # Dynamically imported inside functions (providers/*.py's _client(),
         # providers/__init__.py's _load()) rather than at module top-level --
@@ -54,7 +76,7 @@ a = Analysis(
         'uvicorn.protocols.http.auto',
         'uvicorn.protocols.websockets.auto',
         'uvicorn.lifespan.on',
-    ],
+    ] + speechbrain_hidden,
     hookspath=[],
     runtime_hooks=[],
     excludes=[],

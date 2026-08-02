@@ -12,8 +12,12 @@
 // one physical radio) require >=80 MHz APB timing; 40 MHz would silently
 // break them.
 enum class PowerProfile {
-    LOW_80,    // idle / everything not listed below
-    HIGH_240,  // recording (codec+SD writes), WiFi file streaming, L2CAP transfers
+    LOW_80,     // idle / everything not listed below
+    MEDIUM_160, // recording + Jarvis capture -- live-confirmed 80MHz felt
+                // sluggish for button response on battery; 240MHz works but
+                // costs more battery than this needs -- see main.cpp's
+                // button handlers.
+    HIGH_240,   // WiFi file streaming, L2CAP transfers
 };
 
 void power_mgr_init();
@@ -49,6 +53,24 @@ bool power_mgr_on_external_power();
 // external-power debounce state.
 void power_mgr_tick();
 
+// True if a USB host is physically attached RIGHT NOW -- live-confirmed
+// bug: esp_light_sleep_start() gates the clock this board's native USB
+// Serial/JTAG peripheral runs on (no separate UART bridge chip exists on
+// this board), so sleeping while a debugger/flasher is attached leaves the
+// device USB-enumerated but silently unresponsive (esptool: "No serial
+// data received"). Callers (sleepWatchTask) must gate BOTH sleep tiers on
+// this. Backed by HWCDC::isPlugged() -> IDF's timer-based
+// usb_serial_jtag_is_connected() -- a physical-attach check, not "has a
+// host opened the port" (that's isConnected()/isCDC_Connected(), which
+// this deliberately does NOT use).
+bool power_mgr_usb_host_attached();
+
+// True for BOOT_GRACE_PERIOD_MS after power_mgr_init() runs (i.e. after
+// every boot, cold or otherwise) -- belt-and-braces so an early BLE
+// connect (Mac's own poll cycle, see ble_sync.cpp's onConnect()) can't arm
+// the idle-sleep countdown before there's a real chance to intervene.
+bool power_mgr_boot_grace_period_active();
+
 // --- duty-cycled deep sleep (Phase 2, battery) ----------------------------
 // Flag-gated -- set to 0 to fully disable and fall back to Phase 1 behavior
 // only (never sleeps).
@@ -64,6 +86,16 @@ void power_mgr_note_activity();
 // right now (not recording, not mid radio-session, nothing unsynced) --
 // this function only knows about the idle clock, not app state.
 bool power_mgr_idle_timeout_reached();
+
+// True once a much longer stretch (DEEP_SLEEP_FALLBACK_MS, 20min) has
+// passed with no REAL activity noted -- deliberately the same idle clock
+// power_mgr_note_activity() drives, NOT reset by a routine light-sleep
+// TIMER wake (see sleepWatchTask -- only a genuine button wake calls
+// power_mgr_note_activity() again). Used to decide when to fall back from
+// the routine light-sleep tier to a real deep sleep for a genuinely long
+// idle period, since light sleep's battery draw isn't proven equal to
+// deep sleep's on this board.
+bool power_mgr_deep_sleep_fallback_due();
 
 // Configures both wake sources (BOOT/PWR buttons via ext1, and a timer for
 // the duty-cycled BLE reconnect window) and calls esp_deep_sleep_start().
@@ -88,5 +120,35 @@ WakeCause power_mgr_wake_cause();
 // recording, no BLE central connected, radio not mid-session, not on
 // external power) -- this function only knows about elapsed time.
 bool power_mgr_should_return_to_sleep();
+
+// --- light sleep (real esp_light_sleep_start(), blocking, non-rebooting) --
+// Flag-gated the same way as deep sleep, for a one-line revert if this
+// misbehaves on real hardware.
+#define POWER_MGR_ENABLE_LIGHT_SLEEP 1
+
+// Configures the SAME wake sources as power_mgr_enter_deep_sleep() (ext1 on
+// BOOT/PWR, plus a timer) and calls esp_light_sleep_start(). Unlike deep
+// sleep, this RETURNS -- the whole chip halts (both cores) until a wake
+// source fires, then execution resumes right here, at this call site, with
+// every FreeRTOS task/RAM/PSRAM exactly as it was (no reboot, no re-run of
+// setup()). Returns the wake cause (same enum/mechanism as
+// power_mgr_wake_cause(), read via hardware registers immediately after
+// waking) so the caller can dispatch without a second, possibly-stale
+// read. If esp_light_sleep_start() itself rejects the sleep request (e.g.
+// some driver vetoed it, ESP_ERR_SLEEP_REJECT) the chip never actually
+// slept -- callers should NOT assume time passed just because this
+// returned; check the logged elapsed time if that matters.
+//
+// button_bsp's click detector is poll-based (a 5ms esp_timer, NOT a GPIO
+// interrupt -- confirmed in button_bsp.c), so it will NOT see the button
+// press that woke the chip on its own. Callers must dispatch on the
+// returned WakeCause explicitly rather than relying on the normal button
+// tasks to notice.
+//
+// pendingSync: true if wifi_sync_has_pending_recordings() -- uses a
+// shorter timer-wake interval (5min vs the normal 10min) since there's an
+// actual reason to be eager about finding a sync opportunity while
+// something's waiting to go out.
+WakeCause power_mgr_enter_light_sleep(bool pendingSync);
 
 #endif

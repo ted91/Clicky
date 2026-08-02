@@ -225,6 +225,22 @@ def _format_markdown(record: dict) -> str:
     return "\n".join(lines)
 
 
+def _insight_frontmatter(record: dict) -> dict:
+    """Topics/Intents/Deepgram Summary as real frontmatter fields -- same
+    fields notion_sync._insight_properties adds as Notion properties, kept
+    consistent across both destinations. Empty dict if Deepgram wasn't the
+    STT provider or returned no insights."""
+    insights = record.get("deepgram_insights") or {}
+    fm = {}
+    if insights.get("topics"):
+        fm["topics"] = insights["topics"][:20]
+    if insights.get("intents"):
+        fm["intents"] = insights["intents"][:20]
+    if insights.get("summary"):
+        fm["deepgram_summary"] = insights["summary"]
+    return fm
+
+
 def push_recording(record: dict) -> str:
     """Writes this recording as a markdown file into the vault root.
     Journal-classified recordings skip this entirely (see push_journal) --
@@ -250,8 +266,17 @@ def push_recording(record: dict) -> str:
         "source_recording": record.get("name", ""),
         "generate_social_media": False,
     }
-    _write_note(vault_path, filename, frontmatter, _format_markdown(record))
+    frontmatter.update(_insight_frontmatter(record))
+    body = _format_markdown(record)
+    _write_note(vault_path, filename, frontmatter, body)
     log.info("wrote %s to Obsidian vault", filename)
+
+    try:
+        import rag_index
+        rag_index.index_text("obsidian", file_path, body, date=created_at[:10] if created_at else None)
+    except Exception as e:
+        log.warning("rag_index indexing failed for %s (non-fatal): %s", filename, e)
+
     return file_path
 
 
@@ -274,6 +299,7 @@ def push_journal(record: dict) -> str:
         "created": record.get("created_at", ""),
         "generate_social_media": False,
     }
+    frontmatter.update(_insight_frontmatter(record))
     if not writeup:
         body = _format_markdown(record)
     else:
@@ -296,6 +322,14 @@ def push_journal(record: dict) -> str:
 
     path = _write_note(dir_path, filename, frontmatter, body)
     log.info("wrote %s to Obsidian Journal", filename)
+
+    try:
+        import rag_index
+        created_at = record.get("created_at", "")
+        rag_index.index_text("obsidian", path, body, date=created_at[:10] if created_at else None)
+    except Exception as e:
+        log.warning("rag_index indexing failed for %s (non-fatal): %s", filename, e)
+
     return path
 
 

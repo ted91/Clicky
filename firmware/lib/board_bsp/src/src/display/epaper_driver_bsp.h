@@ -59,7 +59,7 @@ public:
     void EPD_Init();    /* 墨水屏初始化 */
     void EPD_Clear();   /* 清空屏幕 */
     void EPD_Display(); /* 刷buffer到墨水屏 */
-    
+
     /*局部刷新*/
     void EPD_DisplayPartBaseImage();
     void EPD_Init_Partial();

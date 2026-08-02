@@ -222,6 +222,10 @@
           <legend>Bluetooth pairing</legend>
           {% if current.paired_ble_address %}
             <div class="ble-current">Currently paired: {{ current.paired_ble_address }}</div>
+            <form method="post" action="/settings/ble/forget" style="display:inline;">
+              <input type="hidden" name="next" value="/settings?panel=device">
+              <button type="submit" class="secondary">Forget this device</button>
+            </form>
           {% else %}
             <p class="step">Not paired yet — if only one device is in range this isn't required (sync works unambiguously either way), but pairing skips the scan step on every reconnect.</p>
           {% endif %}
@@ -586,6 +590,47 @@
           </fieldset>
           <button type="submit" class="full-width">Save Jarvis settings</button>
         </form>
+
+        <fieldset>
+          <legend>Device API key</legend>
+          <p class="step">
+            Sent to the device automatically below -- shown here for reference. Anyone with this key on your
+            network could trigger real actions (drafting emails, adding calendar events), so treat it like a
+            password.
+          </p>
+          <input type="text" readonly value="{{ current.jarvis_device_api_key }}" onclick="this.select()">
+        </fieldset>
+
+        <form method="post" action="/jarvis/enable-live-agent">
+          <fieldset>
+            <legend>Live voice agent (experimental)</legend>
+            <p class="step">
+              When the device has WiFi, BOOT-captured commands stream live to a Deepgram Voice Agent instead
+              of recording a clip and waiting for this app to process it later -- plain questions get answered
+              immediately, even if this Mac is turned off. Reuses your Deepgram key from Providers; only a
+              <a href="https://console.groq.com/keys" target="_blank">Groq API key</a> (free tier) is new --
+              Groq runs the "what to do" decision cheaply/fast. Actions (calendar/email/etc.) are still
+              forwarded here to actually execute -- this Mac must be reachable for those, same as today.
+            </p>
+            <label for="groq_api_key">Groq API key</label>
+            <input type="password" id="groq_api_key" name="groq_api_key" placeholder="{{ 'already set -- leave blank to keep it' if current.groq_api_key else 'gsk_...' }}">
+            <button type="submit">Push config to device</button>
+          </fieldset>
+        </form>
+
+        {% if not current.notion_jarvis_database_id %}
+        <form method="post" action="/integrations/setup-jarvis">
+          <fieldset>
+            <legend>Notion: one-time setup</legend>
+            <p class="step">Requires Notion already configured. Creates a "Jarvis" database under the same parent page as your other databases -- one page per voice command, independent of Notes.</p>
+            <label for="jarvis_notion_parent_page_id">Page ID (same parent page as your other databases)</label>
+            <input type="text" id="jarvis_notion_parent_page_id" name="notion_parent_page_id" placeholder="32-character ID, or paste the full URL" required>
+            <button type="submit">Create Jarvis database</button>
+          </fieldset>
+        </form>
+        {% else %}
+        <p class="saved">✓ Jarvis database configured</p>
+        {% endif %}
       </div>
 
       <!-- Obsidian -->
@@ -769,6 +814,9 @@
             <label for="owner_name">Your name</label>
             <input type="text" id="owner_name" name="owner_name" value="{{ current.owner_name or '' }}" placeholder="e.g. Sanchit Gupta">
             <p class="hint">Used to label the daily usage-digest email and (if voice recognition is enabled) as your own recognized speaker name.</p>
+            <label for="owner_email">Your email</label>
+            <input type="text" id="owner_email" name="owner_email" value="{{ current.owner_email or '' }}" placeholder="e.g. you@example.com">
+            <p class="hint">Only used to unlock the Device Fleet page for the app author's own install -- leave blank if you're not the developer.</p>
           </fieldset>
           <fieldset>
             <legend>Password</legend>

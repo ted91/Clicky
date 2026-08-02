@@ -132,7 +132,7 @@ def build_summary_prompt(transcript: str, deepgram_insights: dict = None, meetin
     before the transcript, each as its own labeled block:
 
     - deepgram_insights: Deepgram Audio Intelligence (entities/topics/
-      intents/sentiment) -- lets the LLM use already-detected facts rather
+      intents/summary) -- lets the LLM use already-detected facts rather
       than re-deriving them from raw text.
     - meeting: calendar event metadata (title + attendee name/email list,
       see google_client.current_or_next_event) -- steers "speaker_names"
@@ -149,10 +149,9 @@ def build_summary_prompt(transcript: str, deepgram_insights: dict = None, meetin
 
     if deepgram_insights:
         lines = ["[Deepgram Audio Intelligence — use this as a reliable reference:]"]
-        sentiment = deepgram_insights.get("sentiment")
-        if sentiment:
-            score = deepgram_insights.get("sentiment_score", "")
-            lines.append(f"Overall sentiment: {sentiment}" + (f" (score {score})" if score else ""))
+        dg_summary = deepgram_insights.get("summary")
+        if dg_summary:
+            lines.append(f"Deepgram's own summary: {dg_summary}")
         topics = deepgram_insights.get("topics") or []
         if topics:
             lines.append(f"Detected topics: {', '.join(topics[:8])}")

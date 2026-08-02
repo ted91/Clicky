@@ -6,10 +6,12 @@ picked as STT_PROVIDER, never LLM_PROVIDER.
 In addition to transcription and diarization we request four Audio
 Intelligence features in the same API call (no extra cost or latency since
 they run server-side alongside transcription):
-  - sentiment: per-utterance tone (positive/neutral/negative) + overall avg
+  - summarize: Deepgram's own short summary of the whole recording
   - intents:   what the speaker is trying to accomplish in each segment
   - topics:    subject-matter tags for segments (e.g. "project planning")
   - detect_entities: named entities -- PERSON, ORG, DATE, LOCATION, etc.
+(sentiment was dropped per explicit user request -- not useful enough to
+keep taking up a database column/dashboard badge.)
 
 These are returned as `deepgram_insights` in the transcribe() result dict and
 stored in the recording record. poller.py passes them to the LLM summarization
@@ -60,12 +62,13 @@ def _parse_insights(results: dict) -> dict:
     """Extracts Audio Intelligence features from a Deepgram response."""
     insights = {}
 
-    # Overall sentiment
-    sentiments = results.get("sentiments") or {}
-    avg = sentiments.get("average") or {}
-    if avg.get("sentiment"):
-        insights["sentiment"] = avg["sentiment"]
-        insights["sentiment_score"] = round(avg.get("sentiment_score", 0.0), 3)
+    # Deepgram's own summary of the whole recording -- distinct from the
+    # LLM-generated summary this app writes separately (providers.base's
+    # build_summary_prompt); kept alongside it as Deepgram's own take,
+    # cheap since it's the same API call.
+    summary_data = results.get("summary") or {}
+    if summary_data.get("short"):
+        insights["summary"] = summary_data["short"].strip()
 
     # Topics -- deduplicated, sorted by confidence
     topics_data = results.get("topics") or {}
@@ -134,7 +137,7 @@ def transcribe(wav_bytes: bytes) -> dict:
             "smart_format": "true",
             # Audio Intelligence features -- all run server-side alongside
             # transcription so there's no extra round-trip.
-            "sentiment": "true",
+            "summarize": "true",
             "intents": "true",
             "topics": "true",
             "detect_entities": "true",

@@ -150,7 +150,7 @@ function renderRecording(r) {
           }
           return `
           <li>
-            <span class="speaker-slot-label">${escapeHtml(hasName || `Speaker ${sid}`)}</span>
+            <span class="speaker-slot-label">Speaker ${escapeHtml(sid)}</span>
             <input type="text" class="speaker-slot-input${suggestion && !hasName ? " speaker-suggested" : ""}" data-speaker-id="${escapeHtml(sid)}" value="${escapeHtml(hasName || (suggestion && !hasName ? suggestion.name : ""))}" placeholder="Speaker ${escapeHtml(sid)}">
             ${hint}
             <span class="speaker-slot-status"></span>
@@ -401,9 +401,6 @@ async function submitSpeakerRename(hash, speakerId, name) {
     .forEach(el => { el.textContent = `${label}:`; });
   card.querySelectorAll(`.speaker-slot-input[data-speaker-id="${CSS.escape(speakerId)}"]`).forEach(el => {
     el.value = name;
-    const li = el.closest("li");
-    const labelEl = li?.querySelector(".speaker-slot-label");
-    if (labelEl) labelEl.textContent = label;
   });
   lastSignature = ""; // force next poll to pick up the persisted name
 }

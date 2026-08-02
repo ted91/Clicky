@@ -10,15 +10,20 @@
   <a class="app-nav-item {{ 'active' if active_nav == 'transcription' }}" href="/">
     <span class="icon">🎙️</span> Audio Transcription
   </a>
+  <a class="app-nav-item {{ 'active' if active_nav == 'jarvis' }}" href="/jarvis">
+    <span class="icon">🗣️</span> Jarvis
+  </a>
   <a class="app-nav-item {{ 'active' if active_nav == 'social' }}" href="/social">
     <span class="icon">✍️</span> Social Media Posting
   </a>
   <a class="app-nav-item {{ 'active' if active_nav == 'settings' }}" href="/settings">
     <span class="icon">⚙️</span> Settings
   </a>
+  {% if is_admin() %}
   <a class="app-nav-item {{ 'active' if active_nav == 'admin' }}" href="/admin">
     <span class="icon">🛠️</span> Device Fleet
   </a>
+  {% endif %}
   <a class="app-nav-item app-nav-logout" href="/logout">
     <span class="icon">🚪</span> Logout
   </a>

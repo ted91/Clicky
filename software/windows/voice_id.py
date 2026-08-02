@@ -10,7 +10,7 @@ onnxruntime alternative (see the session's plan doc). Model weights
 (~80MB) download from HuggingFace on first real use and cache under
 paths.APP_DATA_DIR -- unlike RNNoise's fully-offline vendored binary, this
 needs network access once. Gated behind settings.get_all()["voice_id_enabled"]
-(default off) so nobody pays this cost unless they opt in.
+(default ON -- see is_enabled() below; users can still opt out).
 
 Enrollment writes a running-average embedding per person (see
 enroll_or_update) rather than keeping every sample -- simpler storage, and
@@ -41,6 +41,17 @@ MODEL_SOURCE = "speechbrain/spkrec-ecapa-voxceleb"
 EXPECTED_SAMPLE_RATE = 16000  # this device's recordings are already 16kHz mono -- no resampling needed
 MIN_ENROLL_SECONDS = 2.0  # SpeechBrain's own short-utterance floor -- below this an embedding is unreliable
 DEFAULT_MATCH_THRESHOLD = 0.75  # judgment-call default, not a measured/tuned value -- see module docstring
+
+# Jarvis BOOT commands are short (often 1-5 words) and produce noisier
+# embeddings than a multi-minute meeting/memo recording -- real command
+# clips scored 0.66-0.79 against a genuinely correct match in testing, so
+# DEFAULT_MATCH_THRESHOLD's 0.75 missed most of them. A command is also a
+# structurally different, lower-risk case than the memo/meeting "who said
+# this" suggestion (see match_candidates' docstring): there's exactly one
+# person who could plausibly be talking to their own device, so a looser
+# bar for auto-applying the top candidate is appropriate here specifically,
+# not a case for lowering DEFAULT_MATCH_THRESHOLD everywhere.
+COMMAND_MATCH_THRESHOLD = 0.6
 
 OWNER_KEY = "__owner__"  # reserved -- can't collide with a real person's name (see enrollment path A)
 

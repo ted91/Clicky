@@ -49,13 +49,21 @@ WIFI_SCAN_POLL_INTERVAL_SECONDS = 0.5
 # was tried first and measured too slow on real hardware (~250 bytes/sec,
 # connection-interval-bound per-chunk ACK round-trips) and was reverted in
 # favor of the current fire-and-forget notify() + a paced CHUNK_DELAY_MS on
-# the firmware side instead. This timeout still needs to be generous,
-# though: a still-in-progress (but ultimately successful) transfer getting
-# discarded and retried from scratch forever was the actual bug behind
+# the firmware side instead. This timeout needs to be generous enough that a
+# still-in-progress (but ultimately successful) transfer doesn't get
+# discarded and retried from scratch -- that was the actual bug behind
 # "transferring... complete... transferring [same file]..." repeating
-# indefinitely -- the device really did finish each time, but the old 60s
-# timeout gave up before receiving confirmation.
-TRANSFER_TIMEOUT_SECONDS = 300
+# indefinitely at the old 60s value; the device really did finish each time,
+# the timeout just gave up before receiving confirmation.
+#
+# Lowered from 300s to 180s now that the firmware retries a dropped notify()
+# instead of silently losing those bytes (see ble_sync.cpp's
+# notifyWithRetry), AND the Mac side resumes a stalled transfer from where
+# it left off instead of restarting (see _partial_downloads below) -- five
+# minutes of dead air per stall was the single biggest contributor to
+# "nothing is syncing" on a congested link; with resume in place, a shorter
+# timeout only costs one retry cycle, not lost progress.
+TRANSFER_TIMEOUT_SECONDS = 180
 CALL_TIMEOUT_SECONDS = TRANSFER_TIMEOUT_SECONDS + 15  # covers connect + transfer
 
 # list_recordings()/delete_recording() are quick GATT read/writes, not file
@@ -85,6 +93,11 @@ _loop_lock = threading.Lock()
 
 _client = None  # persistent bleak.BleakClient, reused across calls
 _client_lock = None  # asyncio.Lock, created inside the loop thread
+
+# name -> bytes already received from a stalled transfer, so the next
+# attempt can resume instead of restarting from zero (see
+# _download_recording_async and ble_sync.cpp's GET <name> <offset>).
+_partial_downloads = {}
 
 
 def _ensure_loop_running():
@@ -217,7 +230,16 @@ async def _list_recordings_async():
 async def _download_recording_async(name: str) -> bytes:
     await _ensure_connected()
 
-    buffer = bytearray()
+    # Resume support: a prior attempt at this exact name may have stalled
+    # partway (see ble_sync.cpp's GET <name> <offset> handling). Rather than
+    # re-downloading bytes already received, pick up where it left off --
+    # on a congested link a full restart can lose to the timeout every time,
+    # while resuming makes steady forward progress across attempts. Keyed by
+    # name only (not content) since a genuinely new recording under a reused
+    # name doesn't happen in practice -- device filenames are permanently
+    # unique/incrementing (see poller.py's is_known_by_size comment).
+    buffer = bytearray(_partial_downloads.get(name, b""))
+    resume_offset = len(buffer)
     total_len = None
     done = asyncio.Event()
     last_log = time.monotonic()
@@ -225,11 +247,14 @@ async def _download_recording_async(name: str) -> bytes:
     def on_notify(_handle, data: bytearray):
         nonlocal total_len, last_log
         if total_len is None:
-            # First packet is always the 4-byte little-endian total length.
-            total_len = int.from_bytes(data[:4], "little")
+            # First packet is always the 4-byte little-endian total length --
+            # NOTE: when resuming, this is the REMAINING length (see
+            # ble_sync.cpp's transferTask), not the file's full size.
+            total_len = resume_offset + int.from_bytes(data[:4], "little")
             if len(data) > 4:
                 buffer.extend(data[4:])
-            log.info("downloading %s: expecting %d bytes", name, total_len)
+            log.info("downloading %s: expecting %d bytes%s", name, total_len,
+                      f" (resuming from {resume_offset})" if resume_offset else "")
             status.update(sync_progress_name=name, sync_progress_bytes=len(buffer), sync_progress_total=total_len)
         else:
             buffer.extend(data)
@@ -248,8 +273,31 @@ async def _download_recording_async(name: str) -> bytes:
 
     await _client.start_notify(DATA_CHAR_UUID, on_notify)
     try:
-        await _client.write_gatt_char(CONTROL_CHAR_UUID, f"GET {name}".encode("utf-8"))
+        cmd = f"GET {name} {resume_offset}" if resume_offset else f"GET {name}"
+        await _client.write_gatt_char(CONTROL_CHAR_UUID, cmd.encode("utf-8"))
         await asyncio.wait_for(done.wait(), timeout=TRANSFER_TIMEOUT_SECONDS)
+        # Completed cleanly -- nothing left to resume from next time.
+        _partial_downloads.pop(name, None)
+    except asyncio.TimeoutError:
+        # Keep whatever we actually received so the NEXT attempt (this
+        # function is only ever called again by poller.py's own retry loop
+        # on the next poll cycle) resumes instead of restarting at zero.
+        # Only worth keeping if we got the length prefix at all -- otherwise
+        # there's no valid resume point (offset 0 is just "start over").
+        #
+        # Safety valve: if THIS attempt was itself a resume and made zero
+        # additional progress (buffer unchanged from resume_offset), don't
+        # keep resuming forever -- something's wrong (e.g. the file on
+        # device no longer matches what we think, or the link is fully
+        # dead), and a stuck resume point would otherwise loop indefinitely.
+        # Drop back to a fresh restart instead.
+        if buffer and len(buffer) > resume_offset:
+            _partial_downloads[name] = bytes(buffer)
+            log.info("keeping %d bytes of %s for resume on next attempt", len(buffer), name)
+        elif resume_offset:
+            log.warning("resume of %s made no progress -- discarding partial, will restart from scratch", name)
+            _partial_downloads.pop(name, None)
+        raise
     finally:
         # Confirmed live: stop_notify() itself can raise (e.g. the
         # connection already dropped mid-transfer) -- when it does, that

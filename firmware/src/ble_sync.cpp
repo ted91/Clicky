@@ -33,27 +33,22 @@ static const char *RAM_RECORDING_NAME = "ram_recording.wav";
 #define WIFI_SCAN_CHAR_UUID "e9a10005-1000-4000-8000-00805f9b34fb"
 
 static const size_t CHUNK_BYTES = 244;      // MTU(247) - 3 bytes ATT overhead, see setMTU() in ble_sync_init()
-// Tunable trade-off, not a hard requirement: shorter delay = faster
-// transfer, at higher risk of overrunning the BLE stack's internal notify
-// queue and dropping a packet. Safe to push lower than it otherwise would
-// be because the pipeline validates the RIFF/WAVE header after every
-// download and silently retries next poll cycle if corrupt (see
-// poller.py's _is_valid_wav()) -- an occasional retry is cheap.
+// History: this was originally 8ms, then dropped to 2ms for speed -- live
+// testing at 2ms reproduced the exact failure this delay was meant to
+// avoid, a notify() queue overrun (see notifyWithRetry's own comment for
+// the full mechanism), and was backed off to 5ms as an untested middle
+// ground. That delay was pure guesswork standing in for real backpressure:
+// notify()'s return value was never checked, so a dropped packet was simply
+// gone forever, and the pacing delay's only job was to make drops rare
+// enough not to matter in casual testing.
 //
-// Was lowered from the original untested default of 8ms to 2ms for speed,
-// but live testing at 2ms showed exactly the failure mode this comment
-// warned about: a ~2.3MB recording kept re-transferring in full,
-// completing firmware-side every time, but never appearing in the
-// pipeline -- i.e. poller.py's WAV validation was silently rejecting it
-// as corrupt (dropped/reordered packets) and retrying from scratch,
-// forever, on every poll cycle. Backed off to 5ms as a middle ground
-// between the original conservative 8ms and the too-aggressive 2ms. Still
-// meaningfully faster than the original (a 60s recording's chunk delay
-// drops from ~62s to ~39s), but if pipeline logs still show repeated "not
-// a valid WAV file... will retry next cycle" warnings at 5ms, raise this
-// back toward 8ms -- there's still no way to verify the right value
-// without live hardware, and this value has now failed once already at 2ms.
-static const uint32_t CHUNK_DELAY_MS = 5;
+// notifyWithRetry() now provides actual backpressure -- a failed notify()
+// retries the SAME bytes instead of silently losing them -- so this delay
+// no longer needs to guess at a safety margin; it only affects raw speed.
+// Lowered back to 2ms on that basis. If throughput measurements ever show
+// this causing sustained retry storms (vs. the occasional expected one),
+// raise it -- but a stall should no longer be possible at any value.
+static const uint32_t CHUNK_DELAY_MS = 2;
 
 // Larger read chunk for the L2CAP path -- write() fragments to the
 // negotiated MTU internally and blocks until sent, so there's no notify-
@@ -156,17 +151,58 @@ static bool pickPendingFileName(String &outName) {
 // transfer gets silently caught and retried next poll cycle, which is a
 // far better tradeoff than every transfer taking hours. Runs in its own
 // task so it doesn't block the BLE stack's callback context while pacing.
+// Sends one notify, retrying the SAME payload while the host's notify queue
+// is full. Backs off progressively (the queue typically drains within a few
+// ms; a longer wait means real congestion) and gives up after a bounded
+// number of attempts so a dead link fails fast instead of spinning forever.
+// Returns false only if every attempt failed -- the caller must then NOT
+// advance its offset, since these bytes never left the device.
+static const int NOTIFY_MAX_ATTEMPTS = 40;
+static const uint32_t NOTIFY_RETRY_BASE_MS = 2;
+static const uint32_t NOTIFY_RETRY_MAX_MS = 40;
+
+static bool notifyWithRetry(const uint8_t *payload, size_t n) {
+    uint32_t backoff = NOTIFY_RETRY_BASE_MS;
+    for (int attempt = 0; attempt < NOTIFY_MAX_ATTEMPTS; attempt++) {
+        s_dataChar->setValue((uint8_t *)payload, n);
+        if (s_dataChar->notify()) {
+            return true;
+        }
+        // Queue full -- wait for the stack to drain it, then re-send the
+        // exact same bytes. Doubling up to a ceiling keeps the common case
+        // (one brief hiccup) fast while still tolerating a long stall.
+        vTaskDelay(pdMS_TO_TICKS(backoff));
+        if (backoff < NOTIFY_RETRY_MAX_MS) backoff *= 2;
+        // A central that disconnected mid-transfer will never drain the
+        // queue -- bail immediately rather than burning all the attempts.
+        if (!s_centralConnected) return false;
+    }
+    return false;
+}
+
+// startOffset supports resuming a transfer that previously stalled partway
+// (see handleCommand's "GET <name> [offset]") -- the Mac keeps whatever
+// bytes it already received and asks for the remainder instead of starting
+// over, which matters a lot on a congested link where a full restart may
+// never finish.
+struct TransferRequest {
+    String name;
+    size_t startOffset;
+};
+
 static void transferTask(void *arg) {
     s_transferInProgress = true;
 
-    String *namePtr = (String *)arg;
-    String name = *namePtr;
-    delete namePtr;
+    TransferRequest *req = (TransferRequest *)arg;
+    String name = req->name;
+    size_t startOffset = req->startOffset;
+    delete req;
 
     const uint8_t *data = nullptr;
     size_t len = 0;
     FILE *f = nullptr;
     uint8_t *sdBuf = nullptr;
+    bool sentAll = true;  // L2CAP path leaves this true; GATT path sets it explicitly
 
     if (name == RAM_RECORDING_NAME) {
         data = recorder_ram_wav_data(&len);
@@ -192,6 +228,25 @@ static void transferTask(void *arg) {
         s_transferInProgress = false;
         vTaskDelete(NULL);
         return;
+    }
+
+    // Resume: skip past what the peer already has. sdBuf (the allocation to
+    // free) deliberately stays pointing at the buffer's start while `data`
+    // advances. The length prefix sent below is then the REMAINING byte
+    // count, which is exactly what a resuming client is waiting for.
+    if (startOffset > 0) {
+        if (startOffset >= len) {
+            Serial.printf("ble_sync: resume offset %u is at/past end of %s (%u bytes), nothing to send\n",
+                          (unsigned)startOffset, name.c_str(), (unsigned)len);
+            if (sdBuf) heap_caps_free(sdBuf);
+            s_transferInProgress = false;
+            vTaskDelete(NULL);
+            return;
+        }
+        Serial.printf("ble_sync: resuming %s at byte %u of %u\n",
+                      name.c_str(), (unsigned)startOffset, (unsigned)len);
+        data += startOffset;
+        len -= startOffset;
     }
 
     // L2CAP path only used if a channel is actually connected right now --
@@ -235,23 +290,55 @@ static void transferTask(void *arg) {
             }
             offset += n;
         }
+        sentAll = (offset >= len);
     } else {
-        s_dataChar->setValue((uint8_t *)&lenLE, sizeof(lenLE));
-        s_dataChar->notify();
+        // notify() returns false when the host's notify queue is full. That
+        // return value used to be ignored while offset advanced anyway, so a
+        // full queue meant those bytes were silently lost FOREVER: the Mac
+        // waits for exactly the byte count promised in the length prefix
+        // below, never receives it, and burns its entire transfer timeout --
+        // while this task cheerfully printed "transfer complete". Confirmed
+        // live as the cause of downloads dying at ~90%. Retrying the same
+        // chunk (rather than advancing past it) is the actual fix: the queue
+        // drains in a few ms and the transfer continues intact. This is also
+        // what makes CHUNK_DELAY_MS safe to lower -- the old 8ms/5ms/2ms
+        // guesswork above was blind padding standing in for real backpressure.
+        if (!notifyWithRetry((uint8_t *)&lenLE, sizeof(lenLE))) {
+            Serial.printf("ble_sync: length prefix for %s never got through, aborting transfer\n", name.c_str());
+            if (sdBuf) heap_caps_free(sdBuf);
+            s_transferInProgress = false;
+            vTaskDelete(NULL);
+            return;
+        }
         vTaskDelay(pdMS_TO_TICKS(CHUNK_DELAY_MS));
 
         size_t offset = 0;
         while (offset < len) {
             size_t n = min(CHUNK_BYTES, len - offset);
-            s_dataChar->setValue((uint8_t *)(data + offset), n);
-            s_dataChar->notify();
+            if (!notifyWithRetry(data + offset, n)) {
+                // Bounded give-up: a genuinely dead link ends promptly with a
+                // visible error instead of spinning. The Mac's own timeout
+                // then retries, and (see the GET <name> <offset> resume
+                // support) picks up from where this left off rather than
+                // restarting from zero.
+                Serial.printf("ble_sync: transfer of %s ABORTED at %u/%u bytes -- host notify queue "
+                              "never drained (link congested or peer stopped reading)\n",
+                              name.c_str(), (unsigned)offset, (unsigned)len);
+                break;
+            }
             offset += n;
             vTaskDelay(pdMS_TO_TICKS(CHUNK_DELAY_MS));
         }
+        sentAll = (offset >= len);
     }
 
     if (sdBuf) heap_caps_free(sdBuf);
-    Serial.printf("ble_sync: transfer of %s complete\n", name.c_str());
+    // Only claim success when every byte actually went out -- an
+    // unconditional "complete" here is what made truncated transfers
+    // invisible from the device side while the Mac sat waiting.
+    if (sentAll) {
+        Serial.printf("ble_sync: transfer of %s complete\n", name.c_str());
+    }
     s_transferInProgress = false;
     vTaskDelete(NULL);
 }
@@ -315,9 +402,23 @@ static void applyAdvertisingInterval(uint16_t minInterval, uint16_t maxInterval)
 // used by app.py whenever WiFi is reachable; BLE is the fallback for
 // "device isn't on WiFi at all yet"), so suppressing idle BLE advertising
 // while WiFi is connected no longer creates a dead end.
+//
+// Gating purely on wifi_sync_is_connected() (WL_CONNECTED -- associated
+// with an AP, has an IP) turned out to be its own dead end: a client-
+// isolated guest network (common at coworking spaces/cafes) happily
+// reports connected while silently blocking device-to-device LAN traffic,
+// so the Mac can never actually reach it over WiFi -- and BLE had already
+// gone silent because WiFi *looked* fine from here. wifi_sync_http_proven_
+// reachable() closes that gap: it only becomes true once an HTTP request
+// has actually been served over the current association (see
+// wifi_sync.cpp), so BLE keeps advertising through the association until
+// that's proven, giving the Mac a real path to discover the device's WiFi
+// IP over BLE and test reachability -- if the network turns out to be
+// isolated, BLE just keeps advertising indefinitely, correctly, since it's
+// the only transport that actually works there.
 static void resumeIdleAdvertising() {
     if (s_pairingActive) return; // pairing's own fast-adv window owns this
-    if (s_paired && !wifi_sync_is_connected()) {
+    if (s_paired && (!wifi_sync_is_connected() || !wifi_sync_http_proven_reachable())) {
         applyAdvertisingInterval(SLOW_ADV_MIN, SLOW_ADV_MAX);
         NimBLEDevice::startAdvertising();
     } else {
@@ -355,11 +456,83 @@ bool ble_sync_pairing_timed_out() {
     return s_pairingActive && (millis() - s_pairingStartedMs > PAIRING_TIMEOUT_MS);
 }
 
+void ble_sync_pause_advertising_for_sleep() {
+    NimBLEDevice::stopAdvertising();
+}
+
+void ble_sync_resume_advertising_after_sleep() {
+    resumeIdleAdvertising();
+}
+
+// Throughput tuning, requested once per connection (see onConnect below).
+// All three are REQUESTS the central (macOS CoreBluetooth) can silently
+// ignore or decline -- see onPhyUpdate/phyReadbackTask for how the actual
+// negotiated result gets logged, since assuming a request took effect isn't
+// good enough to reason about measured throughput changes.
+//
+// 2M PHY specifically is a genuine tradeoff, not a strict win: it roughly
+// halves the effective sensitivity margin vs. 1M, which in a very congested
+// RF environment (confirmed live: 200-400+ nearby BLE devices at one
+// venue) can mean MORE retransmissions, not fewer -- possibly a net loss.
+// Kept behind this one constant so it's a one-line A/B against just the
+// connection-interval/data-length changes, which have no such downside.
+static const bool REQUEST_2M_PHY = true;
+
+// The device advertises no preferred connection parameters today (all the
+// PPCP sdkconfig values are 0), so the central picks unilaterally -- this
+// is the only lever available to ask for a tighter interval. Units are
+// 1.25ms (interval) / 10ms (supervision timeout) per the BLE spec, same as
+// updateConnParams()'s own parameter contract.
+static const uint16_t CONN_INTERVAL_MIN = 12;   // 15ms
+static const uint16_t CONN_INTERVAL_MAX = 24;   // 30ms
+static const uint16_t CONN_LATENCY = 0;
+static const uint16_t CONN_SUPERVISION_TIMEOUT = 400; // 4s
+
+static const char *phyName(uint8_t phy) {
+    switch (phy) {
+        case BLE_GAP_LE_PHY_1M: return "1M";
+        case BLE_GAP_LE_PHY_2M: return "2M";
+        case BLE_GAP_LE_PHY_CODED: return "Coded";
+        default: return "unknown";
+    }
+}
+
+// onPhyUpdate only fires on an actual CHANGE -- if the central declines the
+// 2M request outright, no event arrives at all. This one-shot readback task
+// covers that gap: a short delay (letting the PHY/param negotiation settle)
+// then an explicit getPhy() poll, logged regardless of whether an update
+// event ever fired. Runs on core 0 alongside the transfer task and NimBLE's
+// own host task -- brief and low-priority, not a contention concern.
+static void phyReadbackTask(void *arg) {
+    uint16_t connHandle = (uint16_t)(uintptr_t)arg;
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    uint8_t txPhy = 0, rxPhy = 0;
+    if (s_server->getPhy(connHandle, &txPhy, &rxPhy)) {
+        Serial.printf("ble_sync: negotiated PHY -- tx=%s rx=%s\n", phyName(txPhy), phyName(rxPhy));
+    } else {
+        Serial.println("ble_sync: PHY readback failed (connection may have already ended)");
+    }
+    vTaskDelete(NULL);
+}
+
 class ServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer *server, NimBLEConnInfo &connInfo) override {
         s_centralConnected = true;
         power_mgr_note_activity(); // a real connection resets the idle-sleep clock
         Serial.println("ble_sync: central connected");
+        // BLE connecting is a low-cost PRESENCE SIGNAL that triggers a WiFi
+        // attempt, not a second concurrent sync bearer -- WiFi and BLE
+        // share the same physical radio on this SoC, so running both as
+        // active transports at once would just make them contend for the
+        // same hardware. If WiFi comes up and connects, it becomes the
+        // sole active transport (existing HTTP poll/pull path, faster for
+        // real data volume); this BLE connection stays open and only
+        // becomes the actual bearer (its own existing GET/DELETE + L2CAP
+        // transfer path) if WiFi fails to connect. Gated on having
+        // something to sync -- no reason to bring WiFi up otherwise.
+        if (wifi_sync_has_pending_recordings()) {
+            wifi_sync_radio_on("BLE central connected");
+        }
         if (s_pairingActive) {
             s_pairingActive = false;
             if (!s_paired) {
@@ -371,11 +544,23 @@ class ServerCallbacks : public NimBLEServerCallbacks {
                 Serial.println("ble_sync: paired for the first time");
             }
         }
+
+        uint16_t connHandle = connInfo.getConnHandle();
+        server->updateConnParams(connHandle, CONN_INTERVAL_MIN, CONN_INTERVAL_MAX,
+                                  CONN_LATENCY, CONN_SUPERVISION_TIMEOUT);
+        server->setDataLen(connHandle, 251);
+        if (REQUEST_2M_PHY) {
+            server->updatePhy(connHandle, BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_CODED_ANY);
+        }
+        xTaskCreatePinnedToCore(phyReadbackTask, "phyReadback", 2 * 1024, (void *)(uintptr_t)connHandle, 1, NULL, 0);
     }
     void onDisconnect(NimBLEServer *server, NimBLEConnInfo &connInfo, int reason) override {
         s_centralConnected = false;
         Serial.println("ble_sync: central disconnected, resuming advertising");
         resumeIdleAdvertising();
+    }
+    void onPhyUpdate(NimBLEConnInfo &connInfo, uint8_t txPhy, uint8_t rxPhy) override {
+        Serial.printf("ble_sync: PHY update event -- tx=%s rx=%s\n", phyName(txPhy), phyName(rxPhy));
     }
 };
 
@@ -419,8 +604,35 @@ static bool sanitizedSdPath(const String &name, char *out, size_t outLen) {
 // text protocol either way.
 static void handleCommand(const String &cmd) {
     if (cmd.startsWith("GET ")) {
-        String *namePtr = new String(cmd.substring(4));
-        xTaskCreatePinnedToCore(transferTask, "bleTransfer", 8 * 1024, namePtr, 3, NULL, 1);
+        // "GET <name>" or "GET <name> <byteOffset>" -- the offset form
+        // resumes a previously stalled transfer (see TransferRequest).
+        // Recording filenames never contain spaces, but the all-digits check
+        // keeps a hypothetical spaced filename from being misread as one.
+        String rest = cmd.substring(4);
+        size_t startOffset = 0;
+        int sp = rest.lastIndexOf(' ');
+        if (sp > 0) {
+            String tail = rest.substring(sp + 1);
+            bool allDigits = tail.length() > 0;
+            for (size_t i = 0; i < tail.length(); i++) {
+                if (!isdigit((unsigned char)tail[i])) { allDigits = false; break; }
+            }
+            if (allDigits) {
+                startOffset = (size_t)strtoul(tail.c_str(), nullptr, 10);
+                rest = rest.substring(0, sp);
+            }
+        }
+        // Core 0, NOT core 1: recordTask runs at priority 4 on core 1 while
+        // this task is priority 3, so on a shared core starting a recording
+        // preempts an in-flight transfer -- confirmed live as the cause of
+        // "recording while syncing makes sync stick". Core 0 hosts only
+        // wifiTask (priority 2, and blocked on a task notification whenever
+        // the radio is off) and NimBLE's own host task (priority 21, which
+        // blocks on its event queue), so there's room here. Deliberately not
+        // solved by out-prioritizing recordTask instead -- that would let a
+        // transfer preempt live audio capture and risk dropped samples.
+        TransferRequest *req = new TransferRequest{rest, startOffset};
+        xTaskCreatePinnedToCore(transferTask, "bleTransfer", 8 * 1024, req, 3, NULL, 0);
     } else if (cmd.startsWith("NOTIFY ")) {
         // "NOTIFY <title>|<body>" -- the AI-pager push. Shows on the
         // e-paper until BOOT-dismissed and announces with the short click
@@ -556,8 +768,11 @@ class L2CAPTransferCallbacks : public NimBLEL2CAPChannelCallbacks {
         Serial.printf("ble_sync: L2CAP channel connected, negotiated MTU %u\n", negotiatedMTU);
         String pending;
         if (pickPendingFileName(pending)) {
-            String *namePtr = new String(pending);
-            xTaskCreatePinnedToCore(transferTask, "bleTransfer", 8 * 1024, namePtr, 3, NULL, 1);
+            // Offset 0: the L2CAP path auto-pushes from the start (there's no
+            // GET command carrying a resume point here). Core 0 for the same
+            // reason as the GET path -- see handleCommand's comment.
+            TransferRequest *req = new TransferRequest{pending, 0};
+            xTaskCreatePinnedToCore(transferTask, "bleTransfer", 8 * 1024, req, 3, NULL, 0);
         } else {
             Serial.println("ble_sync: L2CAP channel connected but nothing pending to send");
         }

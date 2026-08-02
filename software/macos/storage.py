@@ -240,10 +240,22 @@ def add_pending(name: str, size: int, content_hash: str, wav_bytes: bytes) -> di
 def get_unprocessed():
     """Records still needing transcription/summarization — either never
     attempted (pending) or a previous attempt failed (failed), so a poll
-    cycle can retry without touching the device at all."""
+    cycle can retry without touching the device at all.
+
+    Jarvis voice commands (kind=="command") are sorted first -- a spoken
+    command is a live, waited-on interaction (the user is standing there
+    expecting a spoken reply), unlike a memo/meeting recording that gets
+    processed in the background with no one watching a clock. Without this,
+    a command queued behind a large, slow-to-transcribe memo recording (or
+    several) sits waiting its turn with no reason to, which is exactly the
+    "most time goes in sync/transcribing before acting" latency reported --
+    this fixes the queuing order, not the per-file transcription time
+    itself (see poller.py's kind=="command" branch for that side)."""
     with _lock:
         records = _load()
-    return [r for r in records if r["status"] in ("pending", "failed")]
+    unprocessed = [r for r in records if r["status"] in ("pending", "failed")]
+    unprocessed.sort(key=lambda r: r.get("kind") != "command")
+    return unprocessed
 
 
 def mark_processed(content_hash: str, transcript: str, segments,

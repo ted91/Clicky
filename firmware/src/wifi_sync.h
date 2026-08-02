@@ -30,6 +30,41 @@ void wifi_sync_tick();
 
 bool wifi_sync_is_connected();
 
+// True if there's any WAV file still on the SD card, or a RAM recording
+// still pending -- i.e. anything the Mac hasn't yet confirmed syncing (it
+// only DELETEs a file from the device once it's synced). Cheap and local
+// (no radio needed): a plain SD directory scan, same logic GET /list
+// already uses to report what's there. Used by main.cpp to decide whether
+// a periodic wake needs to bother bringing WiFi up at all, and whether
+// it's actually safe to sleep after a recording -- both driven by real
+// "is there still something to sync" state instead of a fixed timer.
+bool wifi_sync_has_pending_recordings();
+
+// Nudges the WiFi/lwIP driver back to a known-good state right after a
+// light-sleep wake -- live-confirmed bug: sync works reliably after a cold
+// boot but NOT after light sleep (wifi_sync_radio_on() gets called, s_state
+// tracks CONNECTING correctly, but the connection never actually
+// progresses). wifi_sync_init()'s own comment already explains why: the
+// lwIP TCP/IP task's mutex only initializes as a side effect of
+// WiFi.mode(WIFI_STA) -- light sleep pauses the FreeRTOS tick lwIP's
+// timers depend on, and that state doesn't reliably survive the halt.
+// This repeats just the mode-cycle part of wifi_sync_init() (not the route
+// registration -- s_server and its handlers already exist in RAM,
+// untouched by light sleep) to re-settle that state. Cheap: a WiFi mode
+// toggle, no actual radio scan/connect. Call once from main.cpp's
+// sleepWatchTask right after every light-sleep wake, before any
+// wifi_sync_radio_on() call that wake might trigger.
+void wifi_sync_reinit_after_light_sleep();
+
+// True only once an HTTP request has actually been served over the CURRENT
+// WiFi association -- distinct from wifi_sync_is_connected() (which just
+// means associated with an AP + has an IP, true even on a client-isolated
+// guest network that silently blocks device-to-device traffic). Used by
+// ble_sync.cpp's resumeIdleAdvertising() to decide whether it's actually
+// safe to stop BLE advertising -- see that function's own doc for the
+// deadlock this closes. Resets to false on every new connection attempt.
+bool wifi_sync_http_proven_reachable();
+
 // True if WiFi credentials have ever been saved (NVS or secrets.h
 // fallback) -- used by ble_sync.cpp as a migration heuristic: a device
 // already in real use before the BLE-pairing feature existed shouldn't be

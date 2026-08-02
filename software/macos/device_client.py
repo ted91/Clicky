@@ -170,6 +170,38 @@ def set_device_name(name: str, base_url: str = None):
     resp.raise_for_status()
 
 
+def set_jarvis_config(deepgram_api_key: str, llm_api_key: str, mac_base_url: str, mac_device_key: str, base_url: str = None):
+    """Pushes the config voice_agent.cpp's on-device Deepgram Voice Agent
+    client needs into the device's NVS (see wifi_sync.cpp's
+    handleSetJarvisConfig). Called from Settings -> Jarvis's "Enable live
+    voice agent" action -- deepgram_api_key reuses whatever's already
+    configured under Providers (no need to re-enter it), mac_base_url is
+    auto-detected (poller.wifi_base_url_if_reachable()), and mac_device_key
+    is settings.get_or_create_jarvis_device_api_key() -- only llm_api_key
+    (Groq, per this session's explicit "cheapest/free" choice) is ever new
+    user input."""
+    resp = requests.post(
+        f"{base_url or config.DEVICE_BASE_URL}/jarvis/config",
+        data={
+            "deepgram_api_key": deepgram_api_key,
+            "llm_api_key": llm_api_key,
+            "mac_base_url": mac_base_url,
+            "mac_device_key": mac_device_key,
+        },
+        timeout=TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+
+
+def send_jarvis_ack(base_url: str = None):
+    """Quick tactile "done" click (see wifi_sync.cpp's handleJarvisAck) --
+    sent as soon as a Jarvis action finishes executing, before the slower
+    (and separately fallible) full spoken TTS reply upload, so the user
+    gets immediate confirmation Jarvis actually did something."""
+    resp = requests.post(f"{base_url or config.DEVICE_BASE_URL}/jarvis/ack", timeout=TIMEOUT_SECONDS)
+    resp.raise_for_status()
+
+
 def send_jarvis_audio(wav_bytes: bytes, base_url: str = None):
     """Uploads a Jarvis spoken reply for on-device playback via POST
     /jarvis/audio (see wifi_sync.cpp's handleJarvisAudioUpload/Complete) --
