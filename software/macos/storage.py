@@ -297,6 +297,23 @@ def mark_jarvis_processed(content_hash: str, transcript: str, jarvis_result: dic
         _save(records)
 
 
+def set_jarvis_user_status(content_hash: str, status: str) -> bool:
+    """Sets the user's disposition on a processed Jarvis command --
+    "pending"/"done"/"discarded" -- distinct from jarvis_result["ok"]
+    (whether the action itself executed successfully). Mirrors
+    update_draft()'s shape but writes into jarvis_result directly since a
+    command has one result, not a list of drafts. Returns False if the
+    recording doesn't exist or hasn't been processed by Jarvis yet."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None or record.get("jarvis_result") is None:
+            return False
+        record["jarvis_result"]["user_status"] = status
+        _save(records)
+        return True
+
+
 def apply_speaker_name_guesses(content_hash: str, guesses: dict):
     """Auto-fills speaker_names from the summarizer's self-identification
     guesses (see providers/base.py's "speaker_names" field) -- only for

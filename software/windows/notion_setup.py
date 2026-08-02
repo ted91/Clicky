@@ -235,5 +235,6 @@ def create_jarvis_database(token: str, parent_page_id: str) -> dict:
         "Heard": {"rich_text": {}},
         "Replied": {"rich_text": {}},
         "OK": {"checkbox": {}},
+        "Done": {"checkbox": {}},
     })
     return {"notion_jarvis_database_id": jarvis_db["id"]}

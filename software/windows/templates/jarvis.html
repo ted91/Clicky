@@ -85,6 +85,17 @@
       {% if c.jarvis_result.spoken %}
         <p><strong>Replied:</strong> {{ c.jarvis_result.spoken }}</p>
       {% endif %}
+      {% set user_status = c.jarvis_result.get("user_status", "pending") %}
+      <div class="controls">
+        <label style="font-size:0.82rem;">
+          <input type="checkbox" class="jarvis-done-checkbox" data-hash="{{ c.content_hash }}"
+                 {% if user_status == "done" %}checked{% endif %}> Done
+        </label>
+        <button class="md-download jarvis-discard-btn" data-hash="{{ c.content_hash }}"
+                {% if user_status == "discarded" %}disabled{% endif %}>
+          {{ "Discarded" if user_status == "discarded" else "Discard" }}
+        </button>
+      </div>
     {% endif %}
     <div class="controls">
       <audio controls preload="none" src="/audio/{{ c.content_hash }}.wav"></audio>
@@ -107,6 +118,25 @@
       btn.addEventListener("click", async () => {
         if (!confirm(`Permanently delete ${btn.dataset.name} from the device's SD card? This cannot be undone.`)) return;
         await fetch(`/recordings/${btn.dataset.hash}/device`, {method: "DELETE"});
+        location.reload();
+      });
+    });
+    document.querySelectorAll(".jarvis-done-checkbox").forEach(cb => {
+      cb.addEventListener("change", async () => {
+        const status = cb.checked ? "done" : "pending";
+        await fetch(`/recordings/${cb.dataset.hash}/jarvis-status`, {
+          method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"},
+          body: `status=${status}`,
+        });
+      });
+    });
+    document.querySelectorAll(".jarvis-discard-btn").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        if (!confirm("Mark this command as discarded?")) return;
+        await fetch(`/recordings/${btn.dataset.hash}/jarvis-status`, {
+          method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"},
+          body: "status=discarded",
+        });
         location.reload();
       });
     });

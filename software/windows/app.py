@@ -252,6 +252,23 @@ def dismiss_draft(request: Request, content_hash: str, draft_id: str):
     return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
 
 
+@app.post("/recordings/{content_hash}/jarvis-status")
+def set_jarvis_status(request: Request, content_hash: str, status: str = Form(...)):
+    """Marks a Jarvis command done/discarded/pending from the dashboard --
+    a user-disposition field distinct from jarvis_result["ok"] (whether
+    the action itself executed successfully). One route, not a pair like
+    approve/dismiss above: unlike email drafts, none of these three values
+    trigger any dispatch logic, so there's no asymmetry worth documenting
+    with separate routes."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    if status not in ("pending", "done", "discarded"):
+        return JSONResponse({"error": "invalid_status"}, status_code=400)
+    ok = storage.set_jarvis_user_status(content_hash, status)
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+
 @app.get("/api/pending-person-links")
 def api_pending_person_links(request: Request):
     """Task/Calendar entries created with a name (task owner, email draft

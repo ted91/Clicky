@@ -746,7 +746,8 @@ async def process_once():
                 if settings.get_all().get("notion_jarvis_database_id"):
                     try:
                         import notion_sync
-                        await asyncio.to_thread(notion_sync.push_command, storage.get_recording(content_hash), jarvis_result)
+                        jarvis_page_id = await asyncio.to_thread(notion_sync.push_command, storage.get_recording(content_hash), jarvis_result)
+                        storage.set_notion_page_id(content_hash, jarvis_page_id)
                     except Exception as e:
                         log.warning("Notion push for Jarvis command %s failed (non-fatal): %s", record["name"], e)
 
@@ -1447,6 +1448,41 @@ async def check_notion_email_approvals_once():
             log.info("sent %s via Notion approval for %s", link["draft_id"], record["name"])
 
 
+async def check_notion_jarvis_done_once():
+    """Lets a Jarvis command be marked done from Notion, not just the
+    dashboard -- reads each command's Jarvis-database page's "Done"
+    checkbox every poll cycle, same "read a Notion property, act on it"
+    pattern as check_notion_email_approvals_once(). One-directional
+    Notion<->local sync for done/undone only -- discard has no Notion
+    property (see notion_setup.create_jarvis_database) since it's a
+    local-only housekeeping action, not something worth checking from
+    Notion; a local discard is never overwritten by a stray checkbox
+    state here."""
+    saved = settings.get_all()
+    if not (saved.get("notion_token") and saved.get("notion_jarvis_database_id")):
+        return
+    import notion_sync
+
+    for record in storage.list_recordings():
+        if record.get("kind") != "command" or not record.get("jarvis_result"):
+            continue
+        page_id = record.get("notion_page_id")
+        if not page_id:
+            continue
+        current = record["jarvis_result"].get("user_status", "pending")
+        if current == "discarded":
+            continue
+        try:
+            page = await asyncio.to_thread(notion_sync.get_page, page_id)
+        except Exception as e:
+            log.warning("failed to check Jarvis Done checkbox for %s: %s", record["name"], e)
+            continue
+        checked = (page.get("properties") or {}).get("Done", {}).get("checkbox")
+        new_status = "done" if checked else "pending"
+        if new_status != current:
+            storage.set_jarvis_user_status(record["content_hash"], new_status)
+
+
 async def check_obsidian_email_approvals_once():
     """Obsidian equivalent of check_notion_email_approvals_once() -- reads
     each email-item Task note's "approve_send" frontmatter checkbox (see
@@ -1837,6 +1873,7 @@ async def poll_once():
     await generate_standalone_email_drafts_once()
     await sync_speaker_edits_once()
     await check_notion_email_approvals_once()
+    await check_notion_jarvis_done_once()
     await check_obsidian_email_approvals_once()
     await check_social_post_generation_triggers_once()
     await check_publication_approvals_once()

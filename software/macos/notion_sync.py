@@ -371,6 +371,7 @@ def push_command(record: dict, jarvis_result: dict) -> str:
         "Heard": {"rich_text": [{"type": "text", "text": {"content": transcript[:MAX_TEXT_LEN]}}]},
         "Replied": {"rich_text": [{"type": "text", "text": {"content": spoken[:MAX_TEXT_LEN]}}]},
         "OK": {"checkbox": bool(jarvis_result.get("ok"))},
+        "Done": {"checkbox": jarvis_result.get("user_status") == "done"},
     }
     if record.get("created_at"):
         properties["Date"] = {"date": {"start": record["created_at"][:10]}}
