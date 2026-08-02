@@ -27,7 +27,7 @@ import notifications
 import settings
 import status
 import storage
-from providers import get_transcriber, get_summarizer
+from providers import get_transcriber, get_summarizer, get_completer
 from providers.base import format_transcript_with_speakers
 
 log = logging.getLogger("poller")
@@ -360,6 +360,33 @@ async def sync_once():
             await asyncio.to_thread(signal_sync_complete)
         except Exception as e:
             log.debug("signal_sync_complete failed (device will time out its own radio window instead): %s", e)
+
+
+def _apply_context_fit_to_segments(segments, merged_verdicts):
+    """Maps build_context_fit_prompt's per-chunk verdicts (one per
+    providers.base.merge_consecutive_segments() group) back onto the raw,
+    pre-merge segment list -- storage.json keeps raw segments (for the
+    speaker-rename UI and any future re-merge), so context_fit has to
+    live there too, not just on the throwaway merged view used for the
+    classification call itself. Replicates merge_consecutive_segments'
+    own grouping rule inline (a new group starts whenever speaker_id
+    differs from the immediately preceding segment) rather than needing a
+    separate index-mapping function -- same grouping, so verdict i always
+    lands on exactly the raw segments merge_consecutive_segments would
+    later fold into merged group i."""
+    result = []
+    group_idx = -1
+    prev_speaker = object()  # sentinel that can't equal any real speaker_id
+    for seg in segments:
+        speaker_id = seg.get("speaker_id")
+        if speaker_id != prev_speaker:
+            group_idx += 1
+            prev_speaker = speaker_id
+        seg = dict(seg)
+        if 0 <= group_idx < len(merged_verdicts):
+            seg["context_fit"] = merged_verdicts[group_idx]
+        result.append(seg)
+    return result
 
 
 def _enforce_journal_rule(summary: dict, segments, pre_classified_conversation: bool = False):
@@ -841,6 +868,30 @@ async def process_once():
             if segments and settings.get_all().get("filter_background_conversations", True):
                 import audio_analysis
                 segments = audio_analysis.annotate_segment_loudness(wav_bytes, segments)
+
+            # Backlog #10: content-based chunk classification (FITS/
+            # DIFFERENT_TOPIC/NOISE) -- independent of the acoustic
+            # loudness_class signal above (they can disagree; both feed
+            # format_transcript_with_speakers' prefix logic separately).
+            # Classifies on the same merged-turn granularity the
+            # transcript is displayed/summarized at, one call per
+            # recording (not per chunk) -- see build_context_fit_prompt's
+            # docstring. Skipped for a single-chunk transcript: nothing
+            # to judge a chunk "against" with no neighbors.
+            if segments and settings.get_all().get("classify_context_fit", True):
+                from providers.base import (
+                    build_context_fit_prompt, parse_context_fit_verdicts, merge_consecutive_segments,
+                )
+                merged_for_fit = merge_consecutive_segments(segments)
+                if len(merged_for_fit) > 1:
+                    try:
+                        _, complete_for_fit = get_completer()
+                        verdict_json = await asyncio.to_thread(
+                            complete_for_fit, build_context_fit_prompt(merged_for_fit))
+                        verdicts = parse_context_fit_verdicts(verdict_json, len(merged_for_fit))
+                        segments = _apply_context_fit_to_segments(segments, verdicts)
+                    except Exception as e:
+                        log.warning("context-fit classification failed (non-fatal, all chunks treated as fitting): %s", e)
 
             formatted = format_transcript_with_speakers(transcript, segments)
 

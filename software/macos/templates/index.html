@@ -77,6 +77,7 @@
        from what actually made it into the summary. */
     .transcript p.background-line { color: var(--muted2); opacity: 0.7; }
     .background-tag { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.03em; margin-right: 0.35rem; }
+    .topic-tag { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.03em; margin-right: 0.35rem; color: var(--accent, #8a6d3b); border-bottom: 1px dotted currentColor; }
     .empty { color: var(--muted2); }
     a { color: var(--owner); }
     audio { width: 100%; height: 32px; margin: 0.5rem 0; }
@@ -429,7 +430,7 @@
             {% if r.merged_segments %}
               <div class="transcript" data-hash="{{ r.content_hash }}">
                 {% for seg in r.merged_segments %}
-                  <p class="{{ 'background-line' if seg.loudness_class == 'background' }}">{% if seg.loudness_class == 'background' %}<span class="background-tag" title="Classified as a quieter, more distant conversation -- excluded from the summary">background</span>{% endif %}<span class="speaker rename-speaker" data-speaker-id="{{ seg.speaker_id }}" title="Click to rename">{{ r.get('speaker_names', {}).get(seg.speaker_id) or ("Speaker " ~ seg.speaker_id) }}:</span> {{ seg.text }}</p>
+                  <p class="{{ 'background-line' if seg.loudness_class == 'background' or seg.context_fit == 'noise' }}">{% if seg.loudness_class == 'background' %}<span class="background-tag" title="Classified as a quieter, more distant conversation -- excluded from the summary">background</span>{% elif seg.context_fit == 'noise' %}<span class="background-tag" title="AI-classified: doesn't connect to anything around it -- excluded from the summary">noise</span>{% endif %}{% if seg.context_fit == 'different_topic' %}<span class="topic-tag" title="AI-classified: a real but separate thread -- kept, but not blended into the main summary">different topic</span>{% endif %}<span class="speaker rename-speaker" data-speaker-id="{{ seg.speaker_id }}" title="Click to rename">{{ r.get('speaker_names', {}).get(seg.speaker_id) or ("Speaker " ~ seg.speaker_id) }}:</span> {{ seg.text }}</p>
                 {% endfor %}
               </div>
             {% else %}

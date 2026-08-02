@@ -592,15 +592,26 @@ def settings_transport(request: Request, sync_transport: str = Form(...)):
 
 
 @app.post("/settings/audio")
-def settings_audio(request: Request, filter_background_conversations: str = Form("")):
+def settings_audio(
+    request: Request,
+    filter_background_conversations: str = Form(""),
+    classify_context_fit: str = Form(""),
+):
     """Toggles audio_analysis.py's volume-based background-conversation
-    filtering (see poller.process_once). A plain checkbox, kept separate
-    from the /setup route since that one's shared by first-run setup and
-    the Account panel's own hidden-field forms."""
+    filtering, and separately backlog #10's content-based chunk
+    classification (providers.base.build_context_fit_prompt, see
+    poller.process_once) -- two independent signals (acoustic vs.
+    semantic) that can disagree, so two independent toggles, same plain-
+    checkbox pattern. Kept separate from the /setup route since that
+    one's shared by first-run setup and the Account panel's own
+    hidden-field forms."""
     redirect = _gate(request)
     if redirect:
         return redirect
-    settings.update(filter_background_conversations=bool(filter_background_conversations))
+    settings.update(
+        filter_background_conversations=bool(filter_background_conversations),
+        classify_context_fit=bool(classify_context_fit),
+    )
     return RedirectResponse("/settings?panel=providers", status_code=303)
 
 

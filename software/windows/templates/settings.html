@@ -475,6 +475,19 @@
                      style="width:auto;display:inline-block;vertical-align:middle;">
               Filter likely background conversations (experimental)
             </label>
+
+            <p class="step">
+              A second, independent signal: an AI pass judges each chunk of the transcript by whether it actually
+              connects to what's said around it (not by volume). Chunks that read as a spliced-in separate topic are
+              kept but kept out of the main summary; chunks with no real connection to anything nearby are treated as
+              noise, same as a background conversation above.
+            </p>
+            <label>
+              <input type="checkbox" name="classify_context_fit" value="true"
+                     {{ "checked" if current.get("classify_context_fit", True) }}
+                     style="width:auto;display:inline-block;vertical-align:middle;">
+              Classify chunks by conversational fit (experimental)
+            </label>
             <button type="submit">Save</button>
           </fieldset>
         </form>

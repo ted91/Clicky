@@ -53,19 +53,23 @@ Return ONLY valid JSON (no markdown fences, no commentary) matching exactly:
 If a list has nothing to report, return an empty list for it — never omit a
 key. Infer owner/due_date/date/time/stakeholders only when clearly stated or
 strongly implied in the transcript — use null rather than guessing.
-Any line prefixed "[background, likely a different conversation]" is a
-different, more distant conversation the mic also picked up at a noisy
-venue — never let it contribute to "summary", "action_items",
-"stakeholders", or "follow_ups"; write as if those lines weren't there.
-Separately, even without that prefix, a chunk can still be a spliced-in
-unrelated exchange rather than part of the real conversation -- distinct
-from a genuine multi-topic meeting (which stays fully in-scope, see
-below): the tell is that it doesn't connect to what's said immediately
-before or after it, as if a different, unrelated conversation was briefly
-picked up. Exclude that the same way. If (and only if) you excluded
-anything by either rule, set "excluded_background_note" to one short,
-honest sentence saying so (e.g. "Some unrelated background conversation
-was picked up and excluded from this summary."); otherwise null.
+Any line prefixed "[background, likely a different conversation]" is
+either a different, more distant conversation the mic also picked up at
+a noisy venue, or a chunk a separate classification pass already judged
+as pure noise (no real connection to anything around it) — never let it
+contribute to "summary", "action_items", "stakeholders", or
+"follow_ups"; write as if those lines weren't there.
+Any line prefixed "[different topic thread]" is coherent and real but a
+separate thread from the surrounding conversation (e.g. a brief aside, a
+different discussion spliced in) — distinct from a genuine multi-topic
+meeting (which stays fully in-scope, see below, and has no such prefix).
+Mention it, but keep it clearly separated from the main narrative rather
+than blending it in — its own short sentence/clause, not folded into
+the primary summary, unless it has real action items of its own.
+If (and only if) you excluded anything via the background/noise prefix
+above, set "excluded_background_note" to one short, honest sentence
+saying so (e.g. "Some unrelated background conversation was picked up
+and excluded from this summary."); otherwise null.
 Size "summary" to how much is actually in the transcript, not to a fixed
 sentence count — a short voice memo still gets 2-4 sentences, but a long or
 multi-topic recording (a meeting, a webinar, a call covering several
@@ -497,6 +501,83 @@ def build_continuation_prompt(tail_of_a: str, head_of_b: str, gap_seconds: int) 
     )
 
 
+def build_context_fit_prompt(merged_segments, speaker_names: dict = None) -> str:
+    """Backlog #10: classifies EVERY chunk of a transcript in one call,
+    combining what were two separate ideas (topic-jump detection and noise
+    elimination -- they're the same underlying judgment: does this chunk
+    connect to what's around it). One call per recording carrying all
+    chunks, not one call per chunk -- matches this codebase's existing
+    one-call-per-recording cost profile (build_recording_type_prompt,
+    build_continuation_prompt) rather than a much more expensive
+    many-small-calls pattern.
+
+    `merged_segments` should already be merge_consecutive_segments()'
+    output, not raw diarized segments -- classifying at the same
+    per-turn granularity the transcript is actually displayed/summarized
+    at, not fragmented sentence-by-sentence pieces.
+
+    Response is a JSON array (see summarize()'s own JSON response for this
+    codebase's precedent on structured multi-item LLM output, as opposed
+    to the bare-word verdict build_recording_type_prompt/
+    build_continuation_prompt use -- a per-chunk answer needs a real
+    array, not a single word) -- parsed by parse_context_fit_verdicts()
+    below."""
+    speaker_names = speaker_names or {}
+    lines = []
+    for i, seg in enumerate(merged_segments, start=1):
+        speaker_id = seg.get("speaker_id") or "Unknown"
+        speaker = speaker_names.get(speaker_id) or f"Speaker {speaker_id}"
+        lines.append(f"{i}. {speaker}: {(seg.get('text') or '').strip()}")
+    numbered = "\n".join(lines)
+    return (
+        "Below is a numbered, speaker-labeled transcript, one chunk per "
+        "line (consecutive same-speaker turns are already merged into one "
+        "chunk each). For EACH numbered line, decide how it relates to the "
+        "chunks immediately around it:\n\n"
+        "FITS: genuinely part of the same ongoing conversation/train of "
+        "thought as its neighbors -- including a natural topic change "
+        "WITHIN one continuous conversation (people do shift subjects; "
+        "that's still FITS).\n\n"
+        "DIFFERENT_TOPIC: coherent and real, but reads as a separate "
+        "thread spliced in -- e.g. a brief aside, a different conversation "
+        "entirely, something that doesn't follow from what was said right "
+        "before it and doesn't lead into what's said right after. Keep it "
+        "in the record, just don't blend it into the main narrative.\n\n"
+        "NOISE: doesn't meaningfully connect to anything around it at "
+        "all -- a stray fragment, background chatter the mic picked up, "
+        "something with no real conversational content.\n\n"
+        "Default to FITS when in doubt -- only mark DIFFERENT_TOPIC or "
+        "NOISE when the disconnect is clear.\n\n"
+        "Transcript:\n\"\"\"\n" + numbered + "\n\"\"\"\n\n"
+        "Respond with ONLY a JSON array, no markdown fences, no "
+        "commentary: [{\"line\": 1, \"verdict\": \"FITS\"}, "
+        "{\"line\": 2, \"verdict\": \"NOISE\"}, ...] -- exactly one entry "
+        "per numbered line, in order."
+    )
+
+
+def parse_context_fit_verdicts(raw_response: str, expected_count: int) -> list:
+    """Parses build_context_fit_prompt's JSON-array response into a plain
+    list of "fits"/"different_topic"/"noise" strings, one per chunk, in
+    the same order as the numbered transcript fed in. Defensive like
+    _denull below -- malformed/short/long/unparseable output degrades to
+    "fits" for every affected entry rather than raising, since a
+    classification failure should never block the summarize() call this
+    feeds into (better to under-classify than to crash processing)."""
+    import json
+    verdict_map = {"FITS": "fits", "DIFFERENT_TOPIC": "different_topic", "NOISE": "noise"}
+    try:
+        data = json.loads(raw_response)
+    except (json.JSONDecodeError, TypeError):
+        return ["fits"] * expected_count
+    by_line = {}
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and "line" in item:
+                by_line[item["line"]] = verdict_map.get(str(item.get("verdict", "")).upper(), "fits")
+    return [by_line.get(i + 1, "fits") for i in range(expected_count)]
+
+
 def merge_consecutive_segments(segments):
     """Combines runs of consecutive segments from the same speaker into one
     segment, concatenating their text. Diarization naturally splits even a
@@ -526,6 +607,14 @@ def merge_consecutive_segments(segments):
             # the classification on merge.
             if seg.get("loudness_class") == "background":
                 merged[-1]["loudness_class"] = "background"
+            # Same "worst wins" reasoning for the content-based context_fit
+            # signal (see build_context_fit_prompt) -- "noise" outranks
+            # "different_topic" which outranks "fits", so a merged block
+            # keeps the most-excluded verdict any constituent segment got.
+            constituent_fit = seg.get("context_fit")
+            current_fit = merged[-1].get("context_fit")
+            if constituent_fit == "noise" or (constituent_fit == "different_topic" and current_fit != "noise"):
+                merged[-1]["context_fit"] = constituent_fit
         else:
             merged.append({
                 "speaker_id": speaker_id,
@@ -533,6 +622,7 @@ def merge_consecutive_segments(segments):
                 "start": seg.get("start"),
                 "end": seg.get("end"),
                 "loudness_class": seg.get("loudness_class"),
+                "context_fit": seg.get("context_fit"),
             })
     return merged
 
@@ -559,7 +649,15 @@ def format_transcript_with_speakers(text: str, segments, speaker_names: dict = N
     gets a `[background, likely a different conversation]` prefix instead
     of being dropped — SUMMARY_JSON_INSTRUCTIONS tells the model to ignore
     prefixed lines when writing the summary, but the full transcript still
-    shows everything the mic actually heard."""
+    shows everything the mic actually heard.
+
+    A segment's `context_fit` (see build_context_fit_prompt, backlog #10 --
+    an independent, content-based signal from loudness_class's acoustic
+    one; they can disagree, e.g. a loud but off-topic aside) of "noise"
+    gets the same background prefix (SUMMARY_JSON_INSTRUCTIONS already
+    treats that prefix as "exclude entirely"); "different_topic" gets its
+    own `[different topic thread]` prefix -- kept in the transcript and
+    mentioned in the summary, just not blended into the main narrative."""
     if not segments:
         return text
     speaker_names = speaker_names or {}
@@ -570,7 +668,12 @@ def format_transcript_with_speakers(text: str, segments, speaker_names: dict = N
         seg_text = (seg.get("text") or "").strip()
         if not seg_text:
             continue
-        prefix = "[background, likely a different conversation] " if seg.get("loudness_class") == "background" else ""
+        if seg.get("loudness_class") == "background" or seg.get("context_fit") == "noise":
+            prefix = "[background, likely a different conversation] "
+        elif seg.get("context_fit") == "different_topic":
+            prefix = "[different topic thread] "
+        else:
+            prefix = ""
         lines.append(f"{prefix}{speaker}: {seg_text}")
     return "\n".join(lines) if lines else text
 
