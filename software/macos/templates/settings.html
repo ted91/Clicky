@@ -121,6 +121,9 @@
         <span class="icon">🗣️</span> Jarvis
         <span class="status-dot {{ 'connected' if current.jarvis_enabled }}"></span>
       </div>
+      <div class="sidebar-item" data-panel="conversation-merge">
+        <span class="icon">🔗</span> Conversation Merging
+      </div>
 
       <div class="sidebar-group-label">Integrations</div>
       <div class="sidebar-item" data-panel="notion">
@@ -330,6 +333,27 @@
             <label>
               VIP list (one name or email per line — always pushed, skips the AI check)
               <textarea name="notification_vip_list" rows="3" placeholder="jeremy@example.com&#10;Sanchit">{{ current.notification_vip_list or "" }}</textarea>
+            </label>
+
+            <button type="submit">Save</button>
+          </fieldset>
+        </form>
+      </div>
+
+      <div class="panel" data-panel="conversation-merge">
+        <h2>Conversation Merging</h2>
+        <p class="desc">When you pause a recording and start a new one shortly after continuing the same train of thought, this merges the two into one document instead of leaving them as separate, fragmented notes. A recording only merges if it's both within the time window below AND judged topically continuous by AI — being close in time alone never merges two unrelated recordings.</p>
+
+        <form method="post" action="/settings/conversation-merge">
+          <fieldset>
+            <label>
+              <input type="checkbox" name="merge_continuations_enabled" value="true" {{ "checked" if current.get("merge_continuations_enabled", True) }} style="width:auto;display:inline-block;vertical-align:middle;">
+              Merge continuations automatically
+            </label>
+
+            <label>
+              Gap window (minutes) — recordings further apart than this are never considered
+              <input type="number" name="merge_gap_minutes" min="1" max="60" value="{{ current.get('merge_gap_minutes', 10) }}">
             </label>
 
             <button type="submit">Save</button>

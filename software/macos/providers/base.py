@@ -466,6 +466,37 @@ def build_recording_type_prompt(transcript: str) -> str:
     )
 
 
+def build_continuation_prompt(tail_of_a: str, head_of_b: str, gap_seconds: int) -> str:
+    """Dedicated, single-purpose classification call deciding whether
+    recording B is a continuation of the immediately-preceding recording A
+    (paused mid-thought, someone interrupted) versus an unrelated recording
+    that merely happens to fall inside the merge gap window -- see
+    poller.merge_continuations_once / conversation_merge.py. Same
+    "one word, cheaper and more reliable than a heuristic" shape as
+    build_recording_type_prompt above; deliberately NOT an embedding
+    similarity check (rag_index.rank_by_similarity) since that's tuned for
+    coarse topical retrieval, not the directional discourse judgment this
+    needs (does B pick up where A trailed off, vs. two separate
+    discussions of the same topic that shouldn't merge).
+
+    Only the tail of A and head of B are fed in -- the continuity signal
+    lives at the boundary, and this keeps the call cheap regardless of how
+    long either recording actually is."""
+    return (
+        f"Two voice recordings were made {gap_seconds} seconds apart. "
+        "Recording A's transcript is cut off below (only its ending is "
+        "shown); Recording B's transcript is cut off too (only its "
+        "beginning is shown). Decide: is Recording B a direct continuation "
+        "of the same train of thought or conversation as Recording A (e.g. "
+        "picking back up after being interrupted, finishing a sentence or "
+        "idea left hanging), or is it an unrelated recording that just "
+        "happens to have been made shortly after?\n\n"
+        "End of Recording A:\n\"\"\"\n" + tail_of_a + "\n\"\"\"\n\n"
+        "Start of Recording B:\n\"\"\"\n" + head_of_b + "\n\"\"\"\n\n"
+        "Respond with EXACTLY one word, nothing else: CONTINUATION or NEW."
+    )
+
+
 def merge_consecutive_segments(segments):
     """Combines runs of consecutive segments from the same speaker into one
     segment, concatenating their text. Diarization naturally splits even a

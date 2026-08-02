@@ -289,6 +289,10 @@
           <h3>{{ r.name }}
             {% if r.status == "pending" %}<span class="badge pending">Processing&hellip;</span>{% endif %}
             {% if r.status == "failed" %}<span class="badge failed">Processing failed</span>{% endif %}
+            {% if r.merged_from %}
+              <span class="badge" title="Merged with {{ r.merged_from|length }} continuation recording(s) -- see backlog #5">+{{ r.merged_from|length }} continuation{{ "s" if r.merged_from|length > 1 }}</span>
+              <button type="button" class="unmerge-btn" data-keeper-hash="{{ r.content_hash }}" data-loser-hash="{{ r.merged_from[-1] }}">Unmerge</button>
+            {% endif %}
           </h3>
           {% if r.notion_url or r.obsidian_url %}
             <span class="quick-open-links">

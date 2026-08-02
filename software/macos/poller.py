@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 import config
+import conversation_merge
 import google_client
 import meeting_recorder
 import notifications
@@ -1096,6 +1097,108 @@ async def process_once():
             log.warning("Jarvis batch summary reply failed (non-fatal, actions already executed): %s", e)
 
 
+async def merge_continuations_once():
+    """Backlog #5: merges a just-finished recording into the immediately
+    preceding one if it's a continuation of the same train of thought
+    (paused mid-recording, interrupted) rather than letting it fragment
+    into a second, separate document. Runs between process_once() and
+    distribute_once() in poll_once() so the common case pushes ONCE with
+    the merged content, instead of pushing both separately and then
+    retracting one.
+
+    Two gates, cheap-before-expensive: conversation_merge.find_merge_candidate()
+    (gap window + summary type agreement, no LLM call) narrows to at most
+    one candidate; only then is providers.base.build_continuation_prompt's
+    one-word LLM verdict spent. See both modules' docstrings for why a
+    dedicated classifier was chosen over rag_index embedding similarity.
+    """
+    saved = settings.get_all()
+    if not saved.get("merge_continuations_enabled", True):
+        return
+    gap_minutes = saved.get("merge_gap_minutes", conversation_merge.DEFAULT_MERGE_GAP_MINUTES)
+
+    all_records = storage.list_recordings()
+    new_candidates = [
+        r for r in all_records
+        if r.get("kind") == "memo" and r.get("status") == "done" and not r.get("merge_checked")
+    ]
+    for new_record in new_candidates:
+        preceding = conversation_merge.find_merge_candidate(new_record, all_records, gap_minutes)
+        if preceding is None:
+            storage.mark_merge_checked(new_record["content_hash"])
+            continue
+
+        tail_a, head_b, gap_seconds = conversation_merge.build_merge_check_prompt_args(preceding, new_record)
+        from providers.base import build_continuation_prompt
+        from providers import get_completer
+        _, complete = get_completer()
+        try:
+            verdict = await asyncio.to_thread(
+                complete, build_continuation_prompt(tail_a, head_b, gap_seconds))
+        except Exception as e:
+            log.warning("continuation check failed for %s (treating as not a continuation): %s",
+                        new_record["name"], e)
+            storage.mark_merge_checked(new_record["content_hash"])
+            continue
+
+        if verdict.strip().upper() != "CONTINUATION":
+            storage.mark_merge_checked(new_record["content_hash"])
+            continue
+
+        merged_transcript = (
+            preceding["transcript"] + f"\n\n--- (continued after {gap_seconds // 60}m gap) ---\n\n"
+            + new_record["transcript"]
+        )
+        _, summarize = get_summarizer()
+        merged_summary = await asyncio.to_thread(
+            summarize, merged_transcript, preceding.get("deepgram_insights"), preceding.get("meeting"))
+        _enforce_journal_rule(merged_summary, preceding.get("segments") or [])
+        _add_speakers_as_stakeholders(merged_summary)
+
+        ok = storage.merge_recordings(
+            preceding["content_hash"], new_record["content_hash"], merged_transcript, merged_summary, gap_seconds)
+        if not ok:
+            continue
+        storage.mark_merge_checked(new_record["content_hash"])
+        log.info("merged %s into %s as a continuation (%ds gap)",
+                  new_record["name"], preceding["name"], gap_seconds)
+
+        # Race case: `preceding` may have already been pushed to Notion/
+        # Obsidian by an earlier distribute_once() pass before this
+        # continuation arrived. In-place update, not delete/recreate --
+        # both notion_sync.update_all_blocks() and obsidian_sync's
+        # _write_note() (called again via push_recording) already
+        # overwrite wholesale (same mechanism _resummarize_after_rename
+        # uses above). If it hasn't been pushed yet, distribute_once()'s
+        # normal pass picks up the merged content on its own -- nothing
+        # to do here.
+        merged_record = storage.get_recording(preceding["content_hash"])
+        try:
+            import rag_index
+            rag_index.delete_source("recording", new_record["content_hash"])
+            rag_index.add_recording(merged_record)  # re-index under the keeper's hash with the combined transcript
+        except Exception as e:
+            log.warning("failed to update rag_index after merge (non-fatal): %s", e)
+
+        if merged_record.get("notion_page_id"):
+            import notion_sync
+            try:
+                await asyncio.to_thread(notion_sync.update_all_blocks, merged_record["notion_page_id"], merged_record)
+            except Exception as e:
+                log.error("merged %s locally but failed to refresh Notion page: %s", preceding["name"], e)
+        if merged_record.get("obsidian_note_path"):
+            import obsidian_sync
+            try:
+                await asyncio.to_thread(obsidian_sync.push_recording, merged_record)
+            except Exception as e:
+                log.error("merged %s locally but failed to refresh Obsidian note: %s", preceding["name"], e)
+
+        # Re-fetch for the next candidate in this same pass so a chain of
+        # 3+ continuations (B, then C shortly after) always compares
+        # against the up-to-date merged transcript, not a stale copy.
+        all_records = storage.list_recordings()
+
+
 async def distribute_once():
     """Pushes successfully processed recordings to any configured
     destinations (Notion, Obsidian) — independent of sync/process so a
@@ -2074,6 +2177,7 @@ async def poll_once():
         return  # nothing to do until first-run /setup has been completed
     await sync_once()
     await process_once()
+    await merge_continuations_once()
     await distribute_once()
     await generate_drafts_once()
     await generate_standalone_email_drafts_once()

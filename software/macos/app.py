@@ -151,7 +151,11 @@ def index(request: Request):
     # Jarvis voice commands get their own page (see /jarvis) -- they aren't
     # a recording in the memo/journal sense (no speakers/summary/action
     # items), so they no longer render inline in the main list here.
-    recordings = [r for r in _recordings_for_display() if r.get("kind") != "command"]
+    # merged_into: absorbed into another recording by backlog #5's
+    # continuation merge (see poller.merge_continuations_once) -- its
+    # content now lives on the keeper record, so it has nothing left of
+    # its own to show.
+    recordings = [r for r in _recordings_for_display() if r.get("kind") != "command" and not r.get("merged_into")]
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -165,7 +169,7 @@ def api_recordings(request: Request):
     redirect = _gate(request)
     if redirect:
         return redirect
-    return JSONResponse([r for r in _recordings_for_display() if r.get("kind") != "command"])
+    return JSONResponse([r for r in _recordings_for_display() if r.get("kind") != "command" and not r.get("merged_into")])
 
 
 @app.get("/audio/{content_hash}.wav")
@@ -279,6 +283,49 @@ def set_jarvis_status(request: Request, content_hash: str, status: str = Form(..
         return JSONResponse({"error": "invalid_status"}, status_code=400)
     ok = storage.set_jarvis_user_status(content_hash, status)
     return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+
+@app.post("/recordings/{keeper_hash}/unmerge/{loser_hash}")
+async def unmerge_recordings(request: Request, keeper_hash: str, loser_hash: str):
+    """Splits a continuation-merged pair back apart (see backlog #5,
+    poller.merge_continuations_once) -- storage.unmerge_recording()
+    restores the keeper's exact pre-merge transcript and clears the
+    loser's synced flags; re-summarizing and re-pushing the keeper is
+    this route's job, not storage's (same division as merge_recordings()).
+    The loser needs no push here -- clearing its *_synced flags is enough
+    for distribute_once() to push it as its own document on the next poll
+    cycle, same as any freshly processed recording."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    ok = storage.unmerge_recording(keeper_hash, loser_hash)
+    if not ok:
+        return JSONResponse({"ok": False}, status_code=404)
+
+    from providers import get_summarizer
+    keeper = storage.get_recording(keeper_hash)
+    _, summarize = get_summarizer()
+    restored_summary = await asyncio.to_thread(
+        summarize, keeper["transcript"], keeper.get("deepgram_insights"), keeper.get("meeting"))
+    poller._enforce_journal_rule(restored_summary, keeper.get("segments") or [])
+    poller._add_speakers_as_stakeholders(restored_summary)
+    storage.update_summary(keeper_hash, restored_summary)
+
+    keeper = storage.get_recording(keeper_hash)
+    if keeper.get("notion_page_id"):
+        import notion_sync
+        try:
+            await asyncio.to_thread(notion_sync.update_all_blocks, keeper["notion_page_id"], keeper)
+        except Exception as e:
+            logging.getLogger("app").error("unmerged %s locally but failed to refresh Notion page: %s", keeper["name"], e)
+    if keeper.get("obsidian_note_path"):
+        import obsidian_sync
+        try:
+            await asyncio.to_thread(obsidian_sync.push_recording, keeper)
+        except Exception as e:
+            logging.getLogger("app").error("unmerged %s locally but failed to refresh Obsidian note: %s", keeper["name"], e)
+
+    return JSONResponse({"ok": True})
 
 
 @app.get("/api/pending-person-links")
@@ -594,6 +641,22 @@ def settings_notifications(
     )
     config.reload_settings()
     return RedirectResponse("/settings?panel=notifications", status_code=303)
+
+
+@app.post("/settings/conversation-merge")
+def settings_conversation_merge(
+    request: Request,
+    merge_continuations_enabled: bool = Form(False),
+    merge_gap_minutes: int = Form(10),
+):
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    settings.update(
+        merge_continuations_enabled=merge_continuations_enabled,
+        merge_gap_minutes=merge_gap_minutes,
+    )
+    return RedirectResponse("/settings?panel=conversation-merge", status_code=303)
 
 
 @app.post("/settings/jarvis")

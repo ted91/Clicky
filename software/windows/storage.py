@@ -227,6 +227,11 @@ def add_pending(name: str, size: int, content_hash: str, wav_bytes: bytes) -> di
         "social_posts": {},  # {platform: {...}} -- see set_social_posts/update_social_post
         "notion_publication_page_id": None,  # set once push_social_posts() succeeds -- the ONE Publications page for this recording (sectioned per platform), see notion_sync.push_social_posts
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "merged_from": [],  # content_hashes absorbed into this record, see merge_recordings()
+        "merged_into": None,  # set on a record absorbed into another -- excluded from get_undistributed()/dashboard
+        "merged_wav_paths": [],  # extra wav_paths absorbed in (this record's own wav_path stays first), for playback continuity
+        "pre_merge_transcript": None,  # this record's transcript exactly as it was before the most recent merge, so unmerge_recording() can restore it exactly
+        "merge_checked": False,  # set True once poller.merge_continuations_once() has made its one decision for this record -- same one-shot-then-flag idempotency as the *_synced fields, so a "not a continuation" verdict isn't re-asked (and re-billed) every poll cycle
     }
     with _lock:
         records = _load()
@@ -267,6 +272,81 @@ def mark_processed(content_hash: str, transcript: str, segments,
         record["llm_provider"] = llm_provider
         record["error"] = None
         _save(records)
+
+
+def merge_recordings(keeper_hash: str, loser_hash: str, merged_transcript: str,
+                      merged_summary: dict, gap_seconds: int):
+    """Absorbs `loser_hash` into `keeper_hash` -- see
+    poller.merge_continuations_once/conversation_merge.py, which decides
+    WHETHER two recordings should merge (gap + type + LLM continuity
+    check); this function only does the mechanical merge once that
+    decision is made. Mirrors notion_sync.merge_person_pages's keeper/
+    loser shape: the loser's row stays in storage (audit trail, and so
+    unmerge_recording() has something to restore) but is excluded from
+    every destination's push queue and the dashboard via merged_into.
+
+    `merged_transcript`/`merged_summary` are supplied by the caller
+    (poller.py re-runs summarize() on the combined transcript, the same
+    call process_once() already makes) rather than computed here, since
+    storage.py has no business calling an LLM. The keeper's pre-merge
+    transcript is saved so a later unmerge_recording() can restore it
+    exactly rather than trying to reconstruct it by splitting the merged
+    text back apart."""
+    with _lock:
+        records = _load()
+        keeper = _find(records, keeper_hash)
+        loser = _find(records, loser_hash)
+        if keeper is None or loser is None:
+            return False
+        keeper["pre_merge_transcript"] = keeper["transcript"]
+        keeper["transcript"] = merged_transcript
+        keeper["summary"] = merged_summary
+        keeper["merged_from"].append(loser_hash)
+        keeper["merged_wav_paths"].append(loser["wav_path"])
+        keeper["merged_wav_paths"].extend(loser.get("merged_wav_paths") or [])
+        loser["merged_into"] = keeper_hash
+        _save(records)
+        return True
+
+
+def mark_merge_checked(content_hash: str):
+    """Flags a record as having had its one merge-continuation decision
+    made (merged or not) -- see merge_checked's field docstring on
+    add_pending. Called on BOTH outcomes so a "not a continuation" verdict
+    isn't re-asked every poll cycle."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return
+        record["merge_checked"] = True
+        _save(records)
+
+
+def unmerge_recording(keeper_hash: str, loser_hash: str) -> bool:
+    """Reverses merge_recordings(): restores the keeper's exact pre-merge
+    transcript (see merge_recordings' docstring on why this is stored
+    verbatim rather than reconstructed), and clears the loser's
+    merged_into plus its *_synced flags so distribute_once() pushes it as
+    its own document again next poll cycle. Does NOT re-run summarize()
+    here -- the caller (app.py's unmerge route) is responsible for that,
+    same division of responsibility as merge_recordings() above."""
+    with _lock:
+        records = _load()
+        keeper = _find(records, keeper_hash)
+        loser = _find(records, loser_hash)
+        if keeper is None or loser is None or loser.get("merged_into") != keeper_hash:
+            return False
+        if keeper["pre_merge_transcript"] is not None:
+            keeper["transcript"] = keeper["pre_merge_transcript"]
+            keeper["pre_merge_transcript"] = None
+        keeper["merged_from"] = [h for h in keeper["merged_from"] if h != loser_hash]
+        keeper["merged_wav_paths"] = [p for p in keeper["merged_wav_paths"] if p != loser["wav_path"]]
+        loser["merged_into"] = None
+        for field in ("notion_synced", "obsidian_synced"):
+            loser[field] = False
+        _save(records)
+        return True
 
 
 def mark_jarvis_processed(content_hash: str, transcript: str, jarvis_result: dict, stt_provider: str):
@@ -539,11 +619,14 @@ def merge_task_email_links(content_hash: str, links: list):
 
 def get_undistributed(destination: str):
     """Successfully processed recordings not yet pushed to `destination`
-    ("notion" or "obsidian")."""
+    ("notion" or "obsidian"). Excludes anything absorbed into another
+    recording via merge_recordings() (merged_into set) -- a merged-away
+    record has no content of its own left to push; the keeper it merged
+    into carries the combined content and gets pushed/re-pushed instead."""
     field = f"{destination}_synced"
     with _lock:
         records = _load()
-    return [r for r in records if r["status"] == "done" and not r.get(field)]
+    return [r for r in records if r["status"] == "done" and not r.get(field) and not r.get("merged_into")]
 
 
 def mark_failed(content_hash: str, error: str):

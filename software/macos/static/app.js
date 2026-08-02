@@ -626,6 +626,28 @@ document.getElementById("recordings").addEventListener("click", async (e) => {
     return;
   }
 
+  const unmergeBtn = e.target.closest(".unmerge-btn");
+  if (unmergeBtn) {
+    const keeperHash = unmergeBtn.dataset.keeperHash;
+    const loserHash = unmergeBtn.dataset.loserHash;
+    if (!confirm("Split this back into two separate recordings?")) return;
+
+    unmergeBtn.disabled = true;
+    try {
+      const resp = await fetch(`/recordings/${encodeURIComponent(keeperHash)}/unmerge/${encodeURIComponent(loserHash)}`, { method: "POST" });
+      if (!resp.ok) {
+        alert("Unmerge failed — check the pipeline log.");
+        unmergeBtn.disabled = false;
+        return;
+      }
+      location.reload();
+    } catch (e) {
+      alert("Unmerge failed — check the pipeline log.");
+      unmergeBtn.disabled = false;
+    }
+    return;
+  }
+
   const deviceBtn = e.target.closest(".delete-device-btn");
   if (deviceBtn) {
     const hash = deviceBtn.dataset.hash;
