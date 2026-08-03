@@ -955,6 +955,8 @@ def _settings_context(active_panel: str = "device", wifi_msg: str = "", saved: b
         "app_version": config.APP_VERSION,
         "bundled_firmware_version": update_check.get_bundled_firmware_version(),
         "device_firmware_version": poller.get_device_firmware_version(),
+        "firmware_push_pending": update_check.firmware_push_pending(
+            poller.get_device_firmware_version() or "0.0.0", update_check.get_bundled_firmware_version()),
     }
 
 

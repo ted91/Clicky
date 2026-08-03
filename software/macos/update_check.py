@@ -107,6 +107,20 @@ def get_bundled_firmware_version() -> str:
         return "0.0.0"
 
 
+def firmware_push_pending(device_version: str, bundled_version: str) -> bool:
+    """True only if the bundled firmware is actually newer than the
+    device's -- the correct comparison push_firmware_update_if_needed()
+    itself uses (line below), exposed here so the dashboard can show the
+    same true/false the real push logic will act on. Previously the
+    Settings page compared with a bare `!=`, which claimed a push was
+    coming any time the versions merely differed -- including when the
+    bundled firmware was OLDER (a real live case: after a manual `pio run
+    -t upload` outpaces the app's own bundled copy), which is scary and
+    wrong since push_firmware_update_if_needed() correctly declines to
+    downgrade in that case."""
+    return _parse_version(bundled_version) > _parse_version(device_version)
+
+
 def push_firmware_update_if_needed(base_url: str) -> bool:
     """Called opportunistically whenever the device is confirmed reachable
     over WiFi (see poller.py's _wifi_base_url_if_reachable) -- checks the

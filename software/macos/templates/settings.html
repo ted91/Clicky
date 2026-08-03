@@ -169,7 +169,7 @@
           <p class="step">
             App: {{ app_version }}<br>
             Device firmware: {{ device_firmware_version or "unknown (device not reachable over WiFi right now)" }}
-            {% if device_firmware_version and device_firmware_version != bundled_firmware_version %}
+            {% if firmware_push_pending %}
               — a firmware update ({{ bundled_firmware_version }}) will be pushed automatically next time the device is on WiFi.
             {% endif %}
           </p>
