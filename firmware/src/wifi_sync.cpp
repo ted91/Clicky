@@ -917,13 +917,27 @@ void wifi_sync_set_task_handle(TaskHandle_t handle) {
 }
 
 void wifi_sync_radio_on(const char *why) {
+    if (s_state != WifiState::OFF && s_state != WifiState::IDLE) {
+        // Already on (or mid-connect) -- this call is just a presence
+        // signal (e.g. ble_sync.cpp's onConnect() calls this on every BLE
+        // central connect while something's pending) confirming there's
+        // still something to sync, NOT genuine new HTTP activity. Must be
+        // a true no-op here -- live-confirmed incident: resetting
+        // s_radioOnMs/s_lastHttpMs on every one of these calls let a
+        // repeating BLE presence connect (nothing exotic -- any nearby
+        // device's background BLE activity can trigger this, not just the
+        // Mac) silently re-arm the inactivity bailout indefinitely, with
+        // zero real sync progress, while a stuck-pending recording (Mac
+        // unreachable, or a sync that never actually confirmed) kept
+        // wifi_sync_has_pending_recordings() true all night. WiFi never
+        // timed out, sleep never became eligible, ~80% of the battery
+        // drained overnight. Only a genuine OFF/IDLE -> connecting
+        // transition below should reset anything.
+        return;
+    }
     s_syncedRequested = false;
     s_radioOnMs = millis();
     s_lastHttpMs = s_radioOnMs;
-    if (s_state != WifiState::OFF && s_state != WifiState::IDLE) {
-        // Already on (or mid-connect) -- just extend the session window.
-        return;
-    }
     if (s_ssid.isEmpty()) {
         Serial.println("wifi_sync: radio-on requested but no credentials -- staying off");
         return;
