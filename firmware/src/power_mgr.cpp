@@ -23,6 +23,21 @@ static bool s_onExternalPower = false;
 static uint32_t s_aboveThresholdSinceMs = 0;
 static uint32_t s_belowThresholdSinceMs = 0;
 
+// Live-confirmed incident: a fully-charged LiPo rests near/above this
+// threshold for a long time after actually being unplugged (LiPo voltage
+// sags very slowly at rest right after a full charge, unlike under load) --
+// a user left the device on battery overnight and it stayed on WiFi with
+// sleep completely blocked the entire time, draining ~80% of the battery.
+// Both the sleep-eligibility gate (main.cpp's sleepWatchTask) and the
+// WiFi-radio-off gate (wifi_sync.cpp's radioTick) were checking the raw
+// power_mgr_on_external_power() signal, which has no way to self-correct
+// once the reading gets stuck above threshold. This ceiling bounds that:
+// once "on external power" has read continuously true for this long, stop
+// trusting it for gating purposes (battery-saving resumes) even though the
+// voltage may still read high -- see power_mgr_external_power_override_active().
+static const uint32_t EXTERNAL_POWER_OVERRIDE_CEILING_MS = 30 * 60 * 1000; // 30min
+static uint32_t s_onExternalPowerSinceMs = 0;
+
 void power_mgr_init() {
     s_bootMs = millis();
     analogReadResolution(12);
@@ -58,6 +73,12 @@ bool power_mgr_on_external_power() {
     return s_onExternalPower;
 }
 
+bool power_mgr_external_power_override_active() {
+    if (!s_onExternalPower) return false;
+    if (s_onExternalPowerSinceMs == 0) return true; // just flipped this tick, not yet timed
+    return millis() - s_onExternalPowerSinceMs < EXTERNAL_POWER_OVERRIDE_CEILING_MS;
+}
+
 void power_mgr_tick() {
     uint32_t mv = power_mgr_battery_mv();
     uint32_t now = millis();
@@ -66,6 +87,7 @@ void power_mgr_tick() {
         if (s_aboveThresholdSinceMs == 0) s_aboveThresholdSinceMs = now;
         if (!s_onExternalPower && now - s_aboveThresholdSinceMs > EXTERNAL_POWER_DEBOUNCE_MS) {
             s_onExternalPower = true;
+            s_onExternalPowerSinceMs = now;
             Serial.println("power: external power detected (battery voltage held high) -- disabling battery-saving behavior");
         }
     } else {
@@ -73,6 +95,7 @@ void power_mgr_tick() {
         if (s_belowThresholdSinceMs == 0) s_belowThresholdSinceMs = now;
         if (s_onExternalPower && now - s_belowThresholdSinceMs > EXTERNAL_POWER_DEBOUNCE_MS) {
             s_onExternalPower = false;
+            s_onExternalPowerSinceMs = 0;
             Serial.println("power: external power no longer detected -- resuming battery-saving behavior");
         }
     }

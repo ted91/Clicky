@@ -950,8 +950,12 @@ void wifi_sync_tick() {
     // On external power (charging/plugged in), there's no battery draw to
     // avoid -- skip the session-end logic entirely and just stay
     // connected, matching how the device behaved before any of this radio
-    // gating existed.
-    if (s_state != WifiState::OFF && !s_transferInProgress && !power_mgr_on_external_power()) {
+    // gating existed. Uses the ceiling-bounded override, not the raw
+    // signal -- see power_mgr_external_power_override_active()'s doc
+    // comment for the live incident (all-night WiFi, ~80% battery drain)
+    // this fixes: a misdetected "still on power" reading must not be able
+    // to keep the radio on forever.
+    if (s_state != WifiState::OFF && !s_transferInProgress && !power_mgr_external_power_override_active()) {
         if (s_syncedRequested && millis() - s_syncedAtMs > SYNCED_LINGER_MS) {
             wifi_sync_radio_off("mac confirmed sync complete");
         } else if (millis() - s_lastHttpMs > SYNC_INACTIVITY_MS &&

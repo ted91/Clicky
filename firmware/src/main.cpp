@@ -444,10 +444,18 @@ static void sleepWatchTask(void *arg) {
         // signal. !power_mgr_boot_grace_period_active() is belt-and-braces
         // so an early BLE connect can't arm the countdown before there's a
         // real chance to intervene.
+        // !power_mgr_external_power_override_active() -- NOT the raw
+        // power_mgr_on_external_power() signal. Live-confirmed incident: a
+        // fully-charged battery can read "on external power" for hours
+        // after actually being unplugged (see that function's doc
+        // comment), which permanently blocked sleep here and drained
+        // ~80% of the battery overnight. The bounded override still
+        // blocks sleep for a real charging session, just not forever off
+        // a stale reading.
         bool eligible = s_state == AppState::IDLE &&
                         !wifi_sync_radio_is_on() &&
                         !ble_sync_is_connected() &&
-                        !power_mgr_on_external_power() &&
+                        !power_mgr_external_power_override_active() &&
                         !power_mgr_usb_host_attached() &&
                         !power_mgr_boot_grace_period_active() &&
                         !face_notification_active();

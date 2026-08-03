@@ -49,6 +49,24 @@ int power_mgr_battery_pct(); // 0-100, 4.2V=100 down a LiPo curve to 3.3V=0
 // reason to save battery power that isn't being spent from the battery.
 bool power_mgr_on_external_power();
 
+// Same signal as power_mgr_on_external_power(), but with a safety ceiling
+// (30min) on how long it can override battery-saving behavior -- use THIS,
+// not the raw signal, for anything that gates sleep or the WiFi radio-off
+// logic. Live-confirmed incident: a fully-charged LiPo can rest above the
+// detection threshold for hours after actually being unplugged (voltage
+// sags very slowly at rest right after a full charge), during which the
+// raw signal has no way to self-correct -- a user's device stayed on WiFi
+// with sleep permanently blocked all night, draining ~80% of the battery.
+// This bounds the worst case: once "on external power" has read
+// continuously true past the ceiling, sleep/radio-off resume regardless of
+// what the voltage still reads, until a genuine subsequent charge cycle
+// (voltage actually drops below threshold, then rises again) re-arms it.
+// Purely for gating -- power_mgr_on_external_power() itself is unchanged
+// and still the right call for telemetry/UI (dashboard "on power" badge),
+// where continuing to report the raw reading is correct even past the
+// ceiling.
+bool power_mgr_external_power_override_active();
+
 // Call periodically (e.g. from indicatorTask's 1s tick) to update the
 // external-power debounce state.
 void power_mgr_tick();
