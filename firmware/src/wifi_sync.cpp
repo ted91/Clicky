@@ -972,7 +972,18 @@ void wifi_sync_tick() {
     // comment for the live incident (all-night WiFi, ~80% battery drain)
     // this fixes: a misdetected "still on power" reading must not be able
     // to keep the radio on forever.
-    if (s_state != WifiState::OFF && !s_transferInProgress && !power_mgr_external_power_override_active()) {
+    //
+    // Also skip it entirely while a USB host is attached -- sleepWatchTask
+    // already refuses to sleep at all in that state (see
+    // power_mgr_usb_host_attached()'s doc comment, the USB-flashing-brick
+    // fix), so there's no battery being saved by forcing WiFi off here
+    // either; USB power covers the draw. No ceiling needed the way
+    // external power has one: unlike battery-voltage inference, "is a USB
+    // host physically attached" is a real, unambiguous hardware signal
+    // (IDF's usb_serial_jtag_is_connected()), so it can't get stuck the
+    // same way a misdetected voltage reading can.
+    if (s_state != WifiState::OFF && !s_transferInProgress &&
+        !power_mgr_external_power_override_active() && !power_mgr_usb_host_attached()) {
         if (s_syncedRequested && millis() - s_syncedAtMs > SYNCED_LINGER_MS) {
             wifi_sync_radio_off("mac confirmed sync complete");
         } else if (millis() - s_lastHttpMs > s_activeInactivityMs &&
