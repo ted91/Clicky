@@ -465,8 +465,28 @@ static void sleepWatchTask(void *arg) {
         // local SD opendir scan, no radio cost either way.
         bool pending = wifi_sync_has_pending_recordings();
 
+        // Diagnostic only -- prints every ~30s whenever deep sleep hasn't
+        // fired yet, breaking out every individual condition instead of
+        // just the pass/fail `eligible` bool. Added after a live report
+        // ("BLE/WiFi both off, recording synced, but still never reaches
+        // deep sleep") that a pass/fail log alone couldn't diagnose --
+        // this makes the actual blocking condition visible on the next
+        // occurrence instead of another guess-and-fix cycle.
+        static uint32_t s_lastDiagMs = 0;
+        if (!(eligible && !pending && power_mgr_deep_sleep_fallback_due()) &&
+            millis() - s_lastDiagMs > 30000) {
+            s_lastDiagMs = millis();
+            Serial.printf(
+                "diag: sleep blocked -- state=%d wifi_on=%d ble_conn=%d ext_pwr=%d "
+                "usb=%d boot_grace=%d notif=%d pending=%d idle_ms=%lu/%lu(deep)\n",
+                (int)s_state, wifi_sync_radio_is_on(), ble_sync_is_connected(),
+                power_mgr_external_power_override_active(), power_mgr_usb_host_attached(),
+                power_mgr_boot_grace_period_active(), face_notification_active(),
+                pending, (unsigned long)power_mgr_ms_since_activity(), 10UL * 60 * 1000);
+        }
+
         if (eligible && !pending && power_mgr_deep_sleep_fallback_due()) {
-            Serial.println("main: 20min genuinely idle, nothing pending -- falling back to deep sleep");
+            Serial.println("main: 10min genuinely idle, nothing pending -- falling back to deep sleep");
             // "Sleeping..." draw is deliberately ONLY on this rare, long-idle
             // path, not on the routine light-sleep tier below -- light sleep
             // is meant to stay instant/invisible; a ~580ms refresh here is a

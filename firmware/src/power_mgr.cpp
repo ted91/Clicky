@@ -139,7 +139,7 @@ static const uint64_t DEEP_SLEEP_TIMER_WAKE_INTERVAL_US = 20ULL * 60 * 1000000; 
 // this much continuous idle time -- explicit threshold, not a guess: light
 // sleep's actual battery draw isn't proven equal to deep sleep's on this
 // board, so don't pay it indefinitely once nobody's using the device.
-static const uint32_t DEEP_SLEEP_FALLBACK_MS = 20 * 60 * 1000; // 20 min
+static const uint32_t DEEP_SLEEP_FALLBACK_MS = 10 * 60 * 1000; // 10 min (was 20)
 
 // Never sleep within this long of boot, regardless of activity -- belt-
 // and-braces for the battery-only case: a BLE connect from the Mac's own
@@ -186,6 +186,11 @@ bool power_mgr_idle_timeout_reached() {
 bool power_mgr_deep_sleep_fallback_due() {
     if (s_lastActivityMs == 0) return false; // not yet initialized this boot
     return millis() - s_lastActivityMs > DEEP_SLEEP_FALLBACK_MS;
+}
+
+uint32_t power_mgr_ms_since_activity() {
+    if (s_lastActivityMs == 0) return 0;
+    return millis() - s_lastActivityMs;
 }
 
 void power_mgr_enter_deep_sleep() {

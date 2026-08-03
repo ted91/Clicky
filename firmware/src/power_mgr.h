@@ -105,7 +105,7 @@ void power_mgr_note_activity();
 // this function only knows about the idle clock, not app state.
 bool power_mgr_idle_timeout_reached();
 
-// True once a much longer stretch (DEEP_SLEEP_FALLBACK_MS, 20min) has
+// True once a much longer stretch (DEEP_SLEEP_FALLBACK_MS, 10min) has
 // passed with no REAL activity noted -- deliberately the same idle clock
 // power_mgr_note_activity() drives, NOT reset by a routine light-sleep
 // TIMER wake (see sleepWatchTask -- only a genuine button wake calls
@@ -114,6 +114,13 @@ bool power_mgr_idle_timeout_reached();
 // idle period, since light sleep's battery draw isn't proven equal to
 // deep sleep's on this board.
 bool power_mgr_deep_sleep_fallback_due();
+
+// Milliseconds since the last power_mgr_note_activity() call this boot (0
+// if none yet) -- diagnostic only, so sleepWatchTask can log exactly how
+// close it is to power_mgr_deep_sleep_fallback_due() instead of just a
+// pass/fail bool, the only way to actually see which condition is
+// blocking deep sleep on a real device instead of guessing.
+uint32_t power_mgr_ms_since_activity();
 
 // Configures both wake sources (BOOT/PWR buttons via ext1, and a timer for
 // the duty-cycled BLE reconnect window) and calls esp_deep_sleep_start().
