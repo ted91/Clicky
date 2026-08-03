@@ -525,28 +525,37 @@ static void sleepWatchTask(void *arg) {
             } else {
                 // TIMER wake. Walk-in-range auto-sync: BLE connecting is a
                 // low-cost PRESENCE SIGNAL that triggers a WiFi attempt --
-                // see ble_sync.cpp's onConnect() for the other half of this
-                // (BLE connection -> wifi_sync_radio_on()). The two
-                // transports are sequential, not concurrent: WiFi and BLE
-                // share the same physical radio on this SoC, so running
-                // both as active sync channels at once would just make
-                // them contend for the same hardware, not truly
-                // parallelize. WiFi becomes the sole active transport once
-                // it connects; BLE (already open) is only the actual
-                // bearer if WiFi fails to connect.
+                // ble_sync.cpp's onConnect() is the ONLY thing that turns
+                // WiFi on here, and only once a BLE central actually
+                // connects (presenceConfirmed=true there, short 10s
+                // inactivity window since presence is already known, not
+                // hoped for). This code just opens the BLE window and
+                // waits -- it must NOT also blindly call
+                // wifi_sync_radio_on() itself, which was a live-confirmed
+                // bug: that turned WiFi on unconditionally every ~5min
+                // whenever anything was pending, with zero confirmation
+                // anyone was even in range, directly contributing to an
+                // overnight battery drain incident. The two transports
+                // are sequential, not concurrent: WiFi and BLE share the
+                // same physical radio on this SoC, so running both as
+                // active sync channels at once would just make them
+                // contend for the same hardware, not truly parallelize.
+                // WiFi becomes the sole active transport once it connects;
+                // BLE (already open) is only the actual bearer if WiFi
+                // fails to connect.
                 face_clear_status();
                 if (pending) {
-                    Serial.println("main: TIMER wake -- pending recordings, opening BLE window + checking WiFi reachability");
+                    Serial.println("main: TIMER wake -- pending recordings, opening BLE window to check for a nearby sync partner");
                     ble_sync_resume_advertising_after_sleep();
-                    if (!wifi_sync_radio_is_on()) {
-                        wifi_sync_radio_on("pending recordings, WiFi reachable check");
-                    }
                     // Brief hold so the window is actually visible to a
                     // scanning Mac -- without this, the very next 1s loop
                     // tick re-evaluates eligibility (idle timeout already
                     // exceeded) and re-enters light sleep almost
                     // immediately, giving advertising ~1s of real
-                    // visibility instead of a real window.
+                    // visibility instead of a real window. If a central
+                    // connects during this hold, ble_sync.cpp's onConnect()
+                    // fires wifi_sync_radio_on() on its own -- nothing
+                    // further needed here either way.
                     vTaskDelay(pdMS_TO_TICKS(8000));
                 }
                 // else: nothing pending -- stay paused, let the idle clock

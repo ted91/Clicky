@@ -531,7 +531,11 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         // transfer path) if WiFi fails to connect. Gated on having
         // something to sync -- no reason to bring WiFi up otherwise.
         if (wifi_sync_has_pending_recordings()) {
-            wifi_sync_radio_on("BLE central connected");
+            // presenceConfirmed=true -- a real BLE connection just proved a
+            // sync partner is actually here right now, so this WiFi
+            // session uses the short 10s inactivity window instead of the
+            // full 120s one (see wifi_sync_radio_on()'s doc comment).
+            wifi_sync_radio_on("BLE central connected", /*presenceConfirmed=*/true);
         }
         if (s_pairingActive) {
             s_pairingActive = false;

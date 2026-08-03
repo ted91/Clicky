@@ -78,8 +78,18 @@ bool wifi_sync_is_transferring();
 // The radio is OFF by default. wifi_sync_radio_on() starts a bounded "sync
 // session" (called by main.cpp when a recording finishes, and internally
 // when credentials change); it ends when the Mac POSTs /synced or after
-// 120s with no HTTP traffic. `why` is for the serial log.
-void wifi_sync_radio_on(const char *why);
+// the no-HTTP-traffic inactivity window elapses. `why` is for the serial
+// log.
+//
+// `presenceConfirmed`: true ONLY when something has already confirmed a
+// sync partner is actually in range right now (currently: ble_sync.cpp's
+// onConnect(), a real BLE central connection) -- uses a much shorter
+// inactivity window (WIFI_QUICK_INACTIVITY_MS, 10s) since there's no
+// reason to wait out the full window for an HTTP hit when presence is
+// already known, not merely hoped for. Leave false (default) for every
+// other trigger (new recording saved, credentials changed) -- those have
+// no such confirmation, so they get the full, more patient window.
+void wifi_sync_radio_on(const char *why, bool presenceConfirmed = false);
 void wifi_sync_radio_off(const char *why);
 bool wifi_sync_radio_is_on();
 

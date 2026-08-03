@@ -61,7 +61,9 @@ static uint32_t s_radioOnMs = 0;                // when the current session star
 static uint32_t s_lastHttpMs = 0;               // last served HTTP request
 static volatile bool s_syncedRequested = false; // POST /synced arrived
 static uint32_t s_syncedAtMs = 0;
-static const uint32_t SYNC_INACTIVITY_MS = 120000; // no-HTTP fallback timeout
+static const uint32_t SYNC_INACTIVITY_MS = 120000;       // no-HTTP fallback timeout (unconfirmed presence)
+static const uint32_t WIFI_QUICK_INACTIVITY_MS = 10000;  // same, but for a BLE-presence-confirmed session -- see wifi_sync_radio_on()
+static uint32_t s_activeInactivityMs = SYNC_INACTIVITY_MS; // which window the CURRENT session uses
 static const uint32_t SYNCED_LINGER_MS = 2000;     // let the /synced response flush
 
 // Set only once an HTTP request has actually been served over the CURRENT
@@ -916,7 +918,7 @@ void wifi_sync_set_task_handle(TaskHandle_t handle) {
     s_wifiTaskHandle = handle;
 }
 
-void wifi_sync_radio_on(const char *why) {
+void wifi_sync_radio_on(const char *why, bool presenceConfirmed) {
     if (s_state != WifiState::OFF && s_state != WifiState::IDLE) {
         // Already on (or mid-connect) -- this call is just a presence
         // signal (e.g. ble_sync.cpp's onConnect() calls this on every BLE
@@ -938,6 +940,7 @@ void wifi_sync_radio_on(const char *why) {
     s_syncedRequested = false;
     s_radioOnMs = millis();
     s_lastHttpMs = s_radioOnMs;
+    s_activeInactivityMs = presenceConfirmed ? WIFI_QUICK_INACTIVITY_MS : SYNC_INACTIVITY_MS;
     if (s_ssid.isEmpty()) {
         Serial.println("wifi_sync: radio-on requested but no credentials -- staying off");
         return;
@@ -972,8 +975,8 @@ void wifi_sync_tick() {
     if (s_state != WifiState::OFF && !s_transferInProgress && !power_mgr_external_power_override_active()) {
         if (s_syncedRequested && millis() - s_syncedAtMs > SYNCED_LINGER_MS) {
             wifi_sync_radio_off("mac confirmed sync complete");
-        } else if (millis() - s_lastHttpMs > SYNC_INACTIVITY_MS &&
-                   millis() - s_radioOnMs > SYNC_INACTIVITY_MS) {
+        } else if (millis() - s_lastHttpMs > s_activeInactivityMs &&
+                   millis() - s_radioOnMs > s_activeInactivityMs) {
             wifi_sync_radio_off("sync window timed out with no HTTP activity");
         }
     }
