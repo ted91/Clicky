@@ -452,17 +452,41 @@ static void sleepWatchTask(void *arg) {
         // ~80% of the battery overnight. The bounded override still
         // blocks sleep for a real charging session, just not forever off
         // a stale reading.
+        // !face_notification_blocks_sleep() -- NOT the raw
+        // face_notification_active() signal. Live-confirmed incident: a
+        // device left alone for hours never slept at all because a single
+        // undismissed AI-pager notification (Gmail/Calendar/Mac -- see
+        // notifications.py) has no auto-dismiss, and face_notification_
+        // active() has no timeout either. The bounded version still blocks
+        // sleep for a real, freshly-shown notification (giving the user a
+        // genuine chance to notice it), just not forever off one nobody
+        // was there to dismiss -- see that function's own doc comment.
         bool eligible = s_state == AppState::IDLE &&
                         !wifi_sync_radio_is_on() &&
                         !ble_sync_is_connected() &&
                         !power_mgr_external_power_override_active() &&
                         !power_mgr_usb_host_attached() &&
                         !power_mgr_boot_grace_period_active() &&
-                        !face_notification_active();
+                        !face_notification_blocks_sleep();
 
-        // Computed once per iteration -- drives both the deep-sleep-fallback
-        // gate and the light-sleep TIMER-wake behavior below. Cheap: a
-        // local SD opendir scan, no radio cost either way.
+        // Computed once per iteration -- drives the light-sleep TIMER-wake
+        // behavior below (whether to open a periodic BLE check-in window).
+        // Cheap: a local SD opendir scan, no radio cost either way.
+        //
+        // Deliberately NOT used to gate the deep-sleep fallback below
+        // anymore -- live-confirmed regression: wifi_sync_has_pending_
+        // recordings() (see its own doc comment in wifi_sync.cpp) checks
+        // "does any .wav file exist on SD," and SD recordings are a
+        // PERMANENT archive by design -- the device never deletes them
+        // once synced. So for any device with real recording history,
+        // this is essentially always true, forever, which made the old
+        // `eligible && !pending && ...` deep-sleep condition permanently
+        // unreachable the moment the two-tier light/deep sleep redesign
+        // introduced it this session (confirmed: deep sleep worked fine
+        // before that redesign, which had no such gate at all). "Pending"
+        // here answers "is there SD data at all," not "is there anything
+        // still unsynced" -- the wrong question for deciding whether it's
+        // safe to deep-sleep.
         bool pending = wifi_sync_has_pending_recordings();
 
         // Diagnostic only -- prints every ~30s whenever deep sleep hasn't
@@ -473,20 +497,20 @@ static void sleepWatchTask(void *arg) {
         // this makes the actual blocking condition visible on the next
         // occurrence instead of another guess-and-fix cycle.
         static uint32_t s_lastDiagMs = 0;
-        if (!(eligible && !pending && power_mgr_deep_sleep_fallback_due()) &&
+        if (!(eligible && power_mgr_deep_sleep_fallback_due()) &&
             millis() - s_lastDiagMs > 30000) {
             s_lastDiagMs = millis();
             Serial.printf(
                 "diag: sleep blocked -- state=%d wifi_on=%d ble_conn=%d ext_pwr=%d "
-                "usb=%d boot_grace=%d notif=%d pending=%d idle_ms=%lu/%lu(deep)\n",
+                "usb=%d boot_grace=%d notif=%d pending(SD-has-any-wav)=%d idle_ms=%lu/%lu(deep)\n",
                 (int)s_state, wifi_sync_radio_is_on(), ble_sync_is_connected(),
                 power_mgr_external_power_override_active(), power_mgr_usb_host_attached(),
-                power_mgr_boot_grace_period_active(), face_notification_active(),
+                power_mgr_boot_grace_period_active(), face_notification_blocks_sleep(),
                 pending, (unsigned long)power_mgr_ms_since_activity(), 10UL * 60 * 1000);
         }
 
-        if (eligible && !pending && power_mgr_deep_sleep_fallback_due()) {
-            Serial.println("main: 10min genuinely idle, nothing pending -- falling back to deep sleep");
+        if (eligible && power_mgr_deep_sleep_fallback_due()) {
+            Serial.println("main: 10min genuinely idle -- falling back to deep sleep");
             // "Sleeping..." draw is deliberately ONLY on this rare, long-idle
             // path, not on the routine light-sleep tier below -- light sleep
             // is meant to stay instant/invisible; a ~580ms refresh here is a

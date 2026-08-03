@@ -301,6 +301,11 @@ static bool s_notifActive = false;
 static int s_notifSeq = 0;
 static char s_notifTitle[48] = "";
 static char s_notifBody[128] = "";
+static uint32_t s_notifShownAtMs = 0;
+// See face_notification_blocks_sleep()'s doc comment (face.h) for why this
+// exists -- bounds how long an undismissed notification can keep the
+// device from sleeping, separate from how long it stays visually shown.
+static const uint32_t NOTIF_SLEEP_BLOCK_CEILING_MS = 5 * 60 * 1000; // 5 min
 
 static void drawNotification() {
     // Title band: scale 2, up to ~2 wrapped lines. Body below at scale 1
@@ -726,11 +731,17 @@ void face_show_notification(const char *title, const char *body) {
     snprintf(s_notifTitle, sizeof(s_notifTitle), "%s", title ? title : "");
     snprintf(s_notifBody, sizeof(s_notifBody), "%s", body ? body : "");
     s_notifActive = true;
+    s_notifShownAtMs = millis();
     s_notifSeq = (s_notifSeq + 1) % 500; // stays within the 2000..2499 encoding band
 }
 
 bool face_notification_active() {
     return s_notifActive;
+}
+
+bool face_notification_blocks_sleep() {
+    if (!s_notifActive) return false;
+    return millis() - s_notifShownAtMs < NOTIF_SLEEP_BLOCK_CEILING_MS;
 }
 
 void face_dismiss_notification() {

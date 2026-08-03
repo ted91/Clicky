@@ -109,4 +109,20 @@ void face_show_notification(const char *title, const char *body);
 bool face_notification_active();
 void face_dismiss_notification();
 
+// True only while a shown-but-undismissed notification is within its
+// sleep-blocking window (NOTIF_SLEEP_BLOCK_CEILING_MS since it was shown)
+// -- use THIS, not the raw face_notification_active(), for anything that
+// gates sleep. Live-confirmed incident: a device left alone for 3 hours
+// never reached deep sleep at all -- face_notification_active() has no
+// timeout, so a single undismissed AI-pager push (Gmail/Calendar/Mac
+// notification -- see notifications.py) kept the device fully awake
+// indefinitely, with nothing else in the sleep logic at fault. This
+// bounds that: after the ceiling, sleep resumes regardless of whether the
+// notification was ever dismissed. Nothing is lost visually -- the
+// e-paper holds whatever was last drawn whether the device is asleep or
+// awake, so the notification stays exactly as visible either way; this
+// only stops it from silently draining the battery for hours after the
+// user had a real chance to see and dismiss it.
+bool face_notification_blocks_sleep();
+
 #endif
