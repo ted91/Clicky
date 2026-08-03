@@ -64,6 +64,55 @@ _wifi_probe = {"base_url": None, "last_check": 0.0, "reachable": False}
 _FIRMWARE_PUSH_CHECK_INTERVAL_SECONDS = 300
 _last_firmware_push_check = 0.0
 
+# --- BLE quiet period (device deep-sleep enablement) ----------------------
+# Live-confirmed bug: "device stays in light sleep but never enters deep
+# sleep, BLE connected forever, even with nothing to sync."
+#
+# The firmware's deep-sleep tier requires DEEP_SLEEP_FALLBACK_MS (20 min)
+# with no activity -- and ble_sync.cpp's onConnect() calls
+# power_mgr_note_activity(), which RESETS that idle clock on every single
+# BLE connection. Meanwhile this app polled an idle device over BLE every
+# POLL_INTERVAL_SECONDS (3s), and _wifi_base_url_if_reachable() opened its
+# own BLE connection every _WIFI_PROBE_INTERVAL_SECONDS (15s) just to ask
+# "are you on WiFi?" -- which is exactly the question whose answer is "no"
+# whenever the device is idle, since it keeps WiFi off to save battery.
+#
+# Net effect: the device's 20-minute idle clock was reset every few
+# seconds, so the deep-sleep threshold was mathematically unreachable. The
+# Mac was holding the device awake. Simply releasing the connection after
+# each poll is NOT sufficient -- it's the reconnect that resets the clock.
+#
+# So once a poll confirms the device has nothing to sync, back off BLE
+# entirely for this long, giving the firmware a long uninterrupted stretch
+# to run its idle clock down and reach deep sleep. Deliberately matched to
+# the firmware's own pending-advertising cadence (PENDING_TIMER_WAKE_
+# INTERVAL_US, 5 min) so the two sides check in on the same rhythm rather
+# than fighting each other.
+#
+# Costs nothing in responsiveness for the case that matters: when the user
+# actually records something, the firmware turns its OWN WiFi on
+# ("recording saved" -> wifi_sync_radio_on), and the WiFi path here is a
+# plain cheap HTTP probe that never touches BLE.
+_BLE_QUIET_PERIOD_SECONDS = 300  # 5 min
+_ble_quiet_until = 0.0  # monotonic deadline; 0 = no quiet period active
+
+
+def _ble_is_quiet() -> bool:
+    """True while we're deliberately staying off BLE so the device can
+    reach deep sleep -- see _BLE_QUIET_PERIOD_SECONDS above."""
+    return time.monotonic() < _ble_quiet_until
+
+
+def _start_ble_quiet_period():
+    global _ble_quiet_until
+    _ble_quiet_until = time.monotonic() + _BLE_QUIET_PERIOD_SECONDS
+
+
+def _end_ble_quiet_period():
+    """Called when there's real work again -- go back to responsive polling."""
+    global _ble_quiet_until
+    _ble_quiet_until = 0.0
+
 
 def _http_reachable(base_url: str) -> bool:
     try:
@@ -116,6 +165,14 @@ def _wifi_base_url_if_reachable():
     # what covers the much more common "already on WiFi, just restarted"
     # case instead.
     discovered = None
+    if _ble_is_quiet():
+        # Don't open BLE just to ask "are you on WiFi?" during the quiet
+        # period -- that connection alone resets the device's idle clock
+        # and blocks deep sleep (see _BLE_QUIET_PERIOD_SECONDS). The answer
+        # is reliably "no" here anyway: the device keeps WiFi off while
+        # idle, which is precisely when a quiet period is running.
+        _wifi_probe.update(base_url=None, last_check=now, reachable=False)
+        return None
     try:
         import ble_device_client
         wifi_status = ble_device_client.get_wifi_status()
@@ -236,16 +293,27 @@ def _get_transport():
 
 async def sync_once():
     transport = _get_transport()
+    # BLE transport only (device_client/WiFi has no connection to release).
+    over_ble = getattr(transport, "release_connection", None) is not None
+    if over_ble and _ble_is_quiet():
+        # Deliberately skipping this poll entirely so the device's idle
+        # clock can run down to deep sleep -- see _BLE_QUIET_PERIOD_SECONDS.
+        return
     status.update(device_connecting=True)
     try:
         recordings = await asyncio.to_thread(transport.list_recordings)
     except Exception as e:
         log.warning("could not reach device via %s: %s", config.SYNC_TRANSPORT, e)
         status.update(device_connecting=False, device_connected=False)
+        if over_ble:
+            # Unreachable over BLE (asleep / out of range) -- back off too,
+            # rather than retrying a scan every 3s forever.
+            _start_ble_quiet_period()
         return
     status.update(device_connecting=False, device_connected=True)
     if recordings:  # avoid spamming the log every 3s when there's nothing to report
         log.info("device /list: %s", recordings)
+        _end_ble_quiet_period()  # real work -- go back to responsive polling
     else:
         # Nothing on the device to sync -- release the persistent BLE
         # connection instead of holding it open until the next poll
@@ -268,12 +336,16 @@ async def sync_once():
         # next call lazily reconnects (see _ensure_connected). BLE remains
         # continuously reachable from the device's side via its own periodic
         # advertising window, so this doesn't cost discoverability.
-        release = getattr(transport, "release_connection", None)
-        if release:  # BLE transport only -- device_client (WiFi) has no such handle to drop
+        if over_ble:
             try:
-                await asyncio.to_thread(release)
+                await asyncio.to_thread(transport.release_connection)
             except Exception as e:
                 log.debug("BLE release after idle poll failed (non-fatal): %s", e)
+            # Releasing alone is NOT enough: it's the RECONNECT that resets
+            # the device's idle clock (ble_sync.cpp onConnect ->
+            # power_mgr_note_activity), so without this backoff we'd just
+            # reconnect 3s later and block deep sleep exactly as before.
+            _start_ble_quiet_period()
 
     # Jarvis voice commands (cmd_*.wav) download first -- a live, waited-on
     # interaction, unlike a memo/meeting recording processed in the
@@ -2637,6 +2709,15 @@ def check_notifications_once():
         transport = _get_transport()
     except Exception as e:
         log.warning("notifications check failed: could not resolve transport: %s", e)
+        return
+    # Same BLE quiet-period rule as sync_once(): pushing a notification over
+    # BLE means connecting, and every connect resets the device's idle clock
+    # and blocks deep sleep. Notifications are already retry-on-next-cycle by
+    # design (see this function's docstring -- _push() only marks one "seen"
+    # once the send actually succeeds), so deferring one to the end of the
+    # quiet period costs nothing but a few minutes of latency on a pager
+    # push, and only while the device is idle enough to be asleep anyway.
+    if getattr(transport, "release_connection", None) is not None and _ble_is_quiet():
         return
     try:
         notifications.check_once(transport)
