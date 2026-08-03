@@ -246,6 +246,34 @@ async def sync_once():
     status.update(device_connecting=False, device_connected=True)
     if recordings:  # avoid spamming the log every 3s when there's nothing to report
         log.info("device /list: %s", recordings)
+    else:
+        # Nothing on the device to sync -- release the persistent BLE
+        # connection instead of holding it open until the next poll
+        # reconnects it 3s later, forever.
+        #
+        # Live-confirmed bug (reported: "device never enters deep sleep,
+        # BLE connected forever, even with nothing to sync"): the firmware's
+        # sleep-eligibility check includes !ble_sync_is_connected(), and on
+        # battery the device keeps WiFi off, so _get_transport() picks BLE
+        # every idle cycle. ble_device_client holds a PERSISTENT connection
+        # (_ensure_connected() reconnects lazily and never hangs up on its
+        # own), and release_connection() was only ever called on the WiFi
+        # branch of _get_transport(). Net effect: an idle device with
+        # nothing pending was reconnected every POLL_INTERVAL_SECONDS
+        # indefinitely, so the deep-sleep tier could never be reached --
+        # the Mac was holding it awake, not the firmware failing to sleep.
+        #
+        # Safe to drop here: this branch means the device has nothing to
+        # offer, so there's no in-flight transfer to interrupt, and the very
+        # next call lazily reconnects (see _ensure_connected). BLE remains
+        # continuously reachable from the device's side via its own periodic
+        # advertising window, so this doesn't cost discoverability.
+        release = getattr(transport, "release_connection", None)
+        if release:  # BLE transport only -- device_client (WiFi) has no such handle to drop
+            try:
+                await asyncio.to_thread(release)
+            except Exception as e:
+                log.debug("BLE release after idle poll failed (non-fatal): %s", e)
 
     # Jarvis voice commands (cmd_*.wav, see recorder.cpp) download first --
     # a command is a live, waited-on interaction, unlike a memo/meeting
