@@ -514,15 +514,19 @@ static void sleepWatchTask(void *arg) {
             // "Sleeping..." draw is deliberately ONLY on this rare, long-idle
             // path, not on the routine light-sleep tier below -- light sleep
             // is meant to stay instant/invisible; a ~580ms refresh here is a
-            // non-issue since this only fires after 20 minutes of nothing.
-            face_show_notification("Sleeping...", "");
-            face_update(false); // synchronous, on this task's own stack --
-                                 // must complete before the chip halts, and
-                                 // faceTask's own core halts too during sleep.
-            // Leave whatever's currently on the panel (idle smiley, status
-            // face) as the last image -- e-paper holds it unpowered, and
-            // drawing something new here would cost a visible refresh for
-            // a state nobody's necessarily watching happen.
+            // non-issue since this only fires after 10 minutes of nothing.
+            // One guaranteed synchronous draw, then the panel is latched so
+            // faceTask's next 200ms tick can't repaint the idle smiley over
+            // it in the window before the chip halts. Returns only once the
+            // e-paper refresh has physically completed (it blocks on the
+            // panel's BUSY line), so cutting EPD power right below is safe.
+            // Was face_show_notification()+face_update(), which could
+            // silently skip the draw -- see face_show_sleeping_screen().
+            face_show_sleeping_screen();
+            // Safe to cut the panel's power now: the call above returned
+            // only after the refresh physically completed, and e-paper
+            // holds its last image unpowered -- "Sleeping..." stays on
+            // screen for the entire sleep.
             if (s_epd) s_power.POWEER_EPD_OFF();
             audio_bsp_power_down();
             s_power.POWEER_Audio_OFF();

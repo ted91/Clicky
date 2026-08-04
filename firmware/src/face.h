@@ -125,4 +125,15 @@ void face_dismiss_notification();
 // user had a real chance to see and dismiss it.
 bool face_notification_blocks_sleep();
 
+// Draws the "Sleeping..." screen exactly once, synchronously, and then
+// latches the panel so no later face_update() (e.g. faceTask's own 200ms
+// tick) can repaint over it before the chip actually halts. Call this
+// immediately before power_mgr_enter_deep_sleep(); it returns only once
+// the e-paper refresh has physically completed, so it's safe to cut the
+// panel's power right after. Cleared on the next face_init() (deep sleep
+// wakes via a full reboot). Replaces the old
+// face_show_notification()+face_update() pairing, which could silently
+// skip the draw -- see this function's own comments in face.cpp.
+void face_show_sleeping_screen();
+
 #endif

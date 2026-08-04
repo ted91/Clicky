@@ -12,6 +12,21 @@
 static epaper_driver_display *s_driver = nullptr;
 static int s_lastRecording = -1; // -1 = not drawn yet, forces first draw
 
+// face_update() is called from TWO tasks -- faceTask's own 200ms tick and
+// sleepWatchTask's synchronous pre-deep-sleep draw (see
+// face_show_sleeping_screen). A single redraw is ~580ms of SPI traffic
+// against one shared frame buffer, so without this they can interleave
+// mid-refresh and corrupt or lose each other's draw -- live-confirmed
+// symptom: the "Sleeping..." screen only appeared sometimes.
+static SemaphoreHandle_t s_faceMutex = nullptr;
+
+// Once the device has committed to deep sleep and drawn "Sleeping...",
+// nothing may overwrite the panel -- faceTask's next tick would otherwise
+// happily redraw the idle smiley over it in the window before the chip
+// actually halts. E-paper holds its last image with power removed, so
+// whatever is on screen at halt is what the user sees for the whole sleep.
+static bool s_sleepLatched = false;
+
 // --- custom status persistence (NVS via Preferences) ------------------
 // Same "own namespace, load once at boot, write-through on change" pattern
 // as wifi_sync.cpp's WiFi-credentials storage.
@@ -605,6 +620,8 @@ static int s_customStatusIndex = -1; // meaningful only when s_currentStatus == 
 
 void face_init(epaper_driver_display *driver) {
     s_driver = driver;
+    if (!s_faceMutex) s_faceMutex = xSemaphoreCreateMutex();
+    s_sleepLatched = false; // fresh boot (incl. deep-sleep wake) -- panel is drawable again
     s_lastRecording = -1;
     s_currentStatus = Status::NONE;
     s_lastBleIndicator = false;
@@ -619,6 +636,7 @@ void face_init(epaper_driver_display *driver) {
 
 void face_update(bool recording, bool jarvisActive) {
     if (!s_driver) return;
+    if (s_sleepLatched) return; // committed to deep sleep -- don't overwrite "Sleeping..."
 
     // Kept current unconditionally, even on the early-return below --
     // drawIndicatorStrip() reads these directly, and it can be invoked from
@@ -644,6 +662,16 @@ void face_update(bool recording, bool jarvisActive) {
                : (s_currentStatus == Status::CUSTOM) ? 3000 + s_customStatusIndex
                : (int)s_currentStatus;
     if (wanted == s_lastRecording) return; // nothing changed, skip redraw
+
+    // Serialize the actual refresh -- see s_faceMutex's declaration. Taken
+    // AFTER the change-gate so an unchanged tick stays free (no blocking on
+    // a redraw it wasn't going to do anyway). Re-check the gate inside the
+    // lock: another task may have drawn this exact state while we waited.
+    if (s_faceMutex && xSemaphoreTake(s_faceMutex, portMAX_DELAY) != pdTRUE) return;
+    if (wanted == s_lastRecording || s_sleepLatched) {
+        if (s_faceMutex) xSemaphoreGive(s_faceMutex);
+        return;
+    }
     s_lastRecording = wanted;
 
     s_driver->EPD_Clear();
@@ -672,7 +700,34 @@ void face_update(bool recording, bool jarvisActive) {
     // periodic battery sample (see face_update_battery()/indicatorTask).
     if (s_lastBatteryPct >= 0) drawBatteryBadge(s_lastBatteryPct);
     drawVersionBadge();
-    s_driver->EPD_DisplayPart();
+    s_driver->EPD_DisplayPart(); // blocks on the panel's BUSY line -- the
+                                  // refresh is physically complete on return
+    if (s_faceMutex) xSemaphoreGive(s_faceMutex);
+}
+
+void face_show_sleeping_screen() {
+    // Deliberately NOT face_show_notification() + face_update(): that path
+    // is subject to face_update()'s change-gating (a concurrent faceTask
+    // tick could consume the state change first) and to faceTask racing
+    // the refresh -- live-confirmed symptom, the screen only showed
+    // sometimes. This forces exactly one guaranteed synchronous draw, then
+    // latches the panel so nothing repaints over it before the chip halts.
+    //
+    // No-op when the display was never initialized this boot -- a TIMER
+    // wake from deep sleep deliberately skips display init (see
+    // initHardware(initDisplay) in main.cpp), and in that case the panel is
+    // already physically showing the "Sleeping..." image from before the
+    // sleep anyway, since e-paper holds its last frame unpowered.
+    if (!s_driver) return;
+
+    snprintf(s_notifTitle, sizeof(s_notifTitle), "Sleeping...");
+    s_notifBody[0] = '\0';
+    s_notifActive = true;
+    s_notifShownAtMs = millis();
+    s_notifSeq = (s_notifSeq + 1) % 500;
+    s_lastRecording = -1; // defeat the change-gate: this draw must never be skipped
+    face_update(false, false);
+    s_sleepLatched = true; // freeze the panel from here until the next boot
 }
 
 Status face_next_status() {

@@ -5,6 +5,6 @@
 // against the version string the paired pipeline app has bundled with it
 // (see wifi_sync.cpp's /version route and /ota endpoint) -- the app only
 // pushes a new firmware image when this is older than its own bundled one.
-#define FW_VERSION "0.7.3"
+#define FW_VERSION "0.7.4"
 
 #endif
