@@ -50,6 +50,39 @@ def _slugify(text: str, max_len: int = 60) -> str:
     return text[:max_len] or "recording"
 
 
+def detect_vault_path() -> str:
+    """Best-effort auto-detection of an existing Obsidian vault, so a new
+    user isn't asked to type a filesystem path by hand during setup.
+    Obsidian itself creates a `.obsidian` marker folder in every vault's
+    root -- that's the one cheap, reliable signal a directory is a real
+    vault (vs. just any folder). Scans a short list of common locations,
+    one level deep, and returns the first match, or "" if none found (the
+    field stays a normal, editable text input either way -- this only
+    fills in a default for the common case, never overrides a value the
+    user already set). Not exhaustive by design: a vault kept somewhere
+    unusual, or multiple vaults, still needs manual entry."""
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, "Documents"),
+        os.path.join(home, "Obsidian"),
+        os.path.join(home, "Documents", "Obsidian"),
+        os.path.join(home, "Library", "Mobile Documents", "iCloud~md~obsidian", "Documents"),
+    ]
+    for base in candidates:
+        if not os.path.isdir(base):
+            continue
+        if os.path.isdir(os.path.join(base, ".obsidian")):
+            return base
+        try:
+            for entry in sorted(os.listdir(base)):
+                candidate = os.path.join(base, entry)
+                if os.path.isdir(candidate) and os.path.isdir(os.path.join(candidate, ".obsidian")):
+                    return candidate
+        except OSError:
+            continue
+    return ""
+
+
 def _vault_path() -> str:
     vault_path = settings.get_all().get("obsidian_vault_path")
     if not vault_path:
@@ -74,7 +107,13 @@ def _note_title(record: dict) -> str:
     recording's main note without needing that note's path threaded
     through every call."""
     date_prefix = (record.get("created_at") or "")[:10]  # YYYY-MM-DD
-    slug = _slugify(record.get("summary", {}).get("summary") or record["name"])
+    # Same contextual short title the Notion page uses (see
+    # notion_sync._recording_title) rather than the whole summary
+    # paragraph, so the two destinations agree on what this note is called.
+    # The date prefix stays here -- unlike Notion, a filename has no
+    # separate Date property to carry it.
+    import notion_sync
+    slug = _slugify(notion_sync._recording_title(record))
     return f"{date_prefix} {slug}" if date_prefix else slug
 
 
@@ -201,6 +240,13 @@ def _format_markdown(record: dict) -> str:
             lines.append(line)
         lines.append("")
 
+    organizations = summary.get("organizations") or []
+    if organizations:
+        from providers.base import format_organization
+        lines += ["## Organizations", ""]
+        lines += [f"- {format_organization(o)}" for o in organizations]
+        lines.append("")
+
     calendar_events = summary.get("calendar_events") or []
     if calendar_events:
         lines += ["## Calendar events", ""]
@@ -226,8 +272,10 @@ def _format_markdown(record: dict) -> str:
 
 
 def _insight_frontmatter(record: dict) -> dict:
-    """Topics/Intents/Deepgram Summary as real frontmatter fields -- see
-    macOS obsidian_sync.py for the full rationale."""
+    """Topics/Intents/Deepgram Summary as real frontmatter fields -- same
+    fields notion_sync._insight_properties adds as Notion properties, kept
+    consistent across both destinations. Empty dict if Deepgram wasn't the
+    STT provider or returned no insights."""
     insights = record.get("deepgram_insights") or {}
     fm = {}
     if insights.get("topics"):
@@ -239,7 +287,7 @@ def _insight_frontmatter(record: dict) -> dict:
     return fm
 
 
-def push_recording(record: dict) -> str:
+def push_recording(record: dict, existing_path: str = None) -> str:
     """Writes this recording as a markdown file into the vault root.
     Journal-classified recordings skip this entirely (see push_journal) --
     same dedup as notion_sync (a journal entry's only home is the Journal
@@ -248,13 +296,25 @@ def push_recording(record: dict) -> str:
     property as notion_sync.GENERATE_SOCIAL_PROPERTY. Returns the note's
     path -- caller (poller.distribute_once) persists it via
     storage.set_obsidian_note_path() so Tasks/People/Calendar/Publications
-    can wiki-link back to it and so the trigger can be polled."""
+    can wiki-link back to it and so the trigger can be polled.
+
+    existing_path: when set (a prior push already wrote this recording,
+    but the record's obsidian_synced flag wasn't persisted -- e.g. a crash
+    right after writing), reuse this exact path/filename instead of
+    re-deriving one from the current title. Otherwise a title that
+    changed since the first write (e.g. after a speaker rename) would
+    produce a second, differently-named file instead of overwriting the
+    original."""
     if (record.get("summary") or {}).get("type") == "journal":
         return None
     vault_path = _vault_path()
-    title = _note_title(record)
-    filename = f"{title}.md"
-    file_path = os.path.join(vault_path, filename)
+    if existing_path:
+        file_path = existing_path
+        filename = os.path.basename(existing_path)
+    else:
+        title = _note_title(record)
+        filename = f"{title}.md"
+        file_path = os.path.join(vault_path, filename)
 
     created_at = record.get("created_at", "")
     frontmatter = {
@@ -276,6 +336,56 @@ def push_recording(record: dict) -> str:
         log.warning("rag_index indexing failed for %s (non-fatal): %s", filename, e)
 
     return file_path
+
+
+def note_exists(path: str) -> bool:
+    """Whether a note this module previously wrote is still in the vault.
+
+    Obsidian's counterpart to notion_sync.find_page_by_recording_id: the
+    check that turns a stored path into a verified one. A vault is an
+    ordinary folder the user edits and deletes files in, so a recorded
+    path is a claim about the past, not a guarantee about the present."""
+    return bool(path) and os.path.isfile(path)
+
+
+def missing_notes(records: list) -> list:
+    """Returns [(content_hash, destination)] for every record marked synced
+    to Obsidian whose note file is no longer in the vault.
+
+    Sync flags were write-once: nothing re-checked them, so a note deleted
+    by hand -- or one whose write failed after the flag was set -- was gone
+    for good while the dashboard still reported it synced. Live-confirmed:
+    a meeting's Task, Calendar and People notes were all present but its
+    main note was absent, obsidian_synced=True, and no code path would
+    ever have rewritten it.
+
+    Only reports a record that HAS a recorded path which is now missing --
+    a record that never had one (a journal entry lives under Journal/, so
+    it has no root note by design) is not missing, it's just shaped
+    differently. Caller clears the flags so distribute_once rewrites them;
+    this function itself is read-only."""
+    if not _vault_path_or_none():
+        return []
+    missing = []
+    for record in records:
+        if record.get("status") != "done" or record.get("merged_into"):
+            continue
+        for dest, key in (("obsidian", "obsidian_note_path"),
+                          ("obsidian_journal", "obsidian_journal_note_path")):
+            path = record.get(key)
+            if record.get(f"{dest}_synced") and path and not note_exists(path):
+                missing.append((record["content_hash"], dest))
+    return missing
+
+
+def _vault_path_or_none():
+    """_vault_path() raises when Obsidian isn't configured; callers that
+    simply want to skip when there's no vault use this instead."""
+    try:
+        path = _vault_path()
+    except Exception:
+        return None
+    return path if os.path.isdir(path) else None
 
 
 def push_journal(record: dict) -> str:
@@ -403,6 +513,140 @@ def push_tasks(record: dict, note_path: str = None) -> list:
     return links
 
 
+def refresh_task_notes(record: dict) -> int:
+    """Rewrites the heading/owner of Task notes already written for this
+    recording, so a later correction reaches them -- the Obsidian half of
+    notion_sync.refresh_task_titles.
+
+    Re-running push_tasks() is not equivalent: it derives each filename
+    from the recording's current title, so once that title changes (which
+    a correction or re-summarize does) it writes a NEW file and leaves the
+    stale one behind. This updates the existing files in place.
+
+    Paths come from task_email_links where recorded (that's the only place
+    an Obsidian task path is persisted today); otherwise it falls back to
+    the deterministic current-title path, which is right for a note whose
+    title hasn't changed. Missing files are skipped, not created -- this
+    refreshes what exists rather than resurrecting deleted notes."""
+    items = (record.get("summary") or {}).get("action_items") or []
+    if not items:
+        return 0
+    paths_by_index = {
+        l["index"]: l["task_note_path"]
+        for l in (record.get("task_email_links") or [])
+        if l.get("index") and l.get("task_note_path")
+    }
+    updated = 0
+    for i, item in enumerate(items, start=1):
+        path = paths_by_index.get(i) or task_note_path(record, i)
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            frontmatter = read_frontmatter(path)
+            if item.get("owner"):
+                frontmatter["owner"] = item["owner"]
+            if item.get("due_date"):
+                frontmatter["due_date"] = item["due_date"]
+            if item.get("owner"):
+                frontmatter["related_person"] = _wiki_link(item["owner"])
+            with open(path, "r", encoding="utf-8") as f:
+                existing = f.read()
+            # Replace only the "# ..." heading line; everything below it
+            # (the email draft, hints, anything the user added) is left
+            # untouched -- this is a correction, not a regeneration.
+            body = existing.split("---", 2)[-1].lstrip("\n") if existing.startswith("---") else existing
+            lines = body.split("\n")
+            for n, line in enumerate(lines):
+                if line.startswith("# "):
+                    lines[n] = f"# {item.get('text', '')}"
+                    break
+            _write_note(os.path.dirname(path), os.path.basename(path), frontmatter, "\n".join(lines))
+            updated += 1
+        except Exception as e:
+            log.warning("could not refresh Obsidian task note %s (non-fatal): %s", path, e)
+    return updated
+
+
+def task_note_path(record: dict, item_index: int) -> str:
+    """Reconstructs the deterministic path push_tasks() writes each action
+    item's note to (Tasks/{recording title} - item{1-based index}.md) --
+    used by the email-watch feature (poller.check_email_watches_once) to
+    mirror watch_query/watch_triggered onto the note's frontmatter without
+    needing a separate index->path mapping stored anywhere (push_tasks
+    already only persists such a mapping for email-type items -- see
+    push_tasks's own "links" return value -- and a watch can be set on
+    any action item, not just email ones)."""
+    filename = f"{_note_title(record)} - item{item_index + 1}.md"
+    return os.path.join(_vault_subfolder("Tasks"), filename)
+
+
+def set_task_done(record: dict, item_index: int, done: bool):
+    """Obsidian counterpart of notion_sync.set_task_done -- mirrors the
+    dashboard's action-item checkbox onto the Task note.
+
+    Writes BOTH a "done" boolean and a "status" string: `done` is what
+    Obsidian's own checkbox/Dataview queries key off, `status` matches the
+    Notion Task's Status property wording so the two destinations read the
+    same when compared side by side. item_index is 1-based, matching
+    push_tasks()'s enumerate(..., start=1) and Notion's task_status_links.
+
+    Best-effort like the Notion side: the dashboard toggle already
+    succeeded locally, so a missing note must not raise."""
+    path = _task_note_path_for(record, item_index)
+    if not note_exists(path):
+        return False
+    _update_frontmatter(path, done=done, status="Done" if done else "Not started")
+    return True
+
+
+def read_task_done(record: dict, item_index: int):
+    """Reads the Task note's "done" frontmatter back, so ticking the box
+    in Obsidian propagates INTO Clicky -- the mirror of
+    poller.check_notion_jarvis_done_once's poll-back for Notion. Returns
+    None when the note doesn't exist or has no explicit value, which the
+    caller must distinguish from a real False."""
+    path = _task_note_path_for(record, item_index)
+    if not note_exists(path):
+        return None
+    value = read_frontmatter(path).get("done")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "1")
+    return None
+
+
+def _task_note_path_for(record: dict, item_index: int) -> str:
+    """The Task note path for a 1-based action-item index, preferring a
+    path actually recorded at creation time over one recomputed from the
+    current title -- the recording's title changes (a rename, a
+    re-summarize), and task_note_path() derives from whatever it is NOW,
+    which stops matching the file that was written THEN."""
+    for link in (record.get("task_email_links") or []):
+        if link.get("index") == item_index and link.get("task_note_path"):
+            return link["task_note_path"]
+    return task_note_path(record, item_index)
+
+
+def set_task_watch(record: dict, item_index: int, watch_query: str):
+    """Mirrors an action item's email watch onto its Obsidian Tasks note
+    frontmatter -- no-ops (via _update_frontmatter's own guard) if the
+    note doesn't exist, e.g. Obsidian wasn't configured when this
+    recording was first processed."""
+    path = task_note_path(record, item_index)
+    if os.path.isfile(path):
+        _update_frontmatter(path, watch_for=watch_query, watch_alert=False)
+
+
+def set_task_watch_alert(record: dict, item_index: int, matches: list):
+    """Flags a Tasks note's watch as triggered -- matches is
+    [{"from", "subject"}] from apple_mail.search_messages."""
+    path = task_note_path(record, item_index)
+    if os.path.isfile(path):
+        summary = "; ".join(f"{m.get('from', '')}: {m.get('subject', '')}" for m in matches[:3])
+        _update_frontmatter(path, watch_alert=True, watch_alert_summary=summary)
+
+
 def push_people(record: dict, note_path: str = None):
     """Find-or-create a note per mentioned person (stakeholders, which
     already includes the speaker -- see poller._add_speakers_as_stakeholders)
@@ -440,6 +684,299 @@ def push_people(record: dict, note_path: str = None):
             _write_note(dir_path, f"{_slugify(name)}.md", frontmatter, f"# {name}\n\n{mention}\n")
 
     log.info("pushed %d stakeholder(s) from %s to Obsidian People", len(stakeholders), record["name"])
+
+
+def person_note_path(name: str) -> str:
+    """The deterministic People/ path for a person's note. Same slug
+    push_people() writes to, factored out so contact lookup and dedup
+    agree with it rather than each recomputing the rule."""
+    if not name or not name.strip():
+        return None
+    return os.path.join(_vault_subfolder("People"), f"{_slugify(name.strip())}.md")
+
+
+def get_person_note(email: str, name: str) -> str:
+    """Obsidian counterpart of notion_sync.get_person_note -- returns the
+    person's "note" (their role/relationship) for meeting-prep enrichment.
+
+    Email match is preferred over name, same precedence as Notion's, since
+    an address identifies a human and a name doesn't. Returns "" on any
+    miss -- this enriches a prep note and must never break one."""
+    try:
+        if email and email.strip():
+            match = find_person_by_email(email)
+            if match:
+                return (read_frontmatter(match).get("note") or "").strip()
+        path = person_note_path(name)
+        if note_exists(path):
+            return (read_frontmatter(path).get("note") or "").strip()
+    except Exception as e:
+        log.debug("Obsidian person-note lookup failed for %r (non-fatal): %s", name or email, e)
+    return ""
+
+
+def find_person_by_email(email: str) -> str:
+    """Path of the People/ note whose frontmatter carries this email, or
+    None. Mirrors notion_sync._find_person_by_email: the email is the
+    identity key, the filename only a slug of whatever name was known
+    first."""
+    needle = (email or "").strip().lower()
+    if not needle:
+        return None
+    people_dir = _vault_subfolder("People")
+    for filename in sorted(os.listdir(people_dir)):
+        if not filename.endswith(".md"):
+            continue
+        path = os.path.join(people_dir, filename)
+        try:
+            if (read_frontmatter(path).get("email") or "").strip().lower() == needle:
+                return path
+        except Exception:
+            continue
+    return None
+
+
+def set_person_contact_by_name(name: str, email: str = None, linkedin: str = None) -> str:
+    """Obsidian counterpart of notion_sync.set_person_contact_by_name --
+    writes manually-entered contact details onto a person's People/ note,
+    creating a minimal note when none exists yet (same as the Notion side,
+    so the dashboard's "+ contact" behaves identically for both).
+
+    Only the fields actually supplied are written; passing None for one
+    leaves the existing value alone rather than blanking it."""
+    if not name or not name.strip():
+        return None
+    path = person_note_path(name)
+    if not note_exists(path):
+        _write_note(_vault_subfolder("People"), os.path.basename(path),
+                    {"name": name.strip(), "email": "", "linkedin": "", "note": ""},
+                    f"# {name.strip()}\n")
+    fields = {}
+    if email is not None:
+        fields["email"] = email.strip()
+    if linkedin is not None:
+        fields["linkedin"] = linkedin.strip()
+    if fields:
+        _update_frontmatter(path, **fields)
+    return path
+
+
+def find_duplicate_people() -> list:
+    """Obsidian counterpart of notion_sync.find_duplicate_people: People/
+    notes that look like the same human.
+
+    Groups by email, by LinkedIn, AND by normalized name. The name key
+    matters as much as the others here for the same reason it does on the
+    Notion side -- two notes can describe one person with no contact
+    details on either -- with an extra Obsidian-specific wrinkle: the
+    filename is a slug of the name, so a same-name duplicate can only
+    exist as a *differently slugged* variant ("sanjit.md" vs
+    "sanchit.md"), which is exactly the mis-transcribed-name case.
+
+    Returns [{"key": ..., "pages": [{"id": path, "name", "note", "email"}]}]
+    -- the same shape the dashboard already renders for Notion, with the
+    note's path as its id, so one UI serves both. Read-only: merging is a
+    separate, explicit action (see merge_person_notes)."""
+    if not _vault_path_or_none():
+        return []
+    people_dir = _vault_subfolder("People")
+    by_email, by_linkedin, by_name = {}, {}, {}
+    for filename in sorted(os.listdir(people_dir)):
+        if not filename.endswith(".md"):
+            continue
+        path = os.path.join(people_dir, filename)
+        try:
+            fm = read_frontmatter(path)
+        except Exception:
+            continue
+        entry = {"id": path, "name": fm.get("name") or filename[:-3],
+                 "note": fm.get("note") or "", "email": fm.get("email") or ""}
+        email = (fm.get("email") or "").strip().lower()
+        linkedin = (fm.get("linkedin") or "").strip().rstrip("/").lower()
+        name = (fm.get("name") or filename[:-3]).strip().lower()
+        if email:
+            by_email.setdefault(email, []).append(entry)
+        if linkedin:
+            by_linkedin.setdefault(linkedin, []).append(entry)
+        if name:
+            by_name.setdefault(name, []).append(entry)
+
+    groups, seen = [], set()
+    for key, entries in list(by_email.items()) + list(by_linkedin.items()) + list(by_name.items()):
+        if len(entries) < 2:
+            continue
+        ids = tuple(sorted(e["id"] for e in entries))
+        if ids in seen:
+            continue
+        seen.add(ids)
+        groups.append({"key": key, "pages": entries})
+    return groups
+
+
+def merge_person_notes(keeper_path: str, loser_path: str):
+    """Explicit, user-triggered merge of two People/ notes -- Obsidian's
+    counterpart to notion_sync.merge_person_pages, and deliberately never
+    automatic for the same reason.
+
+    Appends the loser's body onto the keeper under a labeled heading,
+    backfills any contact detail the keeper is missing, then deletes the
+    loser. Wiki-links elsewhere in the vault that pointed at the loser are
+    rewritten to the keeper, so a merge doesn't leave dangling links --
+    the Obsidian-specific half of this job, since Notion relations
+    re-point by id and markdown links don't."""
+    if not note_exists(keeper_path) or not note_exists(loser_path):
+        raise RuntimeError("both notes must exist to merge them")
+    if os.path.abspath(keeper_path) == os.path.abspath(loser_path):
+        raise RuntimeError("cannot merge a note into itself")
+
+    keeper_fm, loser_fm = read_frontmatter(keeper_path), read_frontmatter(loser_path)
+    with open(loser_path, "r", encoding="utf-8") as f:
+        loser_text = f.read()
+    m = _FRONTMATTER_RE.match(loser_text)
+    loser_body = (m.group(2) if m else loser_text).strip()
+
+    # Contact details survive the merge: whichever note had them wins,
+    # rather than the merge silently discarding the only copy.
+    fields = {}
+    for key in ("email", "linkedin", "note"):
+        if not (keeper_fm.get(key) or "").strip() and (loser_fm.get(key) or "").strip():
+            fields[key] = loser_fm[key]
+    if fields:
+        _update_frontmatter(keeper_path, **fields)
+
+    loser_name = loser_fm.get("name") or os.path.basename(loser_path)[:-3]
+    if loser_body:
+        append_body(keeper_path, f"\n## Merged from duplicate note ({loser_name})\n\n{loser_body}\n")
+
+    keeper_title = os.path.basename(keeper_path)[:-3]
+    loser_title = os.path.basename(loser_path)[:-3]
+    _repoint_wiki_links(loser_title, keeper_title)
+    os.remove(loser_path)
+    log.info("merged Obsidian People note %s into %s", loser_title, keeper_title)
+
+
+def _repoint_wiki_links(old_title: str, new_title: str):
+    """Rewrites [[old]] wiki-links across the vault to [[new]]. Without
+    this a merged-away note leaves broken links in every recording note
+    that mentioned that person."""
+    vault = _vault_path_or_none()
+    if not vault or old_title == new_title:
+        return
+    for root, _dirs, files in os.walk(vault):
+        for filename in files:
+            if not filename.endswith(".md"):
+                continue
+            path = os.path.join(root, filename)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    text = f.read()
+                if f"[[{old_title}]]" not in text:
+                    continue
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text.replace(f"[[{old_title}]]", f"[[{new_title}]]"))
+            except Exception as e:
+                log.debug("could not re-point wiki links in %s (non-fatal): %s", path, e)
+
+
+NEW_ACTION_ITEM_FIELD = "new_action_item"
+ADD_ACTION_ITEM_FIELD = "add_action_item"
+
+
+def read_action_item_trigger(note_path: str) -> str:
+    """Obsidian counterpart of notion_sync.read_action_item_trigger:
+    returns the text typed into the note's "new_action_item" frontmatter
+    when "add_action_item" is set true, else "".
+
+    Two fields rather than one so an unfinished sentence doesn't fire the
+    moment it's typed -- the boolean is the deliberate "do it now", exactly
+    like Notion's checkbox beside its text property."""
+    if not note_exists(note_path):
+        return ""
+    try:
+        fm = read_frontmatter(note_path)
+    except Exception:
+        return ""
+    trigger = fm.get(ADD_ACTION_ITEM_FIELD)
+    if isinstance(trigger, str):
+        trigger = trigger.strip().lower() in ("true", "yes", "1")
+    if not trigger:
+        return ""
+    return (fm.get(NEW_ACTION_ITEM_FIELD) or "").strip()
+
+
+def reset_action_item_trigger(note_path: str):
+    """Clears both trigger fields once the task has been created, so the
+    next poll doesn't create it again -- the reset half of the same
+    ensure/poll/reset shape notion_sync uses."""
+    if note_exists(note_path):
+        _update_frontmatter(note_path, **{NEW_ACTION_ITEM_FIELD: "", ADD_ACTION_ITEM_FIELD: False})
+
+
+def ensure_action_item_trigger_fields(note_path: str):
+    """Adds the two trigger fields to a note that predates them, so the
+    user has something to fill in. Obsidian has no schema to migrate (the
+    Notion equivalent patches the database), but a field that isn't
+    present in the frontmatter is a field nobody knows exists."""
+    if not note_exists(note_path):
+        return
+    try:
+        fm = read_frontmatter(note_path)
+    except Exception:
+        return
+    missing = {}
+    if NEW_ACTION_ITEM_FIELD not in fm:
+        missing[NEW_ACTION_ITEM_FIELD] = ""
+    if ADD_ACTION_ITEM_FIELD not in fm:
+        missing[ADD_ACTION_ITEM_FIELD] = False
+    if missing:
+        _update_frontmatter(note_path, **missing)
+
+
+def push_single_task(text: str, record: dict, item_index: int) -> str:
+    """Writes one new Task note for an action item added from inside the
+    vault -- Obsidian's counterpart to notion_sync.push_single_task.
+    Returns the note's path so the caller can record it."""
+    dir_path = _vault_subfolder("Tasks")
+    filename = f"{_note_title(record)} - item{item_index}.md"
+    frontmatter = {"related_note": _wiki_link(_note_title(record)),
+                   "done": False, "status": "Not started", "source": "added in Obsidian"}
+    _write_note(dir_path, filename, frontmatter,
+                f"# {text}\n\nFrom recording: {record.get('name', '')}\n")
+    path = os.path.join(dir_path, filename)
+    log.info("created Obsidian Task note from vault-added action item: %s", filename)
+    return path
+
+
+def push_command(record: dict, jarvis_result: dict) -> str:
+    """Writes one Jarvis voice command into Jarvis/ -- the Obsidian
+    counterpart of notion_sync.push_command, which had no Obsidian path at
+    all: commands reached Notion and the dashboard but never the vault.
+
+    Its own folder rather than the vault root for the same reason Notion
+    gives it its own database: a command isn't a recording in the Notes
+    sense (no speakers, summary or action items) and shouldn't be mixed in
+    with them. Best-effort, like every other destination push."""
+    action_type = jarvis_result.get("action_type") or "unknown"
+    transcript = (jarvis_result.get("transcript") or "").strip()
+    spoken = (jarvis_result.get("spoken") or "").strip()
+    title = f"{action_type} — {transcript[:100]}" if transcript else action_type
+
+    dir_path = _vault_subfolder("Jarvis")
+    created_at = record.get("created_at") or ""
+    filename = f"{created_at[:10]} {_slugify(title)}.md"
+    frontmatter = {
+        "created": created_at,
+        "action_type": action_type,
+        "ok": bool(jarvis_result.get("ok")),
+        "done": jarvis_result.get("user_status") == "done",
+        "source_recording": record.get("name", ""),
+    }
+    body = "\n".join([f"# {title}", "", "## Heard", "", transcript or "(nothing transcribed)",
+                      "", "## Replied", "", spoken or "(no reply)"])
+    _write_note(dir_path, filename, frontmatter, body)
+    path = os.path.join(dir_path, filename)
+    log.info("pushed Jarvis command %s to Obsidian", record["name"])
+    return path
 
 
 def push_events(record: dict, note_path: str = None):

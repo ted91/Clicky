@@ -31,6 +31,7 @@ Setup (documented in full in pipeline/README.md):
 3. Paste the token and database IDs into /integrations.
 """
 import logging
+import re
 
 import requests
 
@@ -180,6 +181,14 @@ def _build_blocks(record: dict) -> list:
     else:
         blocks += _bulleted(["(none)"])
 
+    organizations = summary.get("organizations") or []
+    if organizations:
+        # Only rendered when present -- unlike Stakeholders, every record
+        # predating this field would otherwise show a permanent "(none)".
+        from providers.base import format_organization
+        blocks.append(_heading("Organizations"))
+        blocks += _bulleted([format_organization(o) for o in organizations])
+
     calendar_events = summary.get("calendar_events") or []
     blocks.append(_heading("Calendar events"))
     if calendar_events:
@@ -287,6 +296,87 @@ def _build_journal_blocks(record: dict) -> list:
     return _cap_blocks(blocks)
 
 
+RECORDING_ID_PROPERTY = "Recording ID"
+
+
+def _recording_title(record: dict) -> str:
+    """The Notes page title: a short, contextual name for the conversation.
+
+    No date/time prefix -- the database already has its own "Date" property,
+    so repeating it in the title is pure noise. Prefers the LLM's dedicated
+    "title" field (see providers.base.SUMMARY_JSON_INSTRUCTIONS); falls back
+    to the first clause of the summary sentence for records summarized before
+    that field existed, rather than using the whole paragraph as a title."""
+    summary = record.get("summary") or {}
+    title = (summary.get("title") or "").strip()
+    if not title:
+        # Fallback: first sentence/clause of the summary, not the whole thing.
+        prose = (summary.get("summary") or "").strip()
+        if prose:
+            title = re.split(r"(?<=[.!?])\s|\s+—\s+|;\s", prose)[0].strip()
+            if len(title) > 90:
+                title = title[:87].rsplit(" ", 1)[0] + "..."
+    return (title or record.get("name") or "Untitled")[:200]
+
+
+def find_page_by_title_and_date(database_id: str, title: str, date: str) -> str:
+    """Returns the id of an existing page with this exact title on this
+    exact date, or None. Backstop for pages created before
+    RECORDING_ID_PROPERTY existed (which therefore can't be matched by
+    recording id) -- title+date is the user-visible identity of a note, so
+    matching on it catches the legacy duplicates the id check can't see."""
+    if not database_id or not title or not date:
+        return None
+    try:
+        ds_id = _data_source_id(database_id)
+        resp = requests.post(
+            f"{API_BASE}/data_sources/{ds_id}/query", headers=_headers(),
+            json={"filter": {"and": [
+                {"property": "Name", "title": {"equals": title}},
+                {"property": "Date", "date": {"equals": date}},
+            ]}, "page_size": 1},
+            timeout=15,
+        )
+        if not resp.ok:
+            return None
+        results = resp.json().get("results") or []
+        return results[0]["id"] if results else None
+    except Exception as e:
+        log.warning("could not check Notion for an existing page titled %r (non-fatal): %s", title, e)
+        return None
+
+
+def find_page_by_recording_id(database_id: str, content_hash: str) -> str:
+    """Returns the id of an existing Notes page already created for this
+    recording, or None. content_hash is the recording's own stable
+    identity (never regenerated, unlike the title/summary), stored on the
+    page as RECORDING_ID_PROPERTY.
+
+    This is the last line of defence against duplicate pages: local state
+    (notion_page_id / notion_synced) can be lost if the app dies between
+    creating the page and persisting the id, and Notion is then the only
+    place that knows the page exists. Asking Notion directly makes
+    push_recording idempotent even with no usable local state at all."""
+    if not database_id or not content_hash:
+        return None
+    try:
+        ds_id = _data_source_id(database_id)
+        resp = requests.post(
+            f"{API_BASE}/data_sources/{ds_id}/query", headers=_headers(),
+            json={"filter": {"property": RECORDING_ID_PROPERTY,
+                              "rich_text": {"equals": content_hash}},
+                  "page_size": 1},
+            timeout=15,
+        )
+        if not resp.ok:
+            return None
+        results = resp.json().get("results") or []
+        return results[0]["id"] if results else None
+    except Exception as e:
+        log.warning("could not check Notion for an existing page for %s (non-fatal): %s", content_hash, e)
+        return None
+
+
 def push_recording(record: dict) -> str:
     """Creates a new Notion page in the Notes database for this recording.
     Returns the created page's id (used to relate Tasks/People/Calendar
@@ -305,10 +395,25 @@ def push_recording(record: dict) -> str:
 
     ensure_insight_properties(database_id)
 
-    title = record.get("summary", {}).get("summary") or record["name"]
-    title = title[:200]  # Notion title property practical limit
+    # Ask Notion whether a page for this exact recording already exists
+    # before creating one -- see find_page_by_recording_id. If it does,
+    # update that page in place and return its id, so a lost/never-persisted
+    # notion_page_id can never turn into a second page for the same audio.
+    title = _recording_title(record)
+    date = (record.get("created_at") or "")[:10]
+    existing = (find_page_by_recording_id(database_id, record.get("content_hash"))
+                or find_page_by_title_and_date(database_id, title, date))
+    if existing:
+        log.info("Notion page for %s already exists -- updating in place instead of creating a duplicate",
+                 record.get("name"))
+        update_page_title(existing, _recording_title(record))
+        update_all_blocks(existing, record)
+        return existing
+
+    title = _recording_title(record)
 
     properties = {
+        RECORDING_ID_PROPERTY: {"rich_text": [{"type": "text", "text": {"content": record.get("content_hash", "")}}]},
         # Assumes the database's title property exists under some name;
         # Notion requires referencing it by its actual property name,
         # which we don't know in advance -- "Name" is Notion's default
@@ -488,6 +593,21 @@ def update_transcript_blocks(note_page_id: str, record: dict):
     if not resp.ok:
         raise RuntimeError(f"Notion API error {resp.status_code}: {resp.text[:300]}")
     log.info("updated transcript speaker names on Notion page %s", note_page_id)
+
+
+def update_page_title(page_id: str, title: str):
+    """Renames an existing page's title property in place. Used alongside
+    update_all_blocks() when re-syncing an already-created Notes page so a
+    later speaker-name correction is reflected in the title too, instead of
+    leaving it frozen at whatever guess existed when the page was first
+    created."""
+    resp = requests.patch(
+        f"{API_BASE}/pages/{page_id}", headers=_headers(),
+        json={"properties": {"Name": {"title": [{"type": "text", "text": {"content": title[:200]}}]}}},
+        timeout=15,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Notion API error {resp.status_code}: {resp.text[:300]}")
 
 
 def update_all_blocks(note_page_id: str, record: dict):
@@ -1024,31 +1144,37 @@ def _update_person_knowledge(page_id: str, person_name: str, record: dict, stake
 
 
 def push_people(record: dict, note_page_id: str):
-    """Find-or-create a Notion page per mentioned person (stakeholders,
-    which already includes the speaker themself -- see poller.py's
-    _add_speakers_as_stakeholders) in the People database, and relate each
-    to this recording's Notes page. Appends to each person's existing
-    relations rather than overwriting, so someone mentioned across
-    multiple recordings ends up linked to all of them. No-ops if there are
-    no stakeholders or the People database isn't configured (so this is an
+    """Find-or-create a Notion page per *named speaker* in this recording
+    (record["speaker_names"] -- the people who actually spoke, confirmed
+    via the dashboard's Speakers section or self-identification) in the
+    People database, and relate each to this recording's Notes page.
+    Deliberately NOT summary["stakeholders"] -- that list is people the
+    speaker merely *mentions* in conversation, not participants, and
+    shouldn't populate the same People database as actual speakers (see
+    poller.py's _add_speakers_as_stakeholders, which folds speakers INTO
+    stakeholders for the dashboard/Notes-page display only -- that merge
+    is intentionally not reused here). Appends to each person's existing
+    relations rather than overwriting, so someone speaking across multiple
+    recordings ends up linked to all of them. No-ops if there are no named
+    speakers or the People database isn't configured (so this is an
     optional layer, not a hard requirement).
 
     When this is a meeting recording (record["meeting"] set, see
-    google_client.current_or_next_event), each stakeholder's email is
+    google_client.current_or_next_event), each speaker's email is
     resolved from the calendar attendee list and used as the primary
     find-or-create key -- falls back to name matching when there's no
     meeting, or the name doesn't match any attendee. This is what makes
     "every recording with alice@co.com" a real Notion filter rather than
     depending on her name being spelled identically every time."""
-    stakeholders = (record.get("summary") or {}).get("stakeholders") or []
-    if not stakeholders:
+    speakers = [{"name": n} for n in (record.get("speaker_names") or {}).values() if (n or "").strip()]
+    if not speakers:
         return
     database_id = settings.get_all().get("notion_people_database_id")
     if not database_id:
         return
     meeting = record.get("meeting")
 
-    for s in stakeholders:
+    for s in speakers:
         name = (s.get("name") or "").strip()
         if not name:
             continue
@@ -1120,7 +1246,7 @@ def push_people(record: dict, note_page_id: str):
         except Exception as e:
             log.warning("failed to update knowledge for %r on People page %s: %s", name, page_id, e)
 
-    log.info("pushed %d stakeholder(s) from %s to Notion People", len(stakeholders), record["name"])
+    log.info("pushed %d speaker(s) from %s to Notion People", len(speakers), record["name"])
 
 
 def backfill_person_email(name: str, email: str):
@@ -1245,7 +1371,7 @@ def find_duplicate_people(people_database_id: str) -> list:
     relations unattended is too destructive to do silently."""
     ds_id = _data_source_id(people_database_id)
     cursor = None
-    by_email, by_linkedin = {}, {}
+    by_email, by_linkedin, by_name = {}, {}, {}
     while True:
         body = {"page_size": 100}
         if cursor:
@@ -1257,17 +1383,28 @@ def find_duplicate_people(people_database_id: str) -> list:
         for page in data.get("results", []):
             email = (page["properties"].get("Email", {}).get("email") or "").strip().lower()
             linkedin = (page["properties"].get("LinkedIn", {}).get("url") or "").strip().rstrip("/").lower()
+            title_prop = page["properties"].get("Name", {}).get("title", [])
+            name = "".join(t.get("plain_text", "") for t in title_prop).strip().lower()
             if email:
                 by_email.setdefault(email, []).append(page)
             if linkedin:
                 by_linkedin.setdefault(linkedin, []).append(page)
+            if name:
+                by_name.setdefault(name, []).append(page)
         if not data.get("has_more"):
             break
         cursor = data.get("next_cursor")
 
     groups = []
     seen_page_id_sets = set()
-    for key, pages in list(by_email.items()) + list(by_linkedin.items()):
+    # by_name matters as much as the contact-detail keys: push_people
+    # find-or-creates by name, so two pages sharing one name should be
+    # impossible -- but a race between two concurrent pushes (both look
+    # up, both miss, both create) produces exactly that, and neither page
+    # need have an email for it to happen. Live-confirmed: two identical
+    # "Sanchit" pages, both with no email, invisible to the email/LinkedIn
+    # grouping this function originally shipped with.
+    for key, pages in list(by_email.items()) + list(by_linkedin.items()) + list(by_name.items()):
         if len(pages) < 2:
             continue
         ids = tuple(sorted(p["id"] for p in pages))
@@ -1402,17 +1539,22 @@ def push_tasks(record: dict, note_page_id: str = None) -> list:
     members -- see _match_person_exact's docstring for why this isn't a
     fuzzy match. No-ops if there are no action items.
 
-    Returns a list of {"index", "task_page_id", "person_page_id",
-    "draft_id"} for each comm_type == "email" action item -- the caller
-    (poller.distribute_once) persists this via
-    storage.set_task_email_links() so poller.check_notion_email_approvals_once()
-    can later find each Task page again to check its "Approve & Send" box,
-    and so a successful send can log itself onto the recipient's People
-    page (person_page_id). "index"/"draft_id" (f"email-item-{{index}}")
-    line up with poller._build_email_drafts's own 1-based action-item
-    index -- both iterate the same summary["action_items"] list in the
-    same order, so the Nth Task page created here always corresponds to
-    the Nth action item's draft."""
+    Returns (email_links, all_links). email_links is a list of {"index",
+    "task_page_id", "person_page_id", "draft_id"} for each comm_type ==
+    "email" action item -- the caller (poller.distribute_once) persists
+    this via storage.set_task_email_links() so
+    poller.check_notion_email_approvals_once() can later find each Task
+    page again to check its "Approve & Send" box, and so a successful send
+    can log itself onto the recipient's People page (person_page_id).
+    "index"/"draft_id" (f"email-item-{{index}}") line up with
+    poller._build_email_drafts's own 1-based action-item index -- both
+    iterate the same summary["action_items"] list in the same order, so
+    the Nth Task page created here always corresponds to the Nth action
+    item's draft. all_links is {"index", "task_page_id"} for *every*
+    action item (not just email ones), persisted via
+    storage.set_task_status_links() so the dashboard's action-item
+    checkbox (app.py's set_action_item_done route) can find the matching
+    Notion Task page and mirror its done state via set_task_done()."""
     action_items = (record.get("summary") or {}).get("action_items") or []
     if not action_items:
         return []
@@ -1436,6 +1578,7 @@ def push_tasks(record: dict, note_page_id: str = None) -> list:
             log.warning("failed to ensure Related Person schema on Tasks database %s: %s", database_id, e)
     meeting = record.get("meeting")
     email_links = []
+    all_links = []
 
     for i, item in enumerate(action_items, start=1):
         title = (item.get("text") or record["name"])[:200]
@@ -1534,6 +1677,7 @@ def push_tasks(record: dict, note_page_id: str = None) -> list:
             storage.add_pending_person_link(
                 person_name, task_page["id"], "tasks", pending_candidates, record["name"])
 
+        all_links.append({"index": i, "task_page_id": task_page["id"]})
         if is_email_item:
             email_links.append({
                 "index": i,
@@ -1544,7 +1688,201 @@ def push_tasks(record: dict, note_page_id: str = None) -> list:
             })
 
     log.info("pushed %d task(s) from %s to Notion Tasks", len(action_items), record["name"])
-    return email_links
+    return email_links, all_links
+
+
+NEW_ACTION_ITEM_TEXT_PROPERTY = "New Action Item"
+NEW_ACTION_ITEM_TRIGGER_PROPERTY = "Add Action Item"
+_action_item_trigger_ensured = set()
+
+
+def ensure_action_item_trigger_properties(database_id: str):
+    """Idempotently adds a "New Action Item" text field + "Add Action
+    Item" checkbox to a Notes/Journal database -- typing an item and
+    checking the box is what poller.check_notion_action_item_triggers_once()
+    picks up to create a real Task page from it, same trigger-checkbox
+    pattern as ensure_generate_social_trigger_property."""
+    if not database_id or database_id in _action_item_trigger_ensured:
+        return
+    ds_id = _data_source_id(database_id)
+    resp = requests.patch(
+        f"{API_BASE}/data_sources/{ds_id}", headers=_headers(),
+        json={"properties": {
+            NEW_ACTION_ITEM_TEXT_PROPERTY: {"rich_text": {}},
+            NEW_ACTION_ITEM_TRIGGER_PROPERTY: {"checkbox": {}},
+        }},
+        timeout=15,
+    )
+    if not resp.ok:
+        log.warning("failed to add action-item trigger properties to database %s: %s %s",
+                    database_id, resp.status_code, resp.text[:300])
+        return
+    _action_item_trigger_ensured.add(database_id)
+
+
+def read_action_item_trigger(page_id: str):
+    """Returns the typed action-item text if "Add Action Item" is checked
+    and "New Action Item" is non-empty, else None."""
+    page = get_page(page_id)
+    props = page.get("properties") or {}
+    if not props.get(NEW_ACTION_ITEM_TRIGGER_PROPERTY, {}).get("checkbox"):
+        return None
+    rich_text = props.get(NEW_ACTION_ITEM_TEXT_PROPERTY, {}).get("rich_text") or []
+    text = "".join(t.get("plain_text", "") for t in rich_text).strip()
+    return text or None
+
+
+def reset_action_item_trigger(page_id: str):
+    """Clears both the checkbox and the text field after the new action
+    item has been turned into a Task page -- same momentary-trigger
+    contract as reset_generate_social_trigger."""
+    resp = requests.patch(
+        f"{API_BASE}/pages/{page_id}", headers=_headers(),
+        json={"properties": {
+            NEW_ACTION_ITEM_TRIGGER_PROPERTY: {"checkbox": False},
+            NEW_ACTION_ITEM_TEXT_PROPERTY: {"rich_text": []},
+        }},
+        timeout=15,
+    )
+    if not resp.ok:
+        log.warning("failed to reset action-item trigger on page %s: %s %s",
+                    page_id, resp.status_code, resp.text[:300])
+
+
+def push_single_task(text: str, note_page_id: str, database_id: str) -> str:
+    """Creates one Notion Tasks page for a single action item -- used for
+    an item added after the fact (via the Notion "Add Action Item"
+    trigger) rather than the initial batch push_tasks() does for a
+    freshly-processed recording. Deliberately minimal compared to
+    push_tasks (no Assignee/Related Person/email-draft handling -- a
+    manually-typed item has no owner/comm_type to resolve). Returns the
+    new Task page id."""
+    properties = {
+        "Name": {"title": [{"type": "text", "text": {"content": text[:200]}}]},
+        "Related Note": {"relation": [{"id": note_page_id}]},
+    }
+    resp = requests.post(
+        f"{API_BASE}/pages", headers=_headers(),
+        json={"parent": {"database_id": database_id, "type": "database_id"}, "properties": properties},
+        timeout=15,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Notion API error {resp.status_code}: {resp.text[:300]}")
+    return resp.json()["id"]
+
+
+WATCH_QUERY_PROPERTY = "Watch For"
+WATCH_ALERT_PROPERTY = "Watch Alert"
+_watch_properties_ensured = set()
+
+
+def ensure_watch_properties(database_id: str):
+    """Idempotently adds "Watch For" (text) + "Watch Alert" (checkbox) to
+    the Tasks database -- mirrors the email-watch feature's dashboard
+    state onto the matching Task page (see poller.check_email_watches_once
+    and the Obsidian equivalent, obsidian_sync.set_task_watch)."""
+    if not database_id or database_id in _watch_properties_ensured:
+        return
+    ds_id = _data_source_id(database_id)
+    resp = requests.patch(
+        f"{API_BASE}/data_sources/{ds_id}", headers=_headers(),
+        json={"properties": {
+            WATCH_QUERY_PROPERTY: {"rich_text": {}},
+            WATCH_ALERT_PROPERTY: {"checkbox": {}},
+        }},
+        timeout=15,
+    )
+    if not resp.ok:
+        log.warning("failed to add watch properties to database %s: %s %s",
+                    database_id, resp.status_code, resp.text[:300])
+        return
+    _watch_properties_ensured.add(database_id)
+
+
+def set_task_watch(task_page_id: str, watch_query: str):
+    """Mirrors an action item's email watch onto its Notion Task page --
+    best-effort, called from the dashboard's watch-set route."""
+    resp = requests.patch(
+        f"{API_BASE}/pages/{task_page_id}", headers=_headers(),
+        json={"properties": {
+            WATCH_QUERY_PROPERTY: {"rich_text": [{"type": "text", "text": {"content": watch_query[:2000]}}]},
+            WATCH_ALERT_PROPERTY: {"checkbox": False},
+        }},
+        timeout=15,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Notion API error {resp.status_code}: {resp.text[:300]}")
+
+
+def set_task_watch_alert(task_page_id: str, matches: list):
+    """Checks "Watch Alert" on a Task page once new mail matches --
+    matches is [{"from", "subject"}] from apple_mail.search_messages."""
+    resp = requests.patch(
+        f"{API_BASE}/pages/{task_page_id}", headers=_headers(),
+        json={"properties": {WATCH_ALERT_PROPERTY: {"checkbox": True}}},
+        timeout=15,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Notion API error {resp.status_code}: {resp.text[:300]}")
+
+
+def refresh_task_titles(record: dict):
+    """Rewrites the titles of Task pages already created for this
+    recording, so a later correction reaches them.
+
+    push_tasks() is create-only and gated on notion_tasks_synced, so once a
+    Task page exists nothing ever revisits it -- a name fixed on the
+    dashboard updated the Notes page but left the Task still titled with
+    the wrong name (live-reported: a task reading "... (Sanjit)" long after
+    the speaker was corrected to Sanchit). Re-pushing instead of updating
+    isn't an option: it would create a duplicate Task page every time.
+
+    Matches by the 1-based index recorded in task_status_links, so it only
+    ever touches pages this recording actually created. Best-effort per
+    page -- one failure doesn't abort the rest."""
+    links = record.get("task_status_links") or []
+    if not links:
+        return 0
+    items = (record.get("summary") or {}).get("action_items") or []
+    updated = 0
+    for link in links:
+        idx, page_id = link.get("index"), link.get("task_page_id")
+        if not page_id or not idx or idx > len(items):
+            continue
+        item = items[idx - 1]
+        title = item.get("text") or ""
+        if item.get("owner"):
+            title = f"{title} ({item['owner']})"
+        try:
+            resp = requests.patch(
+                f"{API_BASE}/pages/{page_id}", headers=_headers(),
+                json={"properties": {"Name": {"title": [{"type": "text", "text": {"content": title[:200]}}]}}},
+                timeout=15,
+            )
+            if resp.ok:
+                updated += 1
+            else:
+                log.warning("could not refresh Task page %s title: %s %s", page_id, resp.status_code, resp.text[:200])
+        except Exception as e:
+            log.warning("could not refresh Task page %s title (non-fatal): %s", page_id, e)
+    return updated
+
+
+def set_task_done(task_page_id: str, done: bool):
+    """Mirrors a dashboard action-item checkbox onto its Notion Tasks page
+    Status property (see push_tasks -- one Task page per action item,
+    created with Notion's default Status options). Tries the two most
+    common default option names ("Done"/"Not started") since a bare
+    {"status": {}} schema (notion_setup.create_workspace's shape) gets
+    Notion's own defaults, not ones this codebase controls. Best-effort:
+    callers should not fail the dashboard toggle over a Notion hiccup."""
+    name = "Done" if done else "Not started"
+    resp = requests.patch(
+        f"{API_BASE}/pages/{task_page_id}", headers=_headers(),
+        json={"properties": {"Status": {"status": {"name": name}}}}, timeout=15,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Notion API error {resp.status_code}: {resp.text[:300]}")
 
 
 _publication_schema_ensured = set()
@@ -1640,6 +1978,7 @@ def ensure_insight_properties(database_id: str):
             "Topics": {"multi_select": {}},
             "Intents": {"multi_select": {}},
             "Deepgram Summary": {"rich_text": {}},
+            RECORDING_ID_PROPERTY: {"rich_text": {}},
         }},
         timeout=15,
     )

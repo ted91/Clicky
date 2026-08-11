@@ -1,4 +1,5 @@
 #include "recorder.h"
+#include "ima_adpcm.h"
 #include "audio_bsp.h"
 #include "power_mgr.h"
 #include "sdcard/sdcard_bsp.h"
@@ -30,11 +31,24 @@ static const uint16_t CHANNELS = 2;
 static const uint16_t BITS_PER_SAMPLE = 16;
 static const size_t CHUNK_BYTES = 2048;
 
+// Every recording is now written as 4-bit ADPCM (see ima_adpcm.h), not raw
+// 16-bit PCM -- ~4:1 smaller, cutting SD usage and WiFi transfer time for
+// free. ENCODED_CHUNK_BYTES is exactly CHUNK_BYTES/4: CHUNK_BYTES raw
+// bytes = CHUNK_BYTES/2 int16 samples = CHUNK_BYTES/2 nibbles = that many
+// /2 packed bytes. A private, non-standard format tag (not the real
+// WAVE_FORMAT_DVI_ADPCM 0x0011 -- see ima_adpcm.h) marks a file this way
+// so nothing downstream ever mis-decodes it as PCM.
+static const size_t ENCODED_CHUNK_BYTES = CHUNK_BYTES / 4;
+static const uint16_t ADPCM_FORMAT_TAG = 0x1001;
+static AdpcmEncoderState s_adpcmState; // reset at the start of each new recording
+
 // Recordings shorter than this are almost always an accidental PWR
 // double-tap (start immediately followed by stop) rather than real speech
 // -- silently discarded the same way a cancelled recording is, so a stray
 // press doesn't leave a near-empty file for sync/transcription to choke on.
-static const uint32_t MIN_RECORDING_DATA_BYTES = SAMPLE_RATE * CHANNELS * (BITS_PER_SAMPLE / 8); // 1 second
+// In ENCODED bytes now (1s of ADPCM audio), not raw PCM bytes -- 1/4 of
+// the old PCM-based threshold, same real-world "under 1 second" meaning.
+static const uint32_t MIN_RECORDING_DATA_BYTES = (SAMPLE_RATE * CHANNELS * (BITS_PER_SAMPLE / 8)) / 4;
 
 // PSRAM fallback cap when there's no SD card — 60s of 16kHz/stereo/16-bit
 // audio is ~3.75MB, which comfortably fits alongside everything else in
@@ -82,12 +96,17 @@ struct __attribute__((packed)) WavHeader {
     char wave[4] = {'W', 'A', 'V', 'E'};
     char fmt[4] = {'f', 'm', 't', ' '};
     uint32_t fmtSize = 16;
-    uint16_t audioFormat = 1; // PCM
+    // ADPCM_FORMAT_TAG (0x1001), not 1 (PCM) -- see ima_adpcm.h/the
+    // ENCODED_CHUNK_BYTES comment above. bitsPerSample/byteRate/blockAlign
+    // below are informational only (for anyone inspecting the file by
+    // hand); the decoder doesn't rely on them, it just reads nibbles
+    // until dataSize bytes are consumed.
+    uint16_t audioFormat = ADPCM_FORMAT_TAG;
     uint16_t numChannels = CHANNELS;
     uint32_t sampleRate = SAMPLE_RATE;
-    uint32_t byteRate = SAMPLE_RATE * CHANNELS * (BITS_PER_SAMPLE / 8);
-    uint16_t blockAlign = CHANNELS * (BITS_PER_SAMPLE / 8);
-    uint16_t bitsPerSample = BITS_PER_SAMPLE;
+    uint32_t byteRate = SAMPLE_RATE * CHANNELS / 2; // 4 bits/sample
+    uint16_t blockAlign = CHANNELS; // not block-based; informational only
+    uint16_t bitsPerSample = 4;
     char data[4] = {'d', 'a', 't', 'a'};
     uint32_t dataSize = 0; // filled in on close
 };
@@ -257,12 +276,19 @@ static void recordToSd(uint8_t *chunkBuf) {
     WavHeader header; // placeholder written now, patched on close
     fwrite(&header, sizeof(header), 1, f);
 
+    s_adpcmState = AdpcmEncoderState(); // fresh predictor/index for this recording
+    static uint8_t *s_encodeBuf = nullptr;
+    if (!s_encodeBuf) s_encodeBuf = (uint8_t *)heap_caps_malloc(ENCODED_CHUNK_BYTES, MALLOC_CAP_SPIRAM);
+    uint8_t fallbackEncodeBuf[ENCODED_CHUNK_BYTES];
+    uint8_t *encodeBuf = s_encodeBuf ? s_encodeBuf : fallbackEncodeBuf;
+
     uint32_t totalDataBytes = 0;
     Serial.printf("recorder: recording to %s\n", path);
     while (!s_stopRequested) {
         audio_playback_read(chunkBuf, CHUNK_BYTES);
-        fwrite(chunkBuf, 1, CHUNK_BYTES, f);
-        totalDataBytes += CHUNK_BYTES;
+        size_t encoded = adpcm_encode(&s_adpcmState, (const int16_t *)chunkBuf, CHUNK_BYTES / sizeof(int16_t), CHANNELS, encodeBuf);
+        fwrite(encodeBuf, 1, encoded, f);
+        totalDataBytes += encoded;
     }
 
     header.dataSize = totalDataBytes;
@@ -316,14 +342,22 @@ static void recordToRam(uint8_t *chunkBuf) {
         return;
     }
 
-    Serial.printf("recorder: no SD card, buffering to PSRAM (max %lus)\n", (unsigned long)RECORDER_RAM_MAX_SECONDS);
+    // ADPCM compression means the same PSRAM buffer now holds roughly 4x
+    // the real-world seconds it used to (RECORDER_RAM_MAX_SECONDS/
+    // RECORDER_RAM_MAX_BYTES describe the OLD raw-PCM budget, unchanged
+    // below, but the actual cap is now driven by encoded bytes vs buffer
+    // capacity -- a free side benefit, not something recomputed here).
+    Serial.printf("recorder: no SD card, buffering to PSRAM (up to ~%lus at PCM rates, longer now with ADPCM)\n", (unsigned long)RECORDER_RAM_MAX_SECONDS);
+    s_adpcmState = AdpcmEncoderState(); // fresh predictor/index for this recording
+    uint8_t encodeBuf[ENCODED_CHUNK_BYTES];
     size_t offset = sizeof(WavHeader);
-    while (!s_stopRequested && offset + CHUNK_BYTES <= RECORDER_RAM_MAX_BYTES) {
+    while (!s_stopRequested && offset + ENCODED_CHUNK_BYTES <= RECORDER_RAM_MAX_BYTES) {
         audio_playback_read(chunkBuf, CHUNK_BYTES);
-        memcpy(s_ramBuf + offset, chunkBuf, CHUNK_BYTES);
-        offset += CHUNK_BYTES;
+        size_t encoded = adpcm_encode(&s_adpcmState, (const int16_t *)chunkBuf, CHUNK_BYTES / sizeof(int16_t), CHANNELS, encodeBuf);
+        memcpy(s_ramBuf + offset, encodeBuf, encoded);
+        offset += encoded;
     }
-    if (offset + CHUNK_BYTES > RECORDER_RAM_MAX_BYTES) {
+    if (offset + ENCODED_CHUNK_BYTES > RECORDER_RAM_MAX_BYTES) {
         Serial.println("recorder: hit PSRAM recording cap, stopping automatically");
     }
 

@@ -158,14 +158,14 @@ def _acquire_single_instance_lock() -> bool:
     If the lock is already held, this doesn't just give up -- it reads the
     PID the holder recorded, confirms that PID is genuinely a Clicky
     process (never kill on a bare PID-number match alone), and kills it
-    before retrying. This is what makes replacing the installed build with
-    a new one "just work": overwriting the app's files doesn't kill
-    whatever process already had them open, so without this, every upgrade
-    left a stale pre-upgrade instance squatting on both the lock and port
-    8000, and the new launch could only ever show "already running" -- a
-    real bug hit shipping this exact feature. Since this is a single-user
-    personal app, a fresh launch should always supersede an old one, not
-    silently refuse to start."""
+    before retrying. This is what makes replacing /Applications/Clicky.app
+    with a new DMG's build "just work": overwriting the app bundle's files
+    doesn't kill whatever process already had them open, so without this,
+    every upgrade left a stale pre-upgrade instance squatting on both the
+    lock and port 8000, and the new launch could only ever show "already
+    running" -- a real bug hit shipping this exact feature. Since this is
+    a single-user personal app, a fresh launch should always supersede an
+    old one, not silently refuse to start."""
     global _lock_file
     lock_path = os.path.join(paths.APP_DATA_DIR, "clicky.lock")
     stale_pid = _read_stale_pid(lock_path)
@@ -210,6 +210,20 @@ def _run_server():
 
 
 if __name__ == "__main__":
+    # MUST be the very first thing in __main__, before any app logic runs.
+    # torch/sentence-transformers (rag_index) spawn helper processes, and a
+    # frozen build has no separate python to spawn -- multiprocessing
+    # re-executes THIS binary instead. Without freeze_support() the child
+    # doesn't just run the helper, it re-runs this whole file: it takes the
+    # single-instance lock (whose self-superseding logic then kills the real
+    # running instance), starts a second uvicorn, launches a second
+    # meetingcap agent, and runs a second poller cycle that re-pushes
+    # already-pushed recordings to Notion. Live-confirmed as the cause of
+    # both a ~30s restart loop (dashboard showing "refused to connect") and
+    # ~18 duplicate Notion pages for a single recording.
+    import multiprocessing
+    multiprocessing.freeze_support()
+
     if not _acquire_single_instance_lock():
         _show_already_running_alert()
         sys.exit(1)

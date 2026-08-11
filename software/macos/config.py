@@ -18,7 +18,7 @@ load_dotenv(os.path.join(_env_dir, ".env"))
 # against GitHub Releases' latest tag to show the Settings "update
 # available" banner. Kept as a plain module constant (not settings.json)
 # since it describes the running binary, not user-editable state.
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.8.0"
 
 # Private for now (see this project's distribution-planning conversation --
 # no paid Apple Developer ID yet, demo-scale only) -- update_check.py's
@@ -70,11 +70,24 @@ ANTHROPIC_LLM_MODEL = os.getenv("ANTHROPIC_LLM_MODEL", "claude-haiku-4-5")
 # (gcloud CLI, rclone, etc. all do this) -- users just click Connect and
 # see Google's consent screen, no console work. See google_client.py.
 #
-# NOTE: .env is NOT bundled into the packaged .app by clicky.spec (only
-# templates/static ship) -- see clicky.spec's comment for how this actually
-# gets into the built app.
+# .env IS bundled into the packaged .app (clicky.spec's `datas` includes
+# ('.env', '.')) and loaded from sys._MEIPASS at packaged runtime -- see
+# this file's load_dotenv() call above. Same mechanism now also carries
+# demo MISTRAL_API_KEY/DEEPGRAM_API_KEY for a zero-signup demo build (see
+# reload_settings()'s fallback behavior below and app.py's /setup gate) --
+# a prior version of this comment claimed .env wasn't bundled at all,
+# which was true before Google's key was added and is no longer accurate.
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+
+# Same shared-client pattern as Google above, for Notion's public-
+# integration OAuth (see notion_oauth.py) -- a one-time registration at
+# notion.so/my-integrations under the developer's own account, with a
+# localhost redirect URI (Notion's own docs confirm localhost is allowed
+# for a public integration during development). Removes 3 of 5 manual
+# setup steps (create integration, copy token, share page) for the user.
+NOTION_CLIENT_ID = os.getenv("NOTION_CLIENT_ID", "")
+NOTION_CLIENT_SECRET = os.getenv("NOTION_CLIENT_SECRET", "")
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")

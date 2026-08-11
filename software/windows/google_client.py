@@ -49,6 +49,7 @@ TOKEN_URL = "https://oauth2.googleapis.com/token"
 CALENDAR_API = "https://www.googleapis.com/calendar/v3"
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1"
 TASKS_API = "https://tasks.googleapis.com/tasks/v1"
+MEET_API = "https://meet.googleapis.com/v2"
 
 SCOPES = " ".join([
     "https://www.googleapis.com/auth/calendar.readonly",
@@ -60,6 +61,15 @@ SCOPES = " ".join([
     # (prompt=consent above forces the full new grant).
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/tasks",
+    # For get_meeting_transcript() -- pulling the OFFICIAL Google Meet
+    # transcript when one exists, see poller.check_official_meeting_transcripts_once().
+    # Same "existing installs 403 until reconnect" situation as gmail.readonly
+    # above. Note this only ever returns anything on a paid Google Workspace
+    # plan with meeting transcription enabled AND manually started by the
+    # host during the call -- most accounts (including a plain personal
+    # Gmail account) will simply never see a transcript here, by design of
+    # the feature itself, not a bug in this integration.
+    "https://www.googleapis.com/auth/meetings.space.readonly",
 ])
 
 # Meeting-link patterns recognized in a calendar event's location/description,
@@ -301,3 +311,105 @@ def create_event(title: str, start: str, end: str, attendees: list = None):
     if not resp.ok:
         raise RuntimeError(f"Google Calendar event create failed {resp.status_code}: {resp.text[:300]}")
     return resp.json()
+
+
+# --- Meet transcripts (official, opportunistic upgrade path) --------------
+#
+# See poller.check_official_meeting_transcripts_once() for the caller side.
+# NOTE: the exact request/response shapes below are built from Google's
+# published Meet REST API reference (meet.googleapis.com/v2), not verified
+# against a live call -- this account has no Google Workspace plan, and
+# Meet transcripts are a Workspace-only feature (paid plan + admin-enabled
+# + the host manually starting it during the call), so there was no way to
+# test this end-to-end. Worth a real test pass against a Workspace account
+# if you ever have access to one.
+
+_MEET_CODE_PATTERN = None  # lazily compiled -- see _meeting_code_from_url
+
+
+def _meeting_code_from_url(meeting_url: str):
+    """Extracts the meeting code (e.g. "abc-mnop-xyz") from a
+    meet.google.com URL, for conferenceRecords.list's
+    space.meeting_code filter. Returns None for anything else (a Teams
+    link, a malformed URL, etc.) -- this feature only ever applies to
+    Google Meet, never other conferencing providers."""
+    global _MEET_CODE_PATTERN
+    if not meeting_url or "meet.google.com" not in meeting_url:
+        return None
+    if _MEET_CODE_PATTERN is None:
+        import re as _re
+        _MEET_CODE_PATTERN = _re.compile(r"meet\.google\.com/([a-z]{3,}-[a-z]{4,}-[a-z]{3,})", _re.IGNORECASE)
+    m = _MEET_CODE_PATTERN.search(meeting_url)
+    return m.group(1) if m else None
+
+
+def get_meeting_transcript(meeting_url: str):
+    """Returns [{"speaker": name_or_None, "text": ...}, ...] in order for
+    the official Google Meet transcript of this meeting, or None if
+    anything in the chain comes back empty -- no meeting code, no
+    conference record yet (call hasn't happened / API hasn't indexed it
+    yet), no transcript (host never started one, or account doesn't have
+    the feature), still processing, or any API error (including a 403 for
+    an account that hasn't reconnected with the meetings.space.readonly
+    scope yet). Never raises -- this is a best-effort upgrade path (see
+    poller.check_official_meeting_transcripts_once()), not a required
+    step; local recording/transcription always proceeds regardless."""
+    code = _meeting_code_from_url(meeting_url)
+    if not code:
+        return None
+    try:
+        resp = requests.get(
+            f"{MEET_API}/conferenceRecords", headers=_headers(),
+            params={"filter": f'space.meeting_code="{code}"'}, timeout=15,
+        )
+        if not resp.ok:
+            return None
+        records = resp.json().get("conferenceRecords", []) or []
+        if not records:
+            return None
+        # Most recent conference for this recurring meeting code -- the API
+        # already orders conferenceRecords.list by start_time descending by
+        # default; take the first as "the call that just happened."
+        conference_name = records[0]["name"]
+
+        resp = requests.get(f"{MEET_API}/{conference_name}/transcripts", headers=_headers(), timeout=15)
+        if not resp.ok:
+            return None
+        transcripts = resp.json().get("transcripts", []) or []
+        if not transcripts:
+            return None  # host never started a transcript for this call
+        transcript_name = transcripts[0]["name"]
+
+        entries = []
+        page_token = None
+        while True:
+            params = {"pageSize": 100}
+            if page_token:
+                params["pageToken"] = page_token
+            resp = requests.get(f"{MEET_API}/{transcript_name}/entries", headers=_headers(),
+                                 params=params, timeout=15)
+            if not resp.ok:
+                return entries or None
+            data = resp.json()
+            for entry in data.get("transcriptEntries", []) or []:
+                participant = entry.get("participant", {}) or {}
+                speaker = participant.get("displayName") or None
+                text = entry.get("text", "")
+                if text:
+                    # startTime/endTime are real fields on this API (ISO
+                    # timestamps) -- captured for
+                    # poller.check_official_meeting_transcripts_once's
+                    # voice-ID enrollment path, which aligns these against
+                    # our own diarized segments by absolute time to figure
+                    # out which speaker_id a real name belongs to.
+                    entries.append({
+                        "speaker": speaker, "text": text,
+                        "start_time": entry.get("startTime"), "end_time": entry.get("endTime"),
+                    })
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+        return entries or None
+    except Exception as e:
+        log.debug("get_meeting_transcript failed for %r: %s", meeting_url, e)
+        return None

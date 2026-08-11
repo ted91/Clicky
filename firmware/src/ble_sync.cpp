@@ -382,6 +382,21 @@ static const uint32_t PAIRING_TIMEOUT_MS = 120000;
 static const uint16_t FAST_ADV_MIN = 0x20, FAST_ADV_MAX = 0x40;   // 20-40ms
 static const uint16_t SLOW_ADV_MIN = 0x0640, SLOW_ADV_MAX = 0x0780; // ~1.0-1.2s
 
+// Live-confirmed bug: once paired + on WiFi + HTTP-proven-reachable,
+// resumeIdleAdvertising() suppresses BLE entirely -- correct for the
+// laptop it's already paired to, but it also meant a NEW laptop's scan
+// found nothing at all, with no recovery short of the BOOT long-press
+// (see ble_sync_forget_and_repair()). This gives every boot a bounded
+// window where it stays discoverable (slow interval, cheap) regardless of
+// WiFi state, so a new laptop has a real chance to find it without
+// needing to know about the long-press gesture first. Deliberately NOT
+// unbounded -- the whole point of the WiFi-connected suppression is a real
+// battery saving for the common case (already-paired laptop, day after
+// day), and this window only needs to be long enough to open the app and
+// hit Connect once.
+static uint32_t s_bootMs = 0;
+static const uint32_t POST_BOOT_DISCOVERY_MS = 2 * 60 * 1000; // 2 min
+
 static void applyAdvertisingInterval(uint16_t minInterval, uint16_t maxInterval) {
     NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
     adv->setMinInterval(minInterval);
@@ -390,7 +405,11 @@ static void applyAdvertisingInterval(uint16_t minInterval, uint16_t maxInterval)
 
 // Called after boot and after every disconnect: paired devices keep
 // reconnectability alive (slow adv); unpaired devices stay silent until
-// the user explicitly enters pairing via the BOOT-button status cycle.
+// paired for the first time (ble_sync_init()'s WiFi-credentials migration
+// path, or a genuine first pairing) -- BOOT-button status cycling was
+// dropped entirely (main.cpp:35-36), so ble_sync_start_pairing() now only
+// fires from setup()'s never-paired boot check, or from a paired device's
+// BOOT long-press (ble_sync_forget_and_repair()).
 //
 // BLE is the backup sync/control path (see ble_sync.h's module docstring)
 // -- only one radio needs to be actively reachable at a time, and WiFi
@@ -418,7 +437,8 @@ static void applyAdvertisingInterval(uint16_t minInterval, uint16_t maxInterval)
 // the only transport that actually works there.
 static void resumeIdleAdvertising() {
     if (s_pairingActive) return; // pairing's own fast-adv window owns this
-    if (s_paired && (!wifi_sync_is_connected() || !wifi_sync_http_proven_reachable())) {
+    bool withinPostBootWindow = s_bootMs != 0 && (millis() - s_bootMs) < POST_BOOT_DISCOVERY_MS;
+    if (s_paired && (!wifi_sync_is_connected() || !wifi_sync_http_proven_reachable() || withinPostBootWindow)) {
         applyAdvertisingInterval(SLOW_ADV_MIN, SLOW_ADV_MAX);
         NimBLEDevice::startAdvertising();
     } else {
@@ -450,6 +470,16 @@ void ble_sync_stop_pairing() {
     if (!s_pairingActive) return;
     s_pairingActive = false;
     resumeIdleAdvertising();
+}
+
+void ble_sync_forget_and_repair() {
+    s_paired = false;
+    s_pairPrefs.begin("blesync", /*readOnly=*/false);
+    s_pairPrefs.remove("paired");
+    s_pairPrefs.end();
+    face_set_paired(false);
+    Serial.println("ble_sync: forgot pairing (BOOT long-press) -- entering pairing mode for a new laptop");
+    ble_sync_start_pairing();
 }
 
 bool ble_sync_pairing_timed_out() {
@@ -788,6 +818,8 @@ class L2CAPTransferCallbacks : public NimBLEL2CAPChannelCallbacks {
 };
 
 void ble_sync_init() {
+    s_bootMs = millis();
+
     // Migration: if this device already has WiFi creds saved (real prior
     // use, before pairing existed), default it to paired rather than
     // stranding it silent/unadvertised until someone notices and cycles to

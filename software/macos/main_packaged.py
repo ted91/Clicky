@@ -210,6 +210,20 @@ def _run_server():
 
 
 if __name__ == "__main__":
+    # MUST be the very first thing in __main__, before any app logic runs.
+    # torch/sentence-transformers (rag_index) spawn helper processes, and a
+    # frozen build has no separate python to spawn -- multiprocessing
+    # re-executes THIS binary instead. Without freeze_support() the child
+    # doesn't just run the helper, it re-runs this whole file: it takes the
+    # single-instance lock (whose self-superseding logic then kills the real
+    # running instance), starts a second uvicorn, launches a second
+    # meetingcap agent, and runs a second poller cycle that re-pushes
+    # already-pushed recordings to Notion. Live-confirmed as the cause of
+    # both a ~30s restart loop (dashboard showing "refused to connect") and
+    # ~18 duplicate Notion pages for a single recording.
+    import multiprocessing
+    multiprocessing.freeze_support()
+
     if not _acquire_single_instance_lock():
         _show_already_running_alert()
         sys.exit(1)

@@ -49,9 +49,13 @@ a = Analysis(
         # Carries GOOGLE_CLIENT_ID/SECRET (the app's shared OAuth client --
         # see config.py's comment) into the packaged build. Landed at the
         # bundle root to match config.py's frozen-mode lookup of
-        # sys._MEIPASS/.env. Provider API keys (Mistral/OpenAI/etc.) don't
-        # need this -- those are entered per-user via /setup and persisted
-        # to settings.json, never read from .env at packaged runtime.
+        # sys._MEIPASS/.env. ALSO carries demo MISTRAL_API_KEY/
+        # DEEPGRAM_API_KEY for a zero-signup demo build -- a user's own
+        # entered key (via /setup, persisted to settings.json) always wins
+        # over these (see config.py's reload_settings()); the bundled key
+        # is only the fallback when settings.json has nothing saved, and
+        # usage_limit.py meters recordings against a 100 min/month cap
+        # specifically when the bundled (not user-supplied) key is active.
         ('.env', '.'),
     ] + speechbrain_datas,
     hiddenimports=[
@@ -64,6 +68,13 @@ a = Analysis(
         'mistralai.client',
         'bleak',
         'yaml',  # obsidian_sync.py's frontmatter read/write
+        # audio_store.py's lossless FLAC compression -- imported inside
+        # functions (like the providers above), and its absence degrades
+        # silently to storing uncompressed WAV rather than erroring, so a
+        # missed import here would look like "compression just doesn't
+        # work" with nothing in the log pointing at packaging.
+        'soundfile',
+        'audio_store',
         # voice_id.py's speaker-embedding model -- torch/speechbrain's own
         # dynamic import patterns are extensive; this list is a starting
         # point, not guaranteed complete -- expect to add entries after a

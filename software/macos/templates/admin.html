@@ -3,42 +3,16 @@
 <head>
   <meta charset="utf-8">
   <title>Device Fleet — Clicky Admin</title>
+  <link rel="stylesheet" href="/static/design.css">
   <style>
-    :root { --bg: #fff; --fg: #1a1a1a; --border: #ddd; --muted: #666; --ok: #0a7; --warn: #c0392b; --card: #f9f9f9; }
-    @media (prefers-color-scheme: dark) {
-      :root { --bg: #121212; --fg: #eee; --border: #3a3a3a; --muted: #aaa; --ok: #4fd6a0; --warn: #ff6b5e; --card: #1c1c1c; }
-    }
-    :root[data-theme="dark"] { --bg: #121212; --fg: #eee; --border: #3a3a3a; --muted: #aaa; --ok: #4fd6a0; --warn: #ff6b5e; --card: #1c1c1c; }
-    :root[data-theme="light"] { --bg: #fff; --fg: #1a1a1a; --border: #ddd; --muted: #666; --ok: #0a7; --warn: #c0392b; --card: #f9f9f9; }
-
-    * { box-sizing: border-box; }
-    body { font-family: -apple-system, sans-serif; margin: 0; background: var(--bg); color: var(--fg); display: flex; min-height: 100vh; }
-    .app-nav { width: 210px; flex-shrink: 0; background: #f5f5f5; border-right: 1px solid var(--border); padding: 0.75rem 0; }
-    @media (prefers-color-scheme: dark) { .app-nav { background: #1a1a1a; } }
-    :root[data-theme="dark"] .app-nav { background: #1a1a1a; }
-    :root[data-theme="light"] .app-nav { background: #f5f5f5; }
-    .app-nav-item {
-      display: flex; align-items: center; gap: 0.6rem; padding: 0.6rem 1.1rem;
-      font-size: 0.9rem; color: var(--fg); text-decoration: none; border-left: 3px solid transparent;
-      background: none; border-top: none; border-right: none; border-bottom: none; width: 100%; text-align: left; cursor: pointer; font: inherit;
-    }
-    .app-nav-item .icon { font-size: 1.1rem; width: 1.3rem; text-align: center; }
-    .app-nav-item:hover { background: rgba(128,128,128,0.12); }
-    .app-nav-item.active { background: rgba(128,128,128,0.12); border-left-color: var(--ok); font-weight: 600; }
-    .app-nav-logout { margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 0.9rem; }
-
+    body { display: flex; min-height: 100vh; }
     .page-content { flex: 1; padding: 1.75rem 2rem; overflow-y: auto; max-width: 640px; }
-    h1 { font-size: 1.1rem; margin: 0 0 0.5rem; }
     .note { color: var(--muted); font-size: 0.85rem; padding-bottom: 0.9rem; border-bottom: 1px solid var(--border); margin-bottom: 1.25rem; }
-    fieldset { border: 1px solid var(--border); border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
-    label { display: block; font-size: 0.85rem; margin: 0.6rem 0 0.2rem; }
-    input[type=text] { width: 100%; padding: 0.5rem; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--fg); }
     .actions { display: flex; gap: 0.5rem; margin-top: 0.75rem; flex-wrap: wrap; }
-    button { padding: 0.5rem 0.9rem; border: 1px solid var(--border); border-radius: 6px; background: var(--card); color: var(--fg); cursor: pointer; font-size: 0.85rem; }
-    button.primary { background: var(--ok); color: #fff; border-color: var(--ok); }
-    .result { margin-top: 1rem; padding: 0.9rem 1rem; border-radius: 8px; border: 1px solid var(--border); }
-    .result.ok { border-color: var(--ok); }
-    .result.error { border-color: var(--warn); }
+    .actions button { margin-top: 0; }
+    .result { margin-top: 1rem; padding: 0.9rem 1rem; border-radius: var(--radius); border: 1px solid var(--border); background: var(--card-bg); }
+    .result.ok { border-color: var(--accent); }
+    .result.error { border-color: var(--error); }
     .result pre { white-space: pre-wrap; font-size: 0.85rem; margin: 0.4rem 0 0; }
   </style>
 </head>

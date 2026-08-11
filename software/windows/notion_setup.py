@@ -15,9 +15,12 @@ endpoint for that (confirmed against current docs; it's sidebar-only, a
 manual one-time click). This only creates databases *under* a page the
 user already made and shared with their integration.
 
-Not idempotent -- running it twice against the same parent page creates a
-second, duplicate set of databases. It's meant to be run once per
-workspace; the caller should warn against re-running it.
+Idempotent as of the Notion OAuth work: _create_database() now searches
+for an existing same-titled database under the same parent page first
+(via /v1/search) and reuses it instead of creating a duplicate. This
+matters more now that OAuth (see notion_oauth.py) makes re-running setup
+routine -- reconnecting, or picking a different page after a first
+attempt -- rather than the rare manual one-off it used to be.
 """
 import requests
 
@@ -38,7 +41,41 @@ def _headers(token: str):
     }
 
 
+def _find_existing_database(token: str, parent_page_id: str, title: str):
+    """Searches for a database already named `title` directly under
+    parent_page_id -- Notion's /v1/search is title-filtered but not
+    parent-filtered, so this fetches candidates by title and checks each
+    one's parent itself. Returns the database's raw API object (same shape
+    _create_database's caller expects) or None if nothing matches. Best-
+    effort: any request failure here just falls through to creating a new
+    database, same as if this function didn't exist -- idempotency is a
+    nice-to-have, not something that should turn a setup failure into a
+    harder one."""
+    try:
+        resp = requests.post(
+            f"{API_BASE}/search", headers=_headers(token),
+            json={"query": title, "filter": {"value": "database", "property": "object"}},
+            timeout=15,
+        )
+        if not resp.ok:
+            return None
+        for result in resp.json().get("results", []):
+            parent = result.get("parent", {})
+            if parent.get("page_id") == parent_page_id:
+                result_title = "".join(
+                    t.get("plain_text", "") for t in result.get("title", []))
+                if result_title == title:
+                    return result
+    except requests.RequestException:
+        pass
+    return None
+
+
 def _create_database(token: str, parent_page_id: str, title: str, properties: dict) -> dict:
+    existing = _find_existing_database(token, parent_page_id, title)
+    if existing:
+        return existing
+
     resp = requests.post(
         f"{API_BASE}/databases", headers=_headers(token),
         json={
@@ -110,11 +147,12 @@ def _add_relation_to_notes(token: str, child_database_id: str, notes_data_source
 
 
 def create_workspace(token: str, parent_page_id: str) -> dict:
-    """Creates Notes/Tasks/People/Calendar under parent_page_id, wires up
-    their relations, and adds the Speaker 1..N properties to Notes.
-    Returns {"notion_database_id", "notion_tasks_database_id",
-    "notion_people_database_id", "notion_events_database_id"} for the
-    caller to persist. Raises NotionSetupError with a specific message on
+    """Creates Notes/Tasks/People/Calendar/Journal under parent_page_id,
+    wires up their relations, and adds the Speaker 1..N properties to
+    Notes. Returns {"notion_database_id", "notion_tasks_database_id",
+    "notion_people_database_id", "notion_events_database_id",
+    "notion_journal_database_id"} for the caller to persist. Raises
+    NotionSetupError with a specific message on
     any failure -- whatever got created before the failure is left in
     place (no rollback), since partial setup is easier to diagnose/finish
     by hand than to silently undo."""
@@ -165,8 +203,18 @@ def create_workspace(token: str, parent_page_id: str) -> dict:
     calendar_db = _create_database(token, parent_page_id, "Calendar", {
         "Date": {"date": {}},
     })
+    # Previously the only one of the four not auto-created here --
+    # notion_journal_database_id was manual-entry-only, the sole remaining
+    # step in an otherwise-automated setup. push_journal() (notion_sync.py)
+    # already adapts to whatever schema a Journal database happens to
+    # have (finds the title property dynamically, only sets Date/Related
+    # Note if those properties exist), so a plain Date + relation is
+    # enough -- no journal-specific properties required.
+    journal_db = _create_database(token, parent_page_id, "Journal", {
+        "Date": {"date": {}},
+    })
 
-    for db in (tasks_db, people_db, calendar_db):
+    for db in (tasks_db, people_db, calendar_db, journal_db):
         _add_relation_to_notes(token, db["id"], notes_ds_id)
 
     # Related Person: lets a Task or Calendar entry point at the specific
@@ -183,6 +231,7 @@ def create_workspace(token: str, parent_page_id: str) -> dict:
         "notion_tasks_database_id": tasks_db["id"],
         "notion_people_database_id": people_db["id"],
         "notion_events_database_id": calendar_db["id"],
+        "notion_journal_database_id": journal_db["id"],
     }
 
 

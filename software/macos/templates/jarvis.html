@@ -3,49 +3,34 @@
 <head>
   <meta charset="utf-8">
   <title>Jarvis — Clicky Notes</title>
+  <link rel="stylesheet" href="/static/design.css">
   <style>
-    :root { --bg: #fff; --fg: #1a1a1a; --border: #ddd; --muted: #666; --ok: #0a7; --warn: #c0392b; --card: #f9f9f9; }
-    @media (prefers-color-scheme: dark) {
-      :root { --bg: #121212; --fg: #eee; --border: #3a3a3a; --muted: #aaa; --ok: #4fd6a0; --warn: #ff6b5e; --card: #1c1c1c; }
-    }
-    :root[data-theme="dark"] { --bg: #121212; --fg: #eee; --border: #3a3a3a; --muted: #aaa; --ok: #4fd6a0; --warn: #ff6b5e; --card: #1c1c1c; }
-    :root[data-theme="light"] { --bg: #fff; --fg: #1a1a1a; --border: #ddd; --muted: #666; --ok: #0a7; --warn: #c0392b; --card: #f9f9f9; }
-
-    * { box-sizing: border-box; }
-    body { font-family: -apple-system, sans-serif; margin: 0; background: var(--bg); color: var(--fg); display: flex; min-height: 100vh; }
-
-    .app-nav { width: 210px; flex-shrink: 0; background: #f5f5f5; border-right: 1px solid var(--border); padding: 0.75rem 0; }
-    @media (prefers-color-scheme: dark) { .app-nav { background: #1a1a1a; } }
-    :root[data-theme="dark"] .app-nav { background: #1a1a1a; }
-    :root[data-theme="light"] .app-nav { background: #f5f5f5; }
-    .app-nav-item {
-      display: flex; align-items: center; gap: 0.6rem; padding: 0.6rem 1.1rem;
-      font-size: 0.9rem; color: var(--fg); text-decoration: none; border-left: 3px solid transparent;
-      background: none; border-top: none; border-right: none; border-bottom: none; width: 100%; text-align: left; cursor: pointer; font: inherit;
-    }
-    .app-nav-item .icon { font-size: 1.1rem; width: 1.3rem; text-align: center; }
-    .app-nav-item:hover { background: rgba(128,128,128,0.12); }
-    .app-nav-item.active { background: rgba(128,128,128,0.12); border-left-color: var(--ok); font-weight: 600; }
-    .app-nav-logout { margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 0.9rem; }
-
+    body { display: flex; min-height: 100vh; }
     .page-content { flex: 1; padding: 1.75rem 2rem; overflow-y: auto; }
     .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
     .topbar h1 { font-size: 1.1rem; margin: 0; }
     .note { color: var(--muted); font-size: 0.85rem; padding-bottom: 0.9rem; border-bottom: 1px solid var(--border); margin-bottom: 1.25rem; }
 
-    .command { margin-bottom: 1.1rem; border: 1px solid var(--border); border-radius: 10px; padding: 0.9rem 1rem; }
+    /* Jarvis's own settings -- moved here from the main Settings page since
+       Jarvis is a separate assistant feature from the core record -> note
+       pipeline, not part of it. */
+    .jarvis-settings { border: 1px solid var(--border); border-radius: var(--radius); padding: 1.1rem 1.25rem; background: var(--card-bg); backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur); box-shadow: var(--shadow); margin-bottom: 1.5rem; }
+    .jarvis-settings .desc { color: var(--muted); font-size: 0.85rem; margin: 0 0 0.75rem; }
+    details.more { margin: 0.5rem 0; }
+    details.more summary { cursor: pointer; font-size: 0.8rem; color: var(--muted); }
+    details.more p { font-size: 0.8rem; }
+
+    .command { margin-bottom: 1.1rem; border: 1px solid var(--border); border-radius: var(--radius); padding: 0.9rem 1rem; background: var(--card-bg); box-shadow: var(--shadow); }
     .command-header { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; margin-bottom: 0.4rem; }
     .command-header h3 { margin: 0; font-size: 0.95rem; }
     .timestamp { font-size: 0.78rem; color: var(--muted); margin-bottom: 0.5rem; }
-    .badge { display: inline-block; font-size: 0.78rem; padding: 0.15rem 0.6rem; border-radius: 999px; border: 1px solid var(--border); }
-    .badge.ok { color: var(--ok); border-color: var(--ok); }
-    .badge.fail { color: var(--warn); border-color: var(--warn); }
+    .badge.ok { color: var(--accent); border: 1px solid var(--accent); background: none; }
+    .badge.fail { color: var(--error); border: 1px solid var(--error); background: none; }
     .quick-open-links a { font-size: 0.8rem; margin-left: 0.6rem; }
-    .empty { padding: 2rem; text-align: center; color: var(--muted); }
     audio { height: 30px; max-width: 220px; }
     .controls { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.5rem; }
-    button.md-download, a.md-download { font-size: 0.78rem; padding: 0.3rem 0.6rem; border: 1px solid var(--border); border-radius: 6px; background: var(--card); color: var(--fg); cursor: pointer; text-decoration: none; }
-    button.danger { color: var(--warn); border-color: var(--warn); }
+    button.md-download, a.md-download { font-size: 0.78rem; padding: 0.3rem 0.6rem; margin-top: 0; text-decoration: none; }
+    a.md-download { border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--card-bg); color: var(--fg); }
   </style>
 </head>
 <body>
@@ -55,9 +40,59 @@
     <h1>Jarvis</h1>
   </div>
   <div class="note">
-    Every BOOT-captured voice command, kept separate from regular recordings since a command isn't a memo
-    (no speakers/summary/action items) -- just what was heard, what Jarvis decided to do, and what it replied.
-    Configure Jarvis itself, and its Notion/Obsidian destinations, under Settings → Jarvis.
+    Press BOOT to capture a spoken command -- separate from regular recordings (no speakers/summary/action items).
+  </div>
+
+  {% if saved %}<div class="saved">Saved.</div>{% endif %}
+  {% if setup_error %}<div class="error">Failed: {{ setup_error }}</div>{% endif %}
+
+  <div class="jarvis-settings">
+    <h2 style="margin-top:0;">Settings</h2>
+    <p class="desc">Enable/disable Jarvis under Settings &rarr; Advance.</p>
+    <form method="post" action="/settings/jarvis">
+      <label for="jarvis_repo_path">Repo path (coding requests)</label>
+      <input type="text" id="jarvis_repo_path" name="jarvis_repo_path" value="{{ current.jarvis_repo_path or '' }}" placeholder="/Users/you/code/myrepo">
+      <button type="submit">Save</button>
+    </form>
+
+    <details class="more">
+      <summary>How it works</summary>
+      <p>
+        Q&amp;A uses the LLM provider under Settings &rarr; Connectors. Calendar/reminder/email requests use local
+        Mac automation (first use prompts for Automation permission). Coding requests
+        ("build this feature in...") go through the
+        <a href="https://docs.claude.com/en/docs/claude-code" target="_blank">Claude Code CLI</a>, scoped to the
+        repo path above. Every command is logged to Obsidian if connected.
+      </p>
+    </details>
+
+    <details class="more">
+      <summary>Device API key</summary>
+      <input type="text" readonly value="{{ jarvis_device_api_key }}" onclick="this.select()">
+    </details>
+
+    <details class="more">
+      <summary>Live voice agent (experimental)</summary>
+      <p>Answers plain questions instantly over WiFi. Reuses your Deepgram key; needs a free <a href="https://console.groq.com/keys" target="_blank">Groq key</a> too.</p>
+      <form method="post" action="/jarvis/enable-live-agent">
+        <label for="groq_api_key">Groq API key</label>
+        <input type="password" id="groq_api_key" name="groq_api_key" placeholder="{{ 'saved -- leave blank to keep it' if current.groq_api_key else 'gsk_...' }}">
+        <button type="submit">Push config to device</button>
+      </form>
+    </details>
+
+    {% if not current.notion_jarvis_database_id %}
+    <details class="more">
+      <summary>Notion: one-time setup</summary>
+      <form method="post" action="/integrations/setup-jarvis">
+        <label for="jarvis_notion_parent_page_id">Page ID (same parent page as your other databases)</label>
+        <input type="text" id="jarvis_notion_parent_page_id" name="notion_parent_page_id" placeholder="32-character ID, or paste the full URL" required>
+        <button type="submit">Create Jarvis database</button>
+      </form>
+    </details>
+    {% else %}
+    <p class="saved" style="margin:0.5rem 0 0;">&check; Jarvis database configured</p>
+    {% endif %}
   </div>
 
   {% if not commands %}

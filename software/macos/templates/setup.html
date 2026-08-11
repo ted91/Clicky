@@ -3,22 +3,10 @@
 <head>
   <meta charset="utf-8">
   <title>Setup — Clicky Notes</title>
+  <link rel="stylesheet" href="/static/design.css">
   <style>
-    :root { --bg: #fff; --fg: #1a1a1a; --border: #ddd; --muted: #666; --error: #c0392b; --card: transparent; }
-    @media (prefers-color-scheme: dark) {
-      :root { --bg: #121212; --fg: #eee; --border: #3a3a3a; --muted: #aaa; --error: #ff6b5e; --card: #1c1c1c; }
-    }
-    :root[data-theme="dark"] { --bg: #121212; --fg: #eee; --border: #3a3a3a; --muted: #aaa; --error: #ff6b5e; --card: #1c1c1c; }
-    :root[data-theme="light"] { --bg: #fff; --fg: #1a1a1a; --border: #ddd; --muted: #666; --error: #c0392b; --card: transparent; }
-    body { font-family: -apple-system, sans-serif; max-width: 480px; margin: 3rem auto; padding: 0 1rem; background: var(--bg); color: var(--fg); }
-    h1 { font-size: 1.3rem; }
-    .hint { color: var(--muted); font-size: 0.85rem; margin-bottom: 1.5rem; }
-    fieldset { border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.25rem; margin-bottom: 1rem; background: var(--card); }
-    legend { padding: 0 0.4rem; font-size: 0.85rem; color: var(--muted); }
-    label { display: block; margin: 0.75rem 0 0.25rem; font-size: 0.9rem; }
-    input, select { width: 100%; box-sizing: border-box; padding: 0.5rem; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--fg); }
-    button { width: 100%; padding: 0.7rem; margin-top: 1rem; border: none; border-radius: 4px; background: #0a7; color: #fff; font-weight: 600; cursor: pointer; }
-    .error { color: var(--error); font-size: 0.85rem; margin-bottom: 1rem; }
+    body { max-width: 480px; margin: 3rem auto; padding: 0 1rem; }
+    button { width: 100%; }
     .key-field { display: none; }
     .key-field.active { display: block; }
   </style>
@@ -61,19 +49,27 @@
       </select>
 
       <div id="mistral-key" class="key-field">
-        <label for="mistral_api_key">Mistral API key {{ "(already saved)" if current.mistral_api_key }}</label>
+        <label for="mistral_api_key">Mistral API key
+          {% if current.mistral_api_key %}(already saved){% elif demo_key_available.mistral %}(optional — demo key available, capped at {{ demo_minutes_cap or 100 }} min/month){% endif %}
+        </label>
         <input type="password" id="mistral_api_key" name="mistral_api_key" placeholder="{{ '••••••••' if current.mistral_api_key else '' }}">
       </div>
       <div id="openai-key" class="key-field">
-        <label for="openai_api_key">OpenAI API key {{ "(already saved)" if current.openai_api_key }}</label>
+        <label for="openai_api_key">OpenAI API key
+          {% if current.openai_api_key %}(already saved){% elif demo_key_available.openai %}(optional — demo key available){% endif %}
+        </label>
         <input type="password" id="openai_api_key" name="openai_api_key" placeholder="{{ '••••••••' if current.openai_api_key else '' }}">
       </div>
       <div id="anthropic-key" class="key-field">
-        <label for="anthropic_api_key">Anthropic API key {{ "(already saved)" if current.anthropic_api_key }}</label>
+        <label for="anthropic_api_key">Anthropic API key
+          {% if current.anthropic_api_key %}(already saved){% elif demo_key_available.anthropic %}(optional — demo key available){% endif %}
+        </label>
         <input type="password" id="anthropic_api_key" name="anthropic_api_key" placeholder="{{ '••••••••' if current.anthropic_api_key else '' }}">
       </div>
       <div id="deepgram-key" class="key-field">
-        <label for="deepgram_api_key">Deepgram API key {{ "(already saved)" if current.deepgram_api_key }}</label>
+        <label for="deepgram_api_key">Deepgram API key
+          {% if current.deepgram_api_key %}(already saved){% elif demo_key_available.deepgram %}(optional — demo key available, capped at {{ demo_minutes_cap or 100 }} min/month){% endif %}
+        </label>
         <input type="password" id="deepgram_api_key" name="deepgram_api_key" placeholder="{{ '••••••••' if current.deepgram_api_key else '' }}">
       </div>
     </fieldset>

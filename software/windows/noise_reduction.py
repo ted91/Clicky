@@ -156,13 +156,45 @@ def _process_rnnoise(lib, samples_48k: array.array) -> array.array:
     return out
 
 
+def _channels_differ(samples, channels: int, probe_frames: int = 4000) -> bool:
+    """Whether a multi-channel recording actually carries different audio
+    per channel, rather than one signal duplicated across them.
+
+    This is the difference between the two kinds of stereo this app
+    ingests: the ESP32 records a single mic into both channels (identical,
+    safe to downmix), while meetingcap records system audio on L and the
+    mic on R (one participant each -- downmixing destroys the separation).
+    Sampled rather than compared exhaustively: a few thousand frames is
+    conclusive for "are these the same signal" and keeps this cheap on an
+    hour-long recording."""
+    if channels < 2:
+        return False
+    total_frames = len(samples) // channels
+    if total_frames == 0:
+        return False
+    step = max(1, total_frames // probe_frames)
+    for f in range(0, total_frames, step):
+        base = f * channels
+        first = samples[base]
+        for c in range(1, channels):
+            if samples[base + c] != first:
+                return True
+    return False
+
+
 def denoise_wav(wav_bytes: bytes, sample_rate: int = 16000) -> bytes:
     """Suppresses background noise in 16-bit PCM WAV audio via RNNoise.
-    Mono or stereo in (see recorder.cpp -- this device records stereo);
-    always returns the same channel count/duration/sample rate it was
-    given, with denoised content duplicated back across all channels
-    (a single mic feed captured in stereo has no real per-channel
-    difference to preserve).
+    Mono or stereo in; always returns the same channel count/duration/
+    sample rate it was given.
+
+    Channels that genuinely differ (meetingcap's system-audio-on-L,
+    mic-on-R capture -- one participant per channel) are denoised
+    independently and kept separate, because that separation IS the
+    speaker attribution and is far more reliable than diarizing a mix.
+    Channels that are copies of each other (the ESP32 records one mic into
+    both) are downmixed, denoised once, and duplicated back -- there's no
+    real per-channel difference to preserve there, and processing one
+    track instead of two is half the work. See _channels_differ.
 
     Never raises -- returns the input unchanged on any failure (library
     missing/failed to load, corrupt/unrecognized WAV, unexpected format),
@@ -195,28 +227,56 @@ def denoise_wav(wav_bytes: bytes, sample_rate: int = 16000) -> bytes:
         if sys.byteorder == "big":
             samples.byteswap()
 
-        mono = _downmix_to_mono(samples, channels)
-        if not mono:
-            return wav_bytes
-        up = _upsample_3x(mono) if sample_rate * 3 == RNNOISE_SAMPLE_RATE else mono
-        denoised_48k = _process_rnnoise(lib, up)
-        denoised_mono = _downsample_3x(denoised_48k) if sample_rate * 3 == RNNOISE_SAMPLE_RATE else denoised_48k
+        def _denoise_one(track):
+            """Runs one channel's samples through RNNoise at 48kHz and
+            returns them at the original rate and length."""
+            up = _upsample_3x(track) if sample_rate * 3 == RNNOISE_SAMPLE_RATE else track
+            out = _process_rnnoise(lib, up)
+            out = _downsample_3x(out) if sample_rate * 3 == RNNOISE_SAMPLE_RATE else out
+            # Trim/pad to exactly the original sample count -- resampling
+            # round-trips can be off by a sample or two at the tail.
+            if len(out) > len(track):
+                out = out[:len(track)]
+            elif len(out) < len(track):
+                out = out + array.array("h", [0] * (len(track) - len(out)))
+            return out
 
-        # Trim/pad to exactly the original mono sample count -- resampling
-        # round-trips can be off by a sample or two at the tail.
-        target_len = len(mono)
-        if len(denoised_mono) > target_len:
-            denoised_mono = denoised_mono[:target_len]
-        elif len(denoised_mono) < target_len:
-            denoised_mono = denoised_mono + array.array("h", [0] * (target_len - len(denoised_mono)))
-
-        if channels == 1:
-            out_samples = denoised_mono
+        if channels > 1 and _channels_differ(samples, channels):
+            # Genuinely distinct channels: denoise each ON ITS OWN and keep
+            # them separate.
+            #
+            # This used to downmix to mono and duplicate the result back
+            # across every channel, on the assumption (true for the ESP32,
+            # which records one mic as stereo) that channels carry no real
+            # difference. That assumption is false for a Mac meeting
+            # recording, where meetingcap deliberately puts system audio on
+            # L and the mic on R -- one channel per participant. Collapsing
+            # them destroyed a perfect speaker separation before Deepgram
+            # ever saw the audio, leaving diarization to guess who spoke
+            # from a mono mix of two people. Confirmed on a real recording:
+            # L and R came out bit-identical, and the transcript attributed
+            # one speaker's answers to the other.
+            tracks = []
+            for c in range(channels):
+                track = array.array("h", samples[c::channels])
+                tracks.append(_denoise_one(track))
+            frames = min(len(t) for t in tracks)
+            out_samples = array.array("h", bytes(frames * channels * 2))
+            for c, track in enumerate(tracks):
+                for i in range(frames):
+                    out_samples[i * channels + c] = track[i]
         else:
-            out_samples = array.array("h", bytes(len(denoised_mono) * channels * 2))
-            for i, v in enumerate(denoised_mono):
-                for c in range(channels):
-                    out_samples[i * channels + c] = v
+            mono = _downmix_to_mono(samples, channels)
+            if not mono:
+                return wav_bytes
+            denoised_mono = _denoise_one(mono)
+            if channels == 1:
+                out_samples = denoised_mono
+            else:
+                out_samples = array.array("h", bytes(len(denoised_mono) * channels * 2))
+                for i, v in enumerate(denoised_mono):
+                    for c in range(channels):
+                        out_samples[i * channels + c] = v
 
         if sys.byteorder == "big":
             out_samples.byteswap()

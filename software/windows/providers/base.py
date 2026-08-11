@@ -20,8 +20,22 @@ def summarize(transcript: str) -> dict:
     #     SUMMARY_JSON_INSTRUCTIONS) -- consumed by poller._build_email_drafts
     #     and notion_sync.push_tasks instead of them templating the text
     #     themselves.
+    #   "title": str -- a short, specific name for the conversation, used as the
+    #     Notion page / Obsidian note title (see notion_sync._recording_title).
+    #     Deliberately excludes any date/time: those already exist as their own
+    #     Notion "Date" property and in the Obsidian filename prefix.
     #   "calendar_events": [{"title": str, "date": str | None, "time": str | None}],
     #   "stakeholders": [{"name": str, "note": str | None}],
+    #   "organizations": [{"name": str | None, "role": str, "note": str | None}]
+    #     -- companies as first-class objects rather than free text inside the
+    #     summary prose. "role" separates the speaker's own employer from the
+    #     organization actually under discussion: a recruiter, agency,
+    #     consultant or investor talks *about* a company other than the one
+    #     they work for, and with no place to record that distinction the
+    #     summarizer conflated the two (live-reported: a recruiter's agency
+    #     credited with the client's product, team size and funding round).
+    #     name=None is meaningful and expected -- "the company being discussed,
+    #     never named in the transcript" is a real, honest entry.
     #   "follow_ups": [{"text": str, "owner": str | None}],
     #   "speaker_names": {speaker_id: name} for any "Speaker X:" label confidently
     #     identifiable from the transcript itself (self-introduction, or another
@@ -41,10 +55,12 @@ stakeholders, and follow-ups to the right person where the transcript makes
 that clear.
 Return ONLY valid JSON (no markdown fences, no commentary) matching exactly:
 {
+  "title": "a short, specific title for this conversation — 4-8 words naming who/what it was actually about (e.g. 'Talos recruiter screen — robotics PM role'). No date, no time: those are separate fields. Never a generic label like 'Meeting' or 'Conversation'.",
   "summary": "a bird's-eye view of the whole transcript",
   "action_items": [{"text": "...", "owner": "name or null", "due_date": "YYYY-MM-DD or null", "comm_type": "email" or null, "comm_recipient": "name or null", "email_subject": "... or null", "email_body": "... or null"}],
   "calendar_events": [{"title": "...", "date": "YYYY-MM-DD or null", "time": "HH:MM or null"}],
   "stakeholders": [{"name": "...", "note": "their role or why they matter here, or null"}],
+  "organizations": [{"name": "the company's name, or null if it is discussed but never actually named", "role": "employer_of_speaker" or "subject" or "client" or "investor" or "other", "note": "what this organization is/does here, or null"}],
   "follow_ups": [{"text": "an open question or pending decision, not yet a concrete action item", "owner": "name or null"}],
   "speaker_names": {"<the exact speaker label from the transcript, e.g. speaker_1>": "their real name"},
   "type": "journal" or "actionable",
@@ -53,6 +69,12 @@ Return ONLY valid JSON (no markdown fences, no commentary) matching exactly:
 If a list has nothing to report, return an empty list for it — never omit a
 key. Infer owner/due_date/date/time/stakeholders only when clearly stated or
 strongly implied in the transcript — use null rather than guessing.
+Every company/organization mentioned goes in "organizations" with the role
+it plays here, and prose must stay consistent with it: never attribute a
+product, team, funding round or headcount to an organization whose role
+says it isn't the one under discussion. An organization that is discussed
+but never named is a real entry with "name": null — that is the honest
+answer, not a reason to reuse some other organization's name.
 Any line prefixed "[background, likely a different conversation]" is
 either a different, more distant conversation the mic also picked up at
 a noisy venue, or a chunk a separate classification pass already judged
@@ -678,17 +700,111 @@ def format_transcript_with_speakers(text: str, segments, speaker_names: dict = N
     return "\n".join(lines) if lines else text
 
 
+def build_name_correction_prompt(summary: dict, name_map: dict, roster: dict = None) -> str:
+    """Rewrites an existing summary so every reference to a person uses the
+    user's corrected name -- everywhere, not just where the raw speaker_id
+    happened to appear.
+
+    Used instead of re-running the full summarizer after a rename, for two
+    reasons. First, re-summarizing regenerates from the transcript, whose
+    audio still contains the WRONG name (the model mis-heard "Sanchit" as
+    "Sanjit"), so it reproduces the same error every time -- the user's
+    correction is the only source of truth for who that person is, and it
+    exists nowhere in the transcript. Second, re-summarizing discards any
+    edits the user has made to the summary text (see
+    storage.set_summary_text), which would make the two features quietly
+    destroy each other.
+
+    Deliberately narrow: rewrite names, change nothing else. A pass that's
+    allowed to "improve" things while it's in there is a pass that silently
+    reverts the user's own corrections."""
+    import json
+
+    mapping_lines = "\n".join(
+        f'- anyone referred to as "{old}" is actually named "{new}"'
+        for old, new in name_map.items() if old and new
+    ) or "- (no explicit corrections; use the confirmed roster below)"
+    roster_lines = "\n".join(
+        f'- {sid} is "{name}"' for sid, name in (roster or {}).items() if name
+    ) or "- (none)"
+    return f"""\
+Below is a JSON summary of a conversation, plus the confirmed identities of
+the people in it. Correct the names in the JSON.
+
+Confirmed people (authoritative — a human verified these):
+{roster_lines}
+
+Explicit corrections:
+{mapping_lines}
+
+Rules:
+- Replace incorrect names everywhere they appear: in "summary" prose, and in
+  the "owner"/"name" fields of action_items, follow_ups, stakeholders, and
+  organizations.
+- Treat a near-miss spelling of a confirmed person's name as that person and
+  correct it (e.g. if "Sanchit" is confirmed, then "Sanjit"/"Sanjeet"/
+  "Sunchit" appearing in the same conversation are the same human — a
+  transcription mishearing, not a second person). Be conservative: only do
+  this when the names are clearly variants of each other AND nothing in the
+  text indicates they are genuinely different people.
+- Also fix indirect references: possessives, first-name-only mentions, and
+  raw diarization labels like "speaker_2".
+- If two entries in a list end up as the same person, merge them into one,
+  combining their notes.
+- Change NOTHING else: no rewording, no new facts, no removing or adding
+  information, no "improving" the summary. Only names change.
+- Someone who is neither in the roster nor in the corrections, and is not a
+  variant of one of them, must be left exactly as-is. Job-title entries like
+  "Talos CEO" are not name errors — leave them.
+
+Return ONLY the corrected JSON object, with exactly the same keys and
+structure as the input. No markdown fences, no commentary.
+
+JSON to correct:
+{json.dumps(summary, ensure_ascii=False, indent=2)}
+"""
+
+
+ORGANIZATION_ROLE_LABELS = {
+    "employer_of_speaker": "speaker's employer",
+    "subject": "under discussion",
+    "client": "client",
+    "investor": "investor",
+    "other": "mentioned",
+}
+
+
+def format_organization(org: dict) -> str:
+    """One display line for an organizations[] entry, shared by the
+    dashboard, notion_sync._build_blocks and obsidian_sync._format_markdown
+    so the three surfaces can't drift apart.
+
+    An entry with no name is rendered as "(unnamed)" rather than skipped:
+    "there is a company under discussion and the transcript never named it"
+    is exactly the fact this field exists to record, and hiding it would
+    reintroduce the ambiguity that let a speaker's employer get silently
+    substituted for it."""
+    name = (org.get("name") or "").strip() or "(unnamed)"
+    role = ORGANIZATION_ROLE_LABELS.get(org.get("role"), org.get("role") or "")
+    line = f"{name} [{role}]" if role else name
+    if org.get("note"):
+        line += f" — {org['note']}"
+    return line
+
+
 def _denull(value):
-    """LLMs sometimes emit the literal string "null" (or "none"/"n/a")
-    instead of JSON null for an unfilled optional field, despite the
-    prompt saying to use null -- caught in the wild via a "speaker_names"
-    guess that came back as {"speaker_1": "null"} instead of omitting the
-    key. Recursively normalizes those to real None/absent, since every
-    caller downstream (notion_sync.py, poller.py) treats a non-empty
-    string as real data with `if value:` checks and can't tell a
-    hallucinated "null" from an actual name."""
+    """LLMs sometimes emit the literal string "null" (or "none"/"n/a"/
+    "unknown") instead of JSON null for an unfilled optional field, despite
+    the prompt saying to use null -- caught in the wild via a
+    "speaker_names" guess that came back as {"speaker_1": "unknown"}
+    (and a "stakeholders" entry with name "unknown") instead of omitting
+    the unidentified speaker entirely. Recursively normalizes those to
+    real None/absent, since every caller downstream (notion_sync.py,
+    poller.py, the dashboard templates) treats a non-empty string as real
+    data with `if value:` checks and can't tell a hallucinated "unknown"
+    from an actual name."""
     if isinstance(value, str):
-        return None if value.strip().lower() in ("null", "none", "n/a", "") else value
+        return None if value.strip().lower() in ("null", "none", "n/a", "unknown", "") else value
     if isinstance(value, dict):
         cleaned = {k: _denull(v) for k, v in value.items()}
         return {k: v for k, v in cleaned.items() if v is not None}
@@ -716,19 +832,29 @@ def parse_summary_json(raw_text: str) -> dict:
         data = json.loads(text)
         record_type = _denull(data.get("type"))
         return {
+            "title": _denull(data.get("title")) or "",
             "summary": data.get("summary", "") or "",
             "action_items": _denull(data.get("action_items", []) or []),
             "calendar_events": _denull(data.get("calendar_events", []) or []),
             "stakeholders": _denull(data.get("stakeholders", []) or []),
+            # Deliberately NOT _denull'd on the entry level the way the
+            # others are: an organization discussed but never named is a
+            # real entry with name=None, and _denull drops None-valued dict
+            # keys entirely -- which is fine (readers use .get("name")) but
+            # means an unnamed org must not be mistaken for an empty one.
+            # Entries with neither a name nor a note carry nothing, so drop
+            # only those.
+            "organizations": [o for o in _denull(data.get("organizations", []) or [])
+                              if isinstance(o, dict) and (o.get("name") or o.get("note"))],
             "follow_ups": _denull(data.get("follow_ups", []) or []),
             "speaker_names": _denull(data.get("speaker_names", {}) or {}),
             "type": record_type if record_type in ("journal", "actionable") else "actionable",
             "excluded_background_note": _denull(data.get("excluded_background_note")),
         }
     except (json.JSONDecodeError, AttributeError):
-        return {"summary": raw_text.strip(), "action_items": [], "calendar_events": [],
-                "stakeholders": [], "follow_ups": [], "speaker_names": {}, "type": "actionable",
-                "excluded_background_note": None}
+        return {"title": "", "summary": raw_text.strip(), "action_items": [], "calendar_events": [],
+                "stakeholders": [], "organizations": [], "follow_ups": [], "speaker_names": {},
+                "type": "actionable", "excluded_background_note": None}
 
 
 def parse_social_post_json(raw_text: str) -> dict:

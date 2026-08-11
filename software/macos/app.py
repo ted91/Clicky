@@ -18,6 +18,7 @@ import secrets
 import paths
 import config
 import google_client
+import notion_oauth
 import linkedin_client
 import x_client
 import substack_client
@@ -27,6 +28,8 @@ import status
 import storage
 import poller
 from poller import poll_forever
+from providers import base as providers_base
+import usage_limit
 import voice_id
 import update_check
 
@@ -89,6 +92,27 @@ def _is_admin() -> bool:
 
 
 templates.env.globals["is_admin"] = _is_admin
+
+# Jarvis and Social Media Posting are optional features, off by default --
+# their nav items only appear once explicitly enabled under Settings ->
+# Advance, so a user who never turns them on doesn't see two extra nav
+# items for features they're not using. Same "Jinja global, not threaded
+# through every route's context" pattern as is_admin() above.
+def _jarvis_enabled() -> bool:
+    return bool(settings.get_all().get("jarvis_enabled"))
+
+
+def _social_enabled() -> bool:
+    return bool(settings.get_all().get("social_posting_enabled"))
+
+
+templates.env.globals["jarvis_enabled"] = _jarvis_enabled
+templates.env.globals["social_enabled"] = _social_enabled
+# Same role->label mapping the live re-render in static/app.js and
+# providers.base.format_organization use, so the server-rendered first
+# paint and the JS re-render agree.
+templates.env.globals["org_role_label"] = \
+    lambda role: providers_base.ORGANIZATION_ROLE_LABELS.get(role, role or "")
 
 
 def _gate(request: Request):
@@ -178,8 +202,15 @@ def get_audio(request: Request, content_hash: str):
     if redirect:
         return redirect
     wav_path = storage.get_wav_path(content_hash)
-    if not wav_path:
+    if not wav_path or not os.path.isfile(wav_path):
         return JSONResponse({"error": "not found"}, status_code=404)
+    # Recordings are stored losslessly compressed (see audio_store), so the
+    # file on disk may be FLAC even though this route is ".wav". Serving it
+    # with the right media type lets the browser play it directly -- every
+    # current browser decodes FLAC -- rather than paying to decode a
+    # ~100MB recording into memory on every seek.
+    is_flac = wav_path.lower().endswith(".flac")
+    media_type = "audio/flac" if is_flac else "audio/wav"
     # No `filename` (so no Content-Disposition header) for the default
     # inline-playback case -- the dashboard's <audio> player hits this same
     # URL, and forcing "attachment" there risks some browsers refusing to
@@ -189,10 +220,16 @@ def get_audio(request: Request, content_hash: str):
     if request.query_params.get("download"):
         record = storage.get_recording(content_hash)
         name = (record.get("name") if record else None) or content_hash
-        if not name.lower().endswith(".wav"):
-            name += ".wav"
-        return FileResponse(wav_path, media_type="audio/wav", filename=name)
-    return FileResponse(wav_path, media_type="audio/wav")
+        # The offered filename must match what's actually being sent --
+        # handing someone a FLAC named ".wav" produces a file their player
+        # may refuse to open.
+        want_ext = ".flac" if is_flac else ".wav"
+        for ext in (".wav", ".flac"):
+            if name.lower().endswith(ext):
+                name = name[: -len(ext)]
+        name += want_ext
+        return FileResponse(wav_path, media_type=media_type, filename=name)
+    return FileResponse(wav_path, media_type=media_type)
 
 
 @app.delete("/recordings/{content_hash}")
@@ -229,15 +266,89 @@ def rename_speaker(request: Request, content_hash: str, speaker_id: str, name: s
     redirect = _gate(request)
     if redirect:
         return redirect
-    ok = storage.set_speaker_name(content_hash, speaker_id, name.strip())
+    ok, previous = storage.set_speaker_name(content_hash, speaker_id, name.strip())
     if ok:
+        # A stakeholder entry recorded under the OLD name is the same
+        # person -- rewrite it before the resync, or the note ends up
+        # listing them twice under two spellings (live-reported: a
+        # corrected "Sanchit" still showing an LLM-guessed "Sanjit"
+        # alongside it, with nothing tying the two together).
+        poller.reconcile_stakeholders_after_rename(content_hash, previous, name.strip())
         # Re-summarizing (so Summary/Stakeholders prose picks up the new
         # name too, not just the Transcript block -- see
         # poller.resync_after_rename) means an LLM call plus rewriting the
         # whole Notion page; running it as a background task keeps this
         # response fast and means a Notion hiccup can't fail the rename,
         # which has already succeeded locally by this point.
-        background_tasks.add_task(poller.resync_after_rename, content_hash)
+        background_tasks.add_task(poller.resync_after_rename, content_hash, previous, name.strip())
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+
+@app.post("/recordings/{content_hash}/resummarize")
+def resummarize(request: Request, content_hash: str, background_tasks: BackgroundTasks = None):
+    """Re-runs the full summarizer over this recording's transcript.
+
+    Unlike /fix-names (which only rewrites names in the existing summary),
+    this regenerates everything -- so a recording processed before a schema
+    change picks up the new fields (e.g. "organizations", "title"). The
+    transcript is re-formatted with the confirmed speaker names first, so
+    the new pass sees the corrected names rather than the original guesses.
+    A hand-edited summary is preserved (see _resummarize_and_repush)."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    if not storage.get_recording(content_hash):
+        return JSONResponse({"ok": False}, status_code=404)
+    background_tasks.add_task(poller.resummarize_recording, content_hash)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/recordings/{content_hash}/fix-names")
+def fix_names(request: Request, content_hash: str, background_tasks: BackgroundTasks = None):
+    """Re-runs the name-correction pass on demand, for a recording whose
+    names were already corrected before this existed (or where a variant
+    spelling slipped through). Uses the confirmed speaker roster, so it
+    needs no old->new mapping -- see
+    providers.base.build_name_correction_prompt."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    if not storage.get_recording(content_hash):
+        return JSONResponse({"ok": False}, status_code=404)
+    background_tasks.add_task(poller.resync_after_rename, content_hash)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/recordings/{content_hash}/summary")
+def edit_summary(request: Request, content_hash: str, summary: str = Form(""),
+                 background_tasks: BackgroundTasks = None):
+    """Saves a hand-corrected summary and re-pushes it to Notion/Obsidian.
+
+    The re-push runs in the background for the same reason the rename route
+    does it that way: the edit has already succeeded locally by this point,
+    and a Notion hiccup shouldn't fail the user's edit."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    ok = storage.set_summary_text(content_hash, summary)
+    if ok:
+        background_tasks.add_task(poller.repush_after_edit, content_hash)
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+
+@app.post("/recordings/{content_hash}/stakeholder/{index}")
+def edit_stakeholder(request: Request, content_hash: str, index: int, name: str = Form("")):
+    """Renames, or (with an empty name) removes, one stakeholder entry.
+    Stakeholders come from the LLM's read of the transcript, so they can
+    name the same person differently than a speaker the user has since
+    corrected -- this is the only way to fix that by hand. Dedupes
+    afterwards so two entries collapsing onto one name become one row."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    ok = storage.set_stakeholder(content_hash, index, name)
+    if ok:
+        storage.merge_duplicate_stakeholders(content_hash)
     return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
 
 
@@ -282,6 +393,77 @@ def set_jarvis_status(request: Request, content_hash: str, status: str = Form(..
     if status not in ("pending", "done", "discarded"):
         return JSONResponse({"error": "invalid_status"}, status_code=400)
     ok = storage.set_jarvis_user_status(content_hash, status)
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+
+@app.post("/recordings/{content_hash}/action-item/{item_index}")
+def set_action_item_done(request: Request, content_hash: str, item_index: int, done: bool = Form(...)):
+    """Toggles the done checkbox on one action item, and mirrors it onto
+    the matching Notion Task page's Status property (item_index here is
+    0-based, from the dashboard's loop.index0; task_status_links is keyed
+    1-based, matching notion_sync.push_tasks()'s enumerate(..., start=1),
+    hence the +1). Best-effort on the Notion side -- a hiccup there
+    shouldn't block the dashboard checkbox itself from reflecting the
+    click."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    ok = storage.set_action_item_done(content_hash, item_index, done)
+    if ok:
+        task_page_id = storage.get_task_page_id(content_hash, item_index + 1)
+        if task_page_id:
+            try:
+                import notion_sync
+                notion_sync.set_task_done(task_page_id, done)
+            except Exception as e:
+                log.warning("failed to mirror action-item done state to Notion Task %s: %s", task_page_id, e)
+        # Obsidian gets the same mirror -- a checkbox that only reached one
+        # destination is exactly how the two drifted apart before.
+        if settings.get_all().get("obsidian_vault_path"):
+            try:
+                import obsidian_sync
+                obsidian_sync.set_task_done(storage.get_recording(content_hash), item_index + 1, done)
+            except Exception as e:
+                log.warning("failed to mirror action-item done state to Obsidian: %s", e)
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+
+@app.post("/recordings/{content_hash}/action-item/{item_index}/watch")
+def set_action_item_watch(request: Request, content_hash: str, item_index: int, watch_query: str = Form("")):
+    """Sets (or clears, if watch_query is blank) an email watch on one
+    action item -- poller.check_email_watches_once() then periodically
+    searches Mac Mail.app for it and alerts on new matches. Mirrored
+    best-effort onto the matching Notion Task page and Obsidian Tasks note
+    (macOS only -- apple_mail.py needs Mail.app, so this route is a no-op
+    watch on Windows builds beyond just persisting the query text)."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    watch_query = watch_query.strip()
+    seen_ids = []
+    if watch_query:
+        try:
+            import apple_mail
+            seen_ids = [m["id"] for m in apple_mail.search_messages(watch_query)]
+        except Exception as e:
+            log.warning("baseline Mail.app search failed for watch %r (watch still set, will search fresh next poll): %s", watch_query, e)
+    ok = storage.set_action_item_watch(content_hash, item_index, watch_query, seen_ids)
+    if ok:
+        task_page_id = storage.get_task_page_id(content_hash, item_index + 1)
+        if task_page_id:
+            try:
+                import notion_sync
+                notion_sync.set_task_watch(task_page_id, watch_query)
+            except Exception as e:
+                log.warning("failed to mirror watch to Notion Task %s: %s", task_page_id, e)
+        if settings.get_all().get("obsidian_vault_path"):
+            try:
+                import obsidian_sync
+                record = storage.get_recording(content_hash)
+                if record:
+                    obsidian_sync.set_task_watch(record, item_index, watch_query)
+            except Exception as e:
+                log.warning("failed to mirror watch to Obsidian for %s: %s", content_hash, e)
     return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
 
 
@@ -444,7 +626,17 @@ def setup_form(request: Request):
         # initial unauthenticated run. Its POST route stays live since
         # settings.html's Providers/Account panels submit to it directly.
         return RedirectResponse("/settings", status_code=303)
-    return templates.TemplateResponse(request, "setup.html", {"current": settings.get_all(), "error": None})
+    return templates.TemplateResponse(request, "setup.html", {
+        "current": settings.get_all(),
+        "error": None,
+        "demo_key_available": {
+            "mistral": bool(config.MISTRAL_API_KEY),
+            "openai": bool(config.OPENAI_API_KEY),
+            "anthropic": bool(config.ANTHROPIC_API_KEY),
+            "deepgram": bool(config.DEEPGRAM_API_KEY),
+        },
+        "demo_minutes_cap": usage_limit.MONTHLY_CAP_MINUTES,
+    })
 
 
 @app.post("/setup")
@@ -465,7 +657,11 @@ def setup_submit(
         return RedirectResponse("/login", status_code=303)
 
     # A key is required the first time a provider is chosen, but re-saving
-    # settings later shouldn't force re-entering keys already on file.
+    # settings later shouldn't force re-entering keys already on file --
+    # and a demo build with a bundled key (see config.py's reload_settings,
+    # .env's MISTRAL_API_KEY/DEEPGRAM_API_KEY) shouldn't ask a demo user for
+    # one at all, since config.<KEY> already falls back to the bundled
+    # value whenever settings.json has nothing saved.
     current = settings.get_all()
     for provider in {stt_provider, llm_provider}:
         key_field = PROVIDERS_NEEDING_KEY.get(provider)
@@ -473,7 +669,8 @@ def setup_submit(
             continue
         new_value = {"mistral_api_key": mistral_api_key, "openai_api_key": openai_api_key,
                      "anthropic_api_key": anthropic_api_key, "deepgram_api_key": deepgram_api_key}[key_field]
-        if not new_value and not current.get(key_field):
+        bundled_key = getattr(config, key_field.upper(), "")
+        if not new_value and not current.get(key_field) and not bundled_key:
             error = f"'{provider}' needs an API key — enter one below."
             return templates.TemplateResponse(request, "setup.html", {"current": current, "error": error})
 
@@ -673,21 +870,37 @@ def settings_conversation_merge(
 @app.post("/settings/jarvis")
 def settings_jarvis(
     request: Request,
-    jarvis_enabled: bool = Form(False),
     jarvis_repo_path: str = Form(""),
 ):
     """jarvis_repo_path is only used by the code_task action (always the
     real Claude Code CLI, invoked with cwd=jarvis_repo_path -- see
     jarvis.py's _action_code_task) -- everything else Jarvis does (Q&A,
-    Calendar/Reminders/Mail automation) needs no path configured."""
+    Calendar/Reminders/Mail automation) needs no path configured. The
+    enable/disable toggle itself lives under Settings -> Advance (see
+    settings_features()), not here -- keeping it off this form means
+    saving a repo path can never silently flip the feature off."""
     redirect = _gate(request)
     if redirect:
         return redirect
-    settings.update(
-        jarvis_enabled=jarvis_enabled,
-        jarvis_repo_path=jarvis_repo_path.strip() or None,
-    )
-    return RedirectResponse("/settings?panel=jarvis", status_code=303)
+    settings.update(jarvis_repo_path=jarvis_repo_path.strip() or None)
+    return templates.TemplateResponse(request, "jarvis.html", _jarvis_context(saved=True))
+
+
+@app.post("/settings/features")
+def settings_features(
+    request: Request,
+    jarvis_enabled: bool = Form(False),
+    social_posting_enabled: bool = Form(False),
+):
+    """Jarvis and Social Media Posting are optional, off by default -- this
+    is the single place both are turned on/off, and their site-nav items
+    (see _nav.html's jarvis_enabled()/social_enabled() Jinja globals) only
+    appear once enabled here."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    settings.update(jarvis_enabled=jarvis_enabled, social_posting_enabled=social_posting_enabled)
+    return templates.TemplateResponse(request, "settings.html", _settings_context("features", saved=True))
 
 
 @app.post("/settings/voice-id")
@@ -716,49 +929,6 @@ def settings_voice_id_forget_all(request: Request):
         return redirect
     voice_id.delete_all_voiceprints()
     return RedirectResponse("/settings?panel=voice-id", status_code=303)
-
-
-@app.post("/settings/custom-statuses")
-async def settings_custom_statuses(request: Request):
-    redirect = _gate(request)
-    if redirect:
-        return redirect
-    # Repeated <select name="icon"> / <input name="text"> pairs, one per
-    # row -- parsed positionally (row i's icon pairs with row i's text),
-    # same shape the add/remove-row JS in settings.html builds. A row left
-    # blank (no text typed) is dropped rather than synced as an empty
-    # custom status.
-    form = await request.form()
-    icons = form.getlist("icon")
-    texts = form.getlist("text")
-    statuses = [{"icon": icon, "text": text.strip()} for icon, text in zip(icons, texts) if text.strip()]
-    settings.update(custom_statuses=statuses)
-    config.reload_settings()
-
-    import ble_device_client
-    try:
-        ble_device_client.send_custom_statuses(statuses)
-        msg = "Saved and sent to device."
-    except Exception as e:
-        msg = f"Saved locally, but failed to reach device over BLE: {e}. It'll pick up the change next time you resave once reconnected."
-    return RedirectResponse(f"/settings?panel=custom-statuses&wifi_msg={msg}", status_code=303)
-
-
-@app.post("/settings/custom-statuses/clear")
-async def settings_custom_statuses_clear(request: Request):
-    redirect = _gate(request)
-    if redirect:
-        return redirect
-    settings.update(custom_statuses=[])
-    config.reload_settings()
-
-    import ble_device_client
-    try:
-        ble_device_client.send_custom_statuses([])
-        msg = "Cleared and synced to device."
-    except Exception as e:
-        msg = f"Cleared locally, but failed to reach device over BLE: {e}. It'll pick up the change next time you resave once reconnected."
-    return RedirectResponse(f"/settings?panel=custom-statuses&wifi_msg={msg}", status_code=303)
 
 
 @app.post("/settings/wifi/connect")
@@ -934,8 +1104,17 @@ def _settings_context(active_panel: str = "device", wifi_msg: str = "", saved: b
     should land on the Google panel). Social Media Posting itself is a
     separate top-level page (/social), not nested here -- see that route.
     """
+    current = settings.get_all()
+    if not current.get("obsidian_vault_path"):
+        # Pre-fill (display only, never silently saved) with an
+        # auto-detected vault so the field isn't blank asking for a
+        # filesystem path -- see obsidian_sync.detect_vault_path().
+        import obsidian_sync
+        detected = obsidian_sync.detect_vault_path()
+        if detected:
+            current = dict(current, obsidian_vault_path=detected)
     return {
-        "current": settings.get_all(),
+        "current": current,
         "active_panel": active_panel,
         "active_nav": "settings",
         "wifi_msg": wifi_msg,
@@ -943,6 +1122,7 @@ def _settings_context(active_panel: str = "device", wifi_msg: str = "", saved: b
         "setup_error": setup_error,
         "google_connected": google_client.is_connected(),
         "google_configured": google_client.has_client_credentials(),
+        "notion_oauth_configured": notion_oauth.has_client_credentials(),
         "linkedin_connected": linkedin_client.is_connected(),
         "linkedin_configured": linkedin_client.has_client_credentials(),
         "x_connected": x_client.is_connected(),
@@ -957,6 +1137,9 @@ def _settings_context(active_panel: str = "device", wifi_msg: str = "", saved: b
         "device_firmware_version": poller.get_device_firmware_version(),
         "firmware_push_pending": update_check.firmware_push_pending(
             poller.get_device_firmware_version() or "0.0.0", update_check.get_bundled_firmware_version()),
+        "using_demo_stt_key": usage_limit.is_using_bundled_key(config.STT_PROVIDER),
+        "demo_minutes_used": round(usage_limit.minutes_used(), 1),
+        "demo_minutes_cap": usage_limit.MONTHLY_CAP_MINUTES,
     }
 
 
@@ -1022,6 +1205,74 @@ def integrations_submit(
         substack_publication_url=substack_publication_url or None,
     )
     return templates.TemplateResponse(request, "settings.html", _settings_context(panel, saved=True))
+
+
+@app.get("/notion/connect")
+def notion_connect(request: Request):
+    # Mirrors google_connect() exactly -- no credentials form, the OAuth
+    # client is baked in at build time (config.NOTION_CLIENT_ID/SECRET).
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    import notion_oauth
+    if not notion_oauth.has_client_credentials():
+        return RedirectResponse("/settings?panel=notion", status_code=303)
+    state = secrets.token_urlsafe(16)
+    request.session["notion_oauth_state"] = state
+    return RedirectResponse(notion_oauth.authorize_url(request, state), status_code=303)
+
+
+@app.get("/notion/callback", name="notion_callback")
+def notion_callback(request: Request, code: str = None, state: str = None, error: str = None):
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    import notion_oauth
+    expected_state = request.session.pop("notion_oauth_state", None)
+    if error or not code or not state or state != expected_state:
+        return templates.TemplateResponse(request, "settings.html",
+            _settings_context("notion", setup_error=f"Notion sign-in failed: {error or 'invalid response'}"))
+    try:
+        notion_oauth.exchange_code(request, code)
+    except RuntimeError as e:
+        return templates.TemplateResponse(request, "settings.html", _settings_context("notion", saved=False, setup_error=str(e)))
+    # Token saved -- still need a page to create databases under (OAuth
+    # only grants access to page(s), it doesn't tell us which one to build
+    # in). Land on the page picker rather than /settings directly.
+    return RedirectResponse("/notion/pick-page", status_code=303)
+
+
+@app.get("/notion/pick-page")
+def notion_pick_page(request: Request):
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    import notion_oauth
+    if not settings.get_all().get("notion_token"):
+        return RedirectResponse("/settings?panel=notion", status_code=303)
+    pages = notion_oauth.list_accessible_pages()
+    return templates.TemplateResponse(request, "notion_pick_page.html", {"pages": pages, "error": None})
+
+
+@app.post("/notion/pick-page")
+def notion_pick_page_submit(request: Request, page_id: str = Form(...)):
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    import notion_setup
+    token = settings.get_all().get("notion_token")
+    try:
+        ids = notion_setup.create_workspace(token, page_id)
+        settings.update(**ids)
+    except notion_setup.NotionSetupError as e:
+        pages = []
+        try:
+            import notion_oauth
+            pages = notion_oauth.list_accessible_pages()
+        except Exception:
+            pass
+        return templates.TemplateResponse(request, "notion_pick_page.html", {"pages": pages, "error": str(e)})
+    return RedirectResponse("/settings?panel=notion&saved=1", status_code=303)
 
 
 @app.post("/integrations/setup-notion")
@@ -1127,16 +1378,16 @@ def integrations_setup_jarvis(
     saved = settings.get_all()
     notion_token = saved.get("notion_token")
     if not notion_token:
-        return templates.TemplateResponse(request, "settings.html",
-            _settings_context("jarvis", setup_error="Set up Notion first, then add the Jarvis database."))
+        return templates.TemplateResponse(request, "jarvis.html",
+            _jarvis_context(setup_error="Set up Notion first, then add the Jarvis database."))
     import notion_setup
     try:
         page_id = _extract_notion_id(notion_parent_page_id)
         ids = notion_setup.create_jarvis_database(notion_token, page_id)
         settings.update(**ids)
-        return templates.TemplateResponse(request, "settings.html", _settings_context("jarvis", saved=True, setup_error=None))
+        return templates.TemplateResponse(request, "jarvis.html", _jarvis_context(saved=True))
     except notion_setup.NotionSetupError as e:
-        return templates.TemplateResponse(request, "settings.html", _settings_context("jarvis", saved=False, setup_error=str(e)))
+        return templates.TemplateResponse(request, "jarvis.html", _jarvis_context(setup_error=str(e)))
 
 
 @app.post("/jarvis/enable-live-agent")
@@ -1151,29 +1402,29 @@ def jarvis_enable_live_agent(request: Request, groq_api_key: str = Form("")):
     saved = settings.get_all()
     deepgram_key = saved.get("deepgram_api_key") or ""
     if not deepgram_key:
-        return templates.TemplateResponse(request, "settings.html",
-            _settings_context("jarvis", setup_error="Set a Deepgram API key under Settings -> Providers first."))
+        return templates.TemplateResponse(request, "jarvis.html",
+            _jarvis_context(setup_error="Set a Deepgram API key under Settings -> Connectors first."))
     if groq_api_key:
         settings.update(groq_api_key=groq_api_key)
     else:
         groq_api_key = saved.get("groq_api_key") or ""
     if not groq_api_key:
-        return templates.TemplateResponse(request, "settings.html",
-            _settings_context("jarvis", setup_error="A Groq API key is required (free tier) -- enter one below."))
+        return templates.TemplateResponse(request, "jarvis.html",
+            _jarvis_context(setup_error="A Groq API key is required (free tier) -- enter one below."))
 
     mac_base_url = poller.wifi_base_url_if_reachable()
     if not mac_base_url:
-        return templates.TemplateResponse(request, "settings.html",
-            _settings_context("jarvis", setup_error="Device isn't reachable over WiFi right now -- try again once it is."))
+        return templates.TemplateResponse(request, "jarvis.html",
+            _jarvis_context(setup_error="Device isn't reachable over WiFi right now -- try again once it is."))
 
     device_key = settings.get_or_create_jarvis_device_api_key()
     import device_client
     try:
         device_client.set_jarvis_config(deepgram_key, groq_api_key, mac_base_url, device_key, base_url=mac_base_url)
     except Exception as e:
-        return templates.TemplateResponse(request, "settings.html",
-            _settings_context("jarvis", setup_error=f"Couldn't push config to the device: {e}"))
-    return templates.TemplateResponse(request, "settings.html", _settings_context("jarvis", saved=True, setup_error=None))
+        return templates.TemplateResponse(request, "jarvis.html",
+            _jarvis_context(setup_error=f"Couldn't push config to the device: {e}"))
+    return templates.TemplateResponse(request, "jarvis.html", _jarvis_context(saved=True))
 
 
 @app.get("/linkedin/connect")
@@ -1459,17 +1710,34 @@ def jarvis_memory_facts(request: Request):
     return Response(memory_store.facts_context(), media_type="text/plain")
 
 
+def _jarvis_context(saved: bool = False, setup_error: str = None) -> dict:
+    """Jarvis is a separate assistant feature from the core record -> note
+    pipeline, so its configuration lives on its own page (here) rather than
+    in Settings -- mirrors _settings_context's shape/purpose for the
+    handful of POST routes that used to render settings.html directly."""
+    return {
+        "commands": [r for r in _recordings_for_display() if r.get("kind") == "command"],
+        "active_nav": "jarvis",
+        "current": settings.get_all(),
+        "jarvis_device_api_key": settings.get_or_create_jarvis_device_api_key(),
+        "saved": saved,
+        "setup_error": setup_error,
+    }
+
+
 @app.get("/jarvis")
 def jarvis_page(request: Request):
     """Jarvis voice commands, kept off the main dashboard (see index()) --
     they aren't a recording in the memo/journal sense (no speakers/summary/
     action items), so they get the same top-level-page treatment /social
-    already established for a different non-memo recording kind."""
+    already established for a different non-memo recording kind. Also owns
+    Jarvis's own configuration (enable toggle, repo path, live agent,
+    device API key) -- moved out of Settings entirely so Settings stays
+    scoped to the core recorder/meeting pipeline."""
     redirect = _gate(request)
     if redirect:
         return redirect
-    commands = [r for r in _recordings_for_display() if r.get("kind") == "command"]
-    return templates.TemplateResponse(request, "jarvis.html", {"commands": commands, "active_nav": "jarvis"})
+    return templates.TemplateResponse(request, "jarvis.html", _jarvis_context())
 
 
 @app.get("/social")
@@ -1593,15 +1861,33 @@ def people_contact(request: Request, name: str = Form(...), email: str = Form(""
     redirect = _gate(request)
     if redirect:
         return redirect
-    people_database_id = settings.get_all().get("notion_people_database_id")
-    if not people_database_id:
-        return JSONResponse({"error": "Notion People database isn't configured"}, status_code=400)
-    import notion_sync
-    try:
-        notion_sync.set_person_contact_by_name(name.strip(), people_database_id,
-                                                email=email.strip() or None, linkedin=linkedin.strip() or None)
-    except RuntimeError as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
+    saved = settings.get_all()
+    people_database_id = saved.get("notion_people_database_id")
+    vault_path = saved.get("obsidian_vault_path")
+    if not people_database_id and not vault_path:
+        return JSONResponse({"error": "Neither a Notion People database nor an Obsidian vault is configured"},
+                            status_code=400)
+    # Written to every configured destination, not just Notion -- contact
+    # details landing in only one place is the drift this whole pass exists
+    # to remove. A failure on one destination is reported but must not stop
+    # the other from being written.
+    errors = []
+    if people_database_id:
+        import notion_sync
+        try:
+            notion_sync.set_person_contact_by_name(name.strip(), people_database_id,
+                                                    email=email.strip() or None, linkedin=linkedin.strip() or None)
+        except RuntimeError as e:
+            errors.append(f"Notion: {e}")
+    if vault_path:
+        import obsidian_sync
+        try:
+            obsidian_sync.set_person_contact_by_name(name.strip(),
+                                                      email=email.strip() or None, linkedin=linkedin.strip() or None)
+        except Exception as e:
+            errors.append(f"Obsidian: {e}")
+    if errors and len(errors) == (bool(people_database_id) + bool(vault_path)):
+        return JSONResponse({"error": "; ".join(errors)}, status_code=502)
     import analytics
     analytics.track_event("people_contact_added")
     return JSONResponse({"ok": True})
@@ -1617,29 +1903,47 @@ def people_duplicates(request: Request):
     redirect = _gate(request)
     if redirect:
         return redirect
-    people_database_id = settings.get_all().get("notion_people_database_id")
-    if not people_database_id:
-        return JSONResponse({"groups": []})
-    import notion_sync
-    try:
-        groups = notion_sync.find_duplicate_people(people_database_id)
-    except RuntimeError as e:
-        return JSONResponse({"error": str(e)}, status_code=502)
+    saved = settings.get_all()
+    groups = []
+    # Both destinations are scanned; each group carries which one it came
+    # from so the Merge button knows where to act (a Notion group's ids are
+    # page ids, an Obsidian group's are file paths).
+    if saved.get("notion_people_database_id"):
+        import notion_sync
+        try:
+            for g in notion_sync.find_duplicate_people(saved["notion_people_database_id"]):
+                groups.append({**g, "destination": "notion"})
+        except RuntimeError as e:
+            return JSONResponse({"error": str(e)}, status_code=502)
+    if saved.get("obsidian_vault_path"):
+        import obsidian_sync
+        try:
+            for g in obsidian_sync.find_duplicate_people():
+                groups.append({**g, "destination": "obsidian"})
+        except Exception as e:
+            log.warning("Obsidian duplicate scan failed (non-fatal): %s", e)
     return JSONResponse({"groups": groups})
 
 
 @app.post("/people/merge")
-def people_merge(request: Request, keeper_id: str = Form(...), loser_id: str = Form(...)):
-    """Explicit, user-confirmed merge of two People pages found by
-    /api/people/duplicates -- see notion_sync.merge_person_pages for what
-    actually happens (content append, relation re-pointing, archive)."""
+def people_merge(request: Request, keeper_id: str = Form(...), loser_id: str = Form(...),
+                 destination: str = Form("notion")):
+    """Explicit, user-confirmed merge of two People entries found by
+    /api/people/duplicates. destination picks which store to act on --
+    "notion" (ids are page ids, see notion_sync.merge_person_pages) or
+    "obsidian" (ids are note paths, see obsidian_sync.merge_person_notes).
+    Never automatic on either side."""
     redirect = _gate(request)
     if redirect:
         return redirect
-    import notion_sync
     try:
-        notion_sync.merge_person_pages(keeper_id, loser_id)
-    except RuntimeError as e:
+        if destination == "obsidian":
+            import obsidian_sync
+            obsidian_sync.merge_person_notes(keeper_id, loser_id)
+        else:
+            import notion_sync
+            notion_sync.merge_person_pages(keeper_id, loser_id)
+    except (RuntimeError, OSError) as e:
         return JSONResponse({"error": str(e)}, status_code=502)
     import analytics
     analytics.track_event("people_merged")

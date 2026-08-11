@@ -13,9 +13,11 @@ Runs as an asyncio task started from app.py's lifespan handler.
 """
 import asyncio
 import hashlib
+import json
 import logging
+import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -347,9 +349,13 @@ async def sync_once():
             # reconnect 3s later and block deep sleep exactly as before.
             _start_ble_quiet_period()
 
-    # Jarvis voice commands (cmd_*.wav) download first -- a live, waited-on
-    # interaction, unlike a memo/meeting recording processed in the
-    # background. Matches storage.get_unprocessed()'s command-first order.
+    # Jarvis voice commands (cmd_*.wav, see recorder.cpp) download first --
+    # a command is a live, waited-on interaction, unlike a memo/meeting
+    # recording sitting in the background with no one watching a clock.
+    # Without this, a fresh command queued on the device behind a large
+    # unsynced memo recording would wait through that whole download before
+    # even starting its own -- matches storage.get_unprocessed()'s same
+    # command-first ordering on the processing side.
     recordings = sorted(recordings, key=lambda e: not e["name"].startswith("cmd_"))
 
     for entry in recordings:
@@ -390,11 +396,27 @@ async def sync_once():
                 log.debug("could not delete empty %s from SD (will keep skipping it): %s", name, e)
             continue
 
+        # Explicit start/end logging -- a large file (SD recordings have no
+        # size cap) can take several minutes, and until now nothing logged
+        # anything for the whole duration: no "started", no progress, and
+        # the read-timeout never fires as long as SOME bytes trickle in
+        # within each 30s window (see device_client.DOWNLOAD_TIMEOUT). From
+        # the log alone a slow-but-working transfer was indistinguishable
+        # from one that had silently died -- live-confirmed confusing on a
+        # 79MB recording. This doesn't speed anything up, just makes a long
+        # download visible instead of looking like it vanished.
+        if size and size > 2 * 1024 * 1024:
+            log.info("downloading %s (%.1f MB, this may take a while)...", name, size / 1024 / 1024)
+        download_started = time.monotonic()
         try:
             wav_bytes = await asyncio.to_thread(transport.download_recording, name)
         except Exception as e:
-            log.warning("failed to download %s: %s", name, e)
+            log.warning("failed to download %s after %.0fs: %s", name, time.monotonic() - download_started, e)
             continue
+        download_elapsed = time.monotonic() - download_started
+        if download_elapsed > 5:
+            kbps = (len(wav_bytes) / 1024) / download_elapsed
+            log.info("downloaded %s in %.0fs (%.0f KB/s)", name, download_elapsed, kbps)
 
         if not _is_valid_wav(wav_bytes):
             # Don't mark this (name, size) as known -- leaving it unknown
@@ -403,6 +425,16 @@ async def sync_once():
             log.warning("downloaded %s but it's not a valid WAV file (got %d bytes, no RIFF/WAVE header) "
                         "-- likely a dropped BLE packet, will retry next cycle", name, len(wav_bytes))
             continue
+
+        # Device records in a private ADPCM format now (~4:1 smaller SD/
+        # WiFi footprint -- see firmware/src/ima_adpcm.h). Decode to
+        # standard PCM here, once, right after download -- everything
+        # downstream (transcription providers, storage's saved wav_path,
+        # dashboard playback, duration calc) expects ordinary PCM WAV and
+        # needs no awareness this ever happened. No-ops for an
+        # already-PCM file (e.g. one synced before this feature existed).
+        import adpcm
+        wav_bytes = adpcm.maybe_decode(wav_bytes)
 
         content_hash = hashlib.md5(wav_bytes).hexdigest()
         # RAM recordings skip the pre-download is_known_by_size gate above,
@@ -485,6 +517,17 @@ def _apply_context_fit_to_segments(segments, merged_verdicts):
     return result
 
 
+def _is_garbage_transcript(transcript: str) -> bool:
+    """A non-empty WAV that still transcribed to nothing usable -- pure
+    silence/noise (most STT providers return "" or a couple of filler
+    tokens like "you" for those), or a fragment too short to have said
+    anything ("um", "hello?"). Word-count threshold, not character count,
+    since a single long garbled word shouldn't count as content either."""
+    if not transcript or not transcript.strip():
+        return True
+    return len(transcript.strip().split()) < 3
+
+
 def _enforce_journal_rule(summary: dict, segments, pre_classified_conversation: bool = False):
     """Journaling means the recording's owner talking to themself -- by
     definition that requires exactly one speaker. The LLM's "journal" vs
@@ -524,6 +567,30 @@ def _enforce_journal_rule(summary: dict, segments, pre_classified_conversation: 
         summary["type"] = "actionable"
 
 
+def _resolve_speaker_labels_in_summary(summary: dict):
+    """The summarizer's own self-identification (summary["speaker_names"])
+    can be internally inconsistent with how the SAME LLM response labels
+    action_items/follow_ups' "owner" field -- live-confirmed: a response
+    self-identified speaker_2 as "Ben Wiggins" in speaker_names, but still
+    wrote owner="speaker_2" (the raw diarization id, not the name) on
+    every task it assigned to that same person. Left uncorrected, this
+    means a name that's already known -- whether guessed at original
+    processing time or confirmed later via resync_after_rename -- can
+    still show up as a raw "speaker_N" id on the dashboard/Notion/
+    Obsidian instead of the real name. Normalizes any owner value that's
+    literally a raw speaker_id key into its resolved display name; a
+    no-op for owner values that are already a real name (they won't match
+    a speaker_id key)."""
+    speaker_names = summary.get("speaker_names") or {}
+    if not speaker_names:
+        return
+    for key in ("action_items", "follow_ups"):
+        for item in summary.get(key) or []:
+            owner = item.get("owner")
+            if owner and owner in speaker_names:
+                item["owner"] = speaker_names[owner]
+
+
 def _add_speakers_as_stakeholders(summary: dict):
     """The LLM's "stakeholders" list is prompted for *other* people the
     speaker mentions -- it doesn't reliably include the speaker themself.
@@ -542,100 +609,161 @@ def _add_speakers_as_stakeholders(summary: dict):
             existing.add(name.strip().lower())
 
 
-async def resync_after_rename(content_hash: str):
+def repair_missing_obsidian_notes_once() -> int:
+    """Clears obsidian_synced for records whose note file is gone from the
+    vault, so distribute_once() writes it again next cycle.
+
+    See obsidian_sync.missing_notes for why a sync flag can't be trusted
+    on its own. Returns how many flags were reset."""
+    if not settings.get_all().get("obsidian_vault_path"):
+        return 0
+    import obsidian_sync
+    missing = obsidian_sync.missing_notes(storage.list_recordings())
+    for content_hash, dest in missing:
+        storage.reset_distribution_flags(content_hash, [dest])
+        log.warning("%s note for %s is missing from the vault -- rewriting it", dest, content_hash)
+    return len(missing)
+
+
+async def resummarize_recording(content_hash: str):
+    """Regenerates the whole summary from the transcript, then re-pushes.
+
+    The transcript is re-formatted with the confirmed speaker names first,
+    so the new pass reads "Sanchit: ..." rather than the diarization label
+    or the original mis-heard name. Used by the dashboard's "re-summarize"
+    action, and for bringing a recording processed under an older schema
+    up to date (e.g. gaining "organizations"/"title")."""
+    record = storage.get_recording(content_hash)
+    if not record or not record.get("segments"):
+        return
+    formatted = format_transcript_with_speakers(
+        record.get("transcript") or "", record["segments"], record.get("speaker_names")
+    )
+    await _resummarize_and_repush(content_hash, formatted, record.get("speaker_names") or {})
+
+
+async def repush_after_edit(content_hash: str):
+    """Pushes a hand-edited record's current content to Notion/Obsidian,
+    updating the existing page/note in place rather than creating a new one
+    (title changes are expected here -- the edited summary is what the
+    title is derived from -- so this must never go down the create path).
+    Best-effort: an edit is already saved locally before this runs."""
+    record = storage.get_recording(content_hash)
+    if not record:
+        return
+    if record.get("notion_page_id"):
+        import notion_sync
+        try:
+            await asyncio.to_thread(notion_sync.update_all_blocks, record["notion_page_id"], record)
+            await asyncio.to_thread(notion_sync.update_page_title,
+                                     record["notion_page_id"], notion_sync._recording_title(record))
+        except Exception as e:
+            log.error("saved edit to %s locally but failed to refresh Notion: %s", record["name"], e)
+    if record.get("obsidian_note_path"):
+        import obsidian_sync
+        try:
+            await asyncio.to_thread(obsidian_sync.push_recording, record, record["obsidian_note_path"])
+        except Exception as e:
+            log.error("saved edit to %s locally but failed to refresh Obsidian: %s", record["name"], e)
+    # Task pages are create-only and gated by notion_tasks_synced, so they
+    # never get revisited by the normal push path -- refresh their titles
+    # explicitly or a corrected owner name stays wrong on the Task forever.
+    fresh = storage.get_recording(content_hash)
+    if (fresh or {}).get("task_status_links"):
+        import notion_sync
+        try:
+            n = await asyncio.to_thread(notion_sync.refresh_task_titles, fresh)
+            if n:
+                log.info("refreshed %d Notion Task title(s) for %s", n, content_hash)
+        except Exception as e:
+            log.error("failed to refresh Notion Task titles for %s: %s", content_hash, e)
+    # Same staleness on the Obsidian side -- its Task notes are written
+    # once and never revisited either.
+    if settings.get_all().get("obsidian_vault_path"):
+        import obsidian_sync
+        try:
+            n = await asyncio.to_thread(obsidian_sync.refresh_task_notes, fresh)
+            if n:
+                log.info("refreshed %d Obsidian task note(s) for %s", n, content_hash)
+        except Exception as e:
+            log.error("failed to refresh Obsidian task notes for %s: %s", content_hash, e)
+
+    try:
+        import rag_index
+        rag_index.delete_source("recording", content_hash)
+        rag_index.add_recording(storage.get_recording(content_hash))
+    except Exception as e:
+        log.warning("re-indexing %s after edit failed (non-fatal): %s", content_hash, e)
+
+
+def reconcile_stakeholders_after_rename(content_hash: str, old_name: str, new_name: str):
+    """Rewrites stakeholder entries that named this person under the label
+    they had before the rename, then collapses the resulting duplicates.
+
+    Without this, correcting a speaker only fixes the Speakers panel: the
+    stakeholder list keeps whatever the LLM originally called them, so the
+    same human appears as two separate people (reported live: "Sanjit" and
+    "Sanchit" listed side by side after the rename). The old name is the
+    only link between the two -- no amount of re-summarizing recovers it,
+    since the transcript audio still says the original name.
+
+    Safe when old_name is empty/None (a first-time naming, nothing to
+    rewrite) -- it just runs the dedupe pass."""
+    if new_name and old_name and old_name.strip().lower() != new_name.strip().lower():
+        record = storage.get_recording(content_hash)
+        stakeholders = ((record or {}).get("summary") or {}).get("stakeholders") or []
+        for i, entry in enumerate(stakeholders):
+            if (entry.get("name") or "").strip().lower() == old_name.strip().lower():
+                storage.set_stakeholder(content_hash, i, new_name)
+    removed = storage.merge_duplicate_stakeholders(content_hash)
+    if removed:
+        log.info("merged %d duplicate stakeholder entry(s) on %s after rename to %r",
+                 removed, content_hash, new_name)
+
+
+async def resync_after_rename(content_hash: str, old_name: str = None, new_name: str = None):
     """Called after a speaker is renamed (dashboard's Speakers section /
     inline transcript click, or an edit made directly in Notion -- see
     app.py's rename_speaker route and sync_speaker_edits_once below).
 
     Renaming only ever changes the raw speaker_id -> display name mapping;
-    it doesn't retroactively fix the LLM's own prose. Summary and
-    Stakeholders were written once, at original processing time, using
-    whatever label existed then (often literally "Speaker 1" if no name
-    was known yet) -- a later rename left that text stale. The real fix is
-    to re-run the summarizer against a transcript that already has the
-    corrected name baked into each line, so the new prose picks it up
-    naturally, then push the whole Notion page body again (not just the
-    Transcript block).
+    it doesn't retroactively fix the LLM's own prose. Summary, Stakeholders
+    and the per-item owners were written once, at original processing time,
+    using whatever label existed then -- a later rename left that stale.
 
-    The fresh summarize() call also returns its own "speaker_names" guess,
-    which gets discarded in favor of record["speaker_names"] -- that's the
-    user-confirmed value this whole function exists to propagate; a new
-    guess re-run against already-resolved-name text isn't more authoritative
-    and could only make things worse if it guessed wrong.
+    This used to re-run the whole summarizer against a re-formatted
+    transcript. That was wrong in two ways. The transcript's audio still
+    contains the WRONG name (the model mis-heard it), so re-summarizing
+    faithfully reproduced the same mistake -- the user's correction is the
+    only record of who that person actually is. And a full re-summarize
+    discards any hand-edited summary (storage.set_summary_text), so the two
+    features destroyed each other. Instead a narrow LLM pass rewrites just
+    the names across the existing summary
+    (providers.base.build_name_correction_prompt), preserving everything
+    else including the user's own edits.
+
+    old_name/new_name are optional: without them (e.g. the Notion-side
+    sync path, which only knows the final value) the correction still runs
+    using the speaker_id -> name mapping, which catches raw "speaker_2"
+    style labels even when the previous display name isn't known.
     """
     record = storage.get_recording(content_hash)
     if not record or not record.get("segments"):
         return
 
-    old_type = (record.get("summary") or {}).get("type")
-
-    # Wrapped as a whole: an LLM/Notion hiccup anywhere in here must NOT
-    # skip voice-ID enrollment below (they used to share one un-isolated
-    # code path) -- confirmed live that a real rename left speaker_names
-    # updated but the voiceprint's sample_count never bumped, with no
-    # error surfaced anywhere, since this ran as a fire-and-forget FastAPI
-    # background task (see app.py's rename_speaker route).
     try:
-        formatted = format_transcript_with_speakers(
-            record.get("transcript") or "", record["segments"], record.get("speaker_names")
-        )
-        _, summarize = get_summarizer()
-        new_summary = await asyncio.to_thread(summarize, formatted, record.get("deepgram_insights"), record.get("meeting"))
-        new_summary["speaker_names"] = record.get("speaker_names") or {}
-        _enforce_journal_rule(new_summary, record["segments"])
-        _add_speakers_as_stakeholders(new_summary)
-        storage.update_summary(content_hash, new_summary)
-
-        # A rename can shift the journal/actionable call (this literally
-        # happened testing this feature -- renaming "speaker_1" changed enough
-        # context that the classification flipped). Without resetting these,
-        # a recording that becomes "journal" here would never get pushed to
-        # the Journal database (stuck on a stale "already handled" flag from
-        # before), and vice versa for Tasks/Calendar. Tasks/Calendar are
-        # deliberately only reset on a type change (not every rename) -- unlike
-        # People, push_tasks()/push_events() always create a brand-new page
-        # with no find-or-create check, so resetting them unconditionally would
-        # create a duplicate Task/Event page on every single rename.
-        if new_summary.get("type") != old_type:
-            storage.reset_distribution_flags(
-                content_hash, ["notion_tasks", "notion_people", "notion_events", "notion_journal"]
-            )
-        else:
-            # People, by contrast, IS safe to always re-push: push_people()
-            # find-or-creates by email/name (see notion_sync.py), so re-running
-            # it after a rename just links the now-correctly-named speaker to
-            # an existing or new People page rather than duplicating anything.
-            # Without this, a renamed speaker who was already a "stakeholder"
-            # under a stale name (or wasn't one at all before the rename) never
-            # gets pushed to People at all, since notion_people_synced was
-            # already True from the original push and this record would
-            # otherwise never be reconsidered.
-            storage.reset_distribution_flags(content_hash, ["notion_people"])
-
-        if record.get("notion_page_id"):
-            import notion_sync
-            fresh_record = storage.get_recording(content_hash)
-            try:
-                await asyncio.to_thread(notion_sync.update_all_blocks, record["notion_page_id"], fresh_record)
-                # Also sync the "Speaker N" *properties*, not just the page
-                # body -- without this, a rename made on the dashboard (or a
-                # restore after a Notion-side rename) leaves Notion's property
-                # value stale, which sync_speaker_edits_once() would then treat
-                # as the authoritative source on the next poll cycle and flip
-                # the name right back. This is what keeps the two directions
-                # from fighting each other.
-                slots = {
-                    idx: name
-                    for sid, name in fresh_record["speaker_names"].items()
-                    if (idx := notion_sync.speaker_slot_index(sid))
-                }
-                if slots:
-                    await asyncio.to_thread(notion_sync.set_speaker_slot_values, record["notion_page_id"], slots)
-            except Exception as e:
-                log.error("re-summarized %s locally but failed to refresh Notion page: %s", record["name"], e)
+        await _correct_names_and_repush(content_hash, old_name, new_name)
     except Exception as e:
+        # An LLM/Notion hiccup here must NOT skip voice-ID enrollment below --
+        # they used to share one un-isolated code path, so a resummarize
+        # failure (rate limit, API blip, whatever) silently meant the
+        # rename never enrolled a voiceprint either, with nothing surfaced
+        # anywhere (this ran as a fire-and-forget FastAPI background task --
+        # see app.py's rename_speaker route). Confirmed live: a real rename
+        # left speaker_names updated but the voiceprint's sample_count
+        # never bumped, with no error visible to the user at all.
         log.warning("resummarize/repush after rename failed for %s (non-fatal, enrollment still proceeds): %s",
-                    content_hash, e)
+                    content_hash, e, exc_info=True)
 
     # Voice-ID enrollment path C (see voice_id.py's module docstring) --
     # a rename is exactly the "confidently associated with a real name"
@@ -645,21 +773,76 @@ async def resync_after_rename(content_hash: str):
     # harmless (enroll_or_update just re-averages) for names that were
     # already correct. This is also how correcting a wrong suggestion
     # "retrains" itself, per the plan -- no separate retrain action needed.
+    #
+    # A person with NO existing voiceprint is a brand-new enrollment,
+    # trained from whatever name is on record right now -- if that name
+    # came from the LLM's own self-identification guess rather than a
+    # deliberate rename (see _resolve_speaker_labels_in_summary's
+    # docstring for a live example of that guess being flat-out wrong:
+    # speaker_2 self-identified as "Ben Wiggins" when it was actually the
+    # recording's owner), enrolling immediately would bake the wrong voice
+    # under the wrong name before the user has had a chance to notice and
+    # fix it. So a first-time enrollment is deferred _NEW_VOICEPRINT_
+    # DELAY_SECONDS and re-checked against whatever speaker_names says
+    # THEN, not now -- if the user corrects the name in the meantime, the
+    # corrected name is what gets trained; if they never touch it, it
+    # trains as originally guessed once the window passes. Someone who
+    # ALREADY has a voiceprint (a real rename, or re-confirming a correct
+    # suggestion) is re-enrolled immediately, same as before -- there's no
+    # "wrong guess" risk in strengthening an existing, already-vetted
+    # identity.
     import voice_id
     if voice_id.is_enabled():
         try:
-            with open(storage.get_wav_path(content_hash), "rb") as f:
-                wav_bytes = f.read()
             for speaker_id, name in (record.get("speaker_names") or {}).items():
                 if not name:
                     continue
-                embedding = voice_id.embedding_for_speaker(wav_bytes, record["segments"], speaker_id)
-                if embedding:
-                    voice_id.enroll_or_update(voice_id.normalize_person_key(name), embedding, display_name=name)
+                if voice_id.get_voiceprint(voice_id.normalize_person_key(name)):
+                    wav_bytes = storage.read_audio_bytes(content_hash)
+                    embedding = voice_id.embedding_for_speaker(wav_bytes, record["segments"], speaker_id)
+                    if embedding:
+                        voice_id.enroll_or_update(voice_id.normalize_person_key(name), embedding, display_name=name)
+                else:
+                    asyncio.create_task(_delayed_first_enrollment(content_hash, speaker_id))
         except Exception as e:
-            log.warning("voice enrollment after rename failed for %s (non-fatal): %s", content_hash, e)
+            log.warning("voice enrollment after rename failed for %s (non-fatal): %s", content_hash, e, exc_info=True)
 
     await rescan_voice_suggestions(exclude_content_hash=content_hash)
+
+
+_NEW_VOICEPRINT_DELAY_SECONDS = 10 * 60
+
+
+async def _delayed_first_enrollment(content_hash: str, speaker_id: str):
+    """Waits _NEW_VOICEPRINT_DELAY_SECONDS, then trains a brand-new
+    voiceprint for speaker_id using whatever name speaker_names says AT
+    THAT LATER TIME -- not the name that scheduled this call. Gives the
+    user a real window to correct a wrong auto-guessed name (see the
+    caller's docstring) before it's permanently baked into training data.
+    No-ops quietly if the recording/speaker no longer has a name (removed
+    or the recording itself was deleted in the meantime), or if a
+    voiceprint for that name now exists anyway (someone else's rename in
+    the interim already covered it)."""
+    await asyncio.sleep(_NEW_VOICEPRINT_DELAY_SECONDS)
+    record = storage.get_recording(content_hash)
+    if not record or not record.get("segments"):
+        return
+    name = (record.get("speaker_names") or {}).get(speaker_id)
+    if not name:
+        return
+    import voice_id
+    if voice_id.get_voiceprint(voice_id.normalize_person_key(name)):
+        return  # already covered (e.g. another speaker in this recording shares the name)
+    try:
+        wav_bytes = storage.read_audio_bytes(content_hash)
+        embedding = voice_id.embedding_for_speaker(wav_bytes, record["segments"], speaker_id)
+        if embedding:
+            voice_id.enroll_or_update(voice_id.normalize_person_key(name), embedding, display_name=name)
+            log.info("deferred first-time voice enrollment for %r on %s completed after %ds window",
+                      name, content_hash, _NEW_VOICEPRINT_DELAY_SECONDS)
+            await rescan_voice_suggestions(exclude_content_hash=content_hash)
+    except Exception as e:
+        log.warning("deferred voice enrollment failed for %r on %s (non-fatal): %s", name, content_hash, e, exc_info=True)
 
 
 async def rescan_voice_suggestions(exclude_content_hash: str = None):
@@ -688,8 +871,7 @@ async def rescan_voice_suggestions(exclude_content_hash: str = None):
         if not unnamed_sids:
             continue
         try:
-            with open(storage.get_wav_path(content_hash), "rb") as f:
-                wav_bytes = f.read()
+            wav_bytes = storage.read_audio_bytes(content_hash)
         except OSError:
             continue
 
@@ -730,6 +912,387 @@ async def rescan_voice_suggestions(exclude_content_hash: str = None):
             storage.update_summary(content_hash, summary)
 
 
+def _is_plausible_rename(old: str, new: str, name_map: dict) -> bool:
+    """Whether changing `old` to `new` is a name CORRECTION rather than a
+    substitution of one person for another.
+
+    Allowed: an explicitly-mapped pair (the user confirmed it), a raw
+    diarization label being resolved ("speaker_2" -> a real name), and a
+    close spelling variant ("Sanjit"/"Sanchit" -- a transcription
+    mishearing of one human). Rejected: anything else, because at that
+    point the model is not fixing a name, it is reassigning an entry to a
+    different person and taking that person's biography with it."""
+    import difflib
+
+    old_s, new_s = (old or "").strip(), (new or "").strip()
+    if not old_s or not new_s or old_s.lower() == new_s.lower():
+        return True
+    if name_map.get(old_s) == new_s:
+        return True                              # explicitly confirmed by the user
+    if re.fullmatch(r"speaker[_ ]?\d+", old_s, re.I):
+        return True                              # resolving a raw diarization label
+    ratio = difflib.SequenceMatcher(None, old_s.lower(), new_s.lower()).ratio()
+    return ratio >= 0.6                          # close spelling variant of one name
+
+
+def _reject_implausible_renames(original: dict, corrected: dict, name_map: dict):
+    """Restores any name the correction pass changed implausibly (see
+    _is_plausible_rename). Mutates `corrected` in place; compares
+    positionally, so it only vetoes entries that still line up with the
+    original list."""
+    for key, field in (("stakeholders", "name"), ("organizations", "name"),
+                        ("action_items", "owner"), ("follow_ups", "owner")):
+        old_items = original.get(key) or []
+        new_items = corrected.get(key) or []
+        if len(old_items) != len(new_items):
+            continue  # entries were merged/reordered -- positional veto no longer valid
+        for old_item, new_item in zip(old_items, new_items):
+            if not isinstance(old_item, dict) or not isinstance(new_item, dict):
+                continue
+            old_val, new_val = old_item.get(field), new_item.get(field)
+            if old_val and new_val and not _is_plausible_rename(old_val, new_val, name_map):
+                log.warning("rejected implausible %s rename %r -> %r (kept the original)",
+                            key, old_val, new_val)
+                new_item[field] = old_val
+
+
+async def _correct_names_and_repush(content_hash: str, old_name: str = None, new_name: str = None):
+    """Applies a confirmed name correction across the whole summary, then
+    re-pushes. See resync_after_rename's docstring for why this replaced a
+    full re-summarize.
+
+    The name_map is built from two sources: the explicit old->new rename
+    (when the caller knows it), plus every raw speaker_id -> display name
+    pair, which is what catches leftover "speaker_2" labels in owner
+    fields. If neither yields anything to fix, this returns without
+    spending an LLM call."""
+    record = storage.get_recording(content_hash)
+    if not record or not isinstance(record.get("summary"), dict):
+        return
+
+    speaker_names = record.get("speaker_names") or {}
+    name_map = {sid: name for sid, name in speaker_names.items() if name}
+    if old_name and new_name and old_name.strip().lower() != new_name.strip().lower():
+        name_map[old_name] = new_name
+
+    summary = record["summary"]
+    blob = json.dumps(summary, ensure_ascii=False).lower()
+    # Run whenever a confirmed person is referenced at all -- not only when
+    # an exact stale string is found. The variant case ("Sanjit" for a
+    # confirmed "Sanchit") is precisely the one no literal check can spot,
+    # and for a past rename the old spelling isn't recorded anywhere, so
+    # requiring a known-bad string to match would skip the very recordings
+    # that need fixing. Renames are rare and user-initiated, so the
+    # occasional no-op call is a fair price.
+    triggers = list(name_map) + [n for n in speaker_names.values() if n]
+    if not triggers or not any(t.lower() in blob for t in triggers):
+        log.info("rename on %s needs no summary correction (nobody confirmed is referenced)", content_hash)
+        return
+
+    from providers.base import build_name_correction_prompt, parse_summary_json
+    prompt = build_name_correction_prompt(summary, name_map, roster=speaker_names)
+    _, complete = get_completer()  # returns (provider_name, complete_fn)
+    raw = await asyncio.to_thread(complete, prompt)
+    corrected = parse_summary_json(raw)
+
+    # parse_summary_json falls back to {"summary": <raw text>, ...} when the
+    # response isn't valid JSON. Accepting that would replace a good summary
+    # with the model's raw output, so treat a fallback as a failed pass and
+    # keep what we already have -- the names stay stale, which is far better
+    # than the summary being destroyed.
+    if not corrected.get("action_items") and not corrected.get("stakeholders") \
+            and (summary.get("action_items") or summary.get("stakeholders")):
+        log.warning("name-correction pass on %s returned an unusable result -- keeping the existing summary",
+                    content_hash)
+        return
+
+    # Reject corrections that swap one real person for a DIFFERENT real
+    # person. The pass is only ever allowed to reconcile variants of the
+    # same name ("Sanjit" -> "Sanchit") or resolve a raw diarization label
+    # ("speaker_2" -> "Sanchit"). Live-confirmed damage without this: it
+    # rewrote the candidate's stakeholder entry to the recruiter's name,
+    # leaving two "Ben Wiggins" -- one carrying the other person's whole
+    # biography. A guard that only checks the result is non-empty (which
+    # is all this had) cannot catch that.
+    _reject_implausible_renames(summary, corrected, name_map)
+
+    # The user's confirmed mapping always wins over anything the model
+    # returned for speaker_names -- that's the input to this pass, not
+    # something it gets to revise.
+    corrected["speaker_names"] = speaker_names
+    # A hand-edited summary is the user's own wording: correct the names in
+    # the rest of the structure but never overwrite their prose.
+    if record.get("summary_edited"):
+        corrected["summary"] = summary.get("summary", "")
+    _resolve_speaker_labels_in_summary(corrected)
+    storage.update_summary(content_hash, corrected)
+    log.info("applied name correction %s to %s", name_map, content_hash)
+
+    await repush_after_edit(content_hash)
+    if record.get("notion_page_id"):
+        import notion_sync
+        try:
+            fresh = storage.get_recording(content_hash)
+            slots = {
+                idx: name
+                for sid, name in (fresh.get("speaker_names") or {}).items()
+                if (idx := notion_sync.speaker_slot_index(sid))
+            }
+            if slots:
+                await asyncio.to_thread(notion_sync.set_speaker_slot_values, record["notion_page_id"], slots)
+        except Exception as e:
+            log.error("failed to refresh Notion speaker slots for %s: %s", content_hash, e)
+
+
+async def _resummarize_and_repush(content_hash: str, formatted_transcript: str, speaker_names: dict):
+    """Shared tail of resync_after_rename() and
+    check_official_meeting_transcripts_once(): re-runs the summarizer
+    against an already-finalized transcript (speaker names already
+    resolved, whether by user rename or -- for the Meet path -- because
+    Google's own transcript already has real participant names, no
+    diarization guess needed), resets distribution flags on a
+    journal/actionable flip, and re-pushes the Notion page body.
+
+    speaker_names may be empty (the Meet-transcript path has no speaker_id
+    keys to map Notion "Speaker N" slot properties from, unlike a rename)
+    -- the slot-sync step below is a no-op in that case, not an error.
+    """
+    record = storage.get_recording(content_hash)
+    if not record:
+        return
+
+    old_type = (record.get("summary") or {}).get("type")
+
+    _, summarize = get_summarizer()
+    new_summary = await asyncio.to_thread(
+        summarize, formatted_transcript, record.get("deepgram_insights"), record.get("meeting")
+    )
+    new_summary["speaker_names"] = speaker_names
+    # A hand-corrected summary is the user's own wording and outranks
+    # anything regenerated here (see storage.set_summary_text) -- the
+    # richer transcript still improves the structured fields, but the
+    # prose they fixed must survive.
+    if record.get("summary_edited"):
+        new_summary["summary"] = (record.get("summary") or {}).get("summary", "")
+    _resolve_speaker_labels_in_summary(new_summary)
+    _enforce_journal_rule(new_summary, record.get("segments") or [])
+    _add_speakers_as_stakeholders(new_summary)
+    storage.update_summary(content_hash, new_summary)
+
+    # A rename (or a transcript upgrade) can shift the journal/actionable call (this literally
+    # happened testing this feature -- renaming "speaker_1" changed enough
+    # context that the classification flipped). Without resetting these,
+    # a recording that becomes "journal" here would never get pushed to
+    # the Journal database (stuck on a stale "already handled" flag from
+    # before), and vice versa for Tasks/Calendar. Tasks/Calendar are
+    # deliberately only reset on a type change (not every rename) -- unlike
+    # People, push_tasks()/push_events() always create a brand-new page
+    # with no find-or-create check, so resetting them unconditionally would
+    # create a duplicate Task/Event page on every single rename.
+    if new_summary.get("type") != old_type:
+        storage.reset_distribution_flags(
+            content_hash, ["notion_tasks", "notion_people", "notion_events", "notion_journal"]
+        )
+    else:
+        # People, by contrast, IS safe to always re-push: push_people()
+        # find-or-creates by email/name (see notion_sync.py), so re-running
+        # it after a rename just links the now-correctly-named speaker to
+        # an existing or new People page rather than duplicating anything.
+        # Without this, a renamed speaker who was already a "stakeholder"
+        # under a stale name (or wasn't one at all before the rename) never
+        # gets pushed to People at all, since notion_people_synced was
+        # already True from the original push and this record would
+        # otherwise never be reconsidered.
+        storage.reset_distribution_flags(content_hash, ["notion_people"])
+
+    if record.get("notion_page_id"):
+        import notion_sync
+        fresh_record = storage.get_recording(content_hash)
+        try:
+            await asyncio.to_thread(notion_sync.update_all_blocks, record["notion_page_id"], fresh_record)
+            # The title is built from the summary sentence, which the
+            # re-summarize above just regenerated with the corrected
+            # speaker names -- refresh it too, or the page keeps a title
+            # naming whoever the LLM originally guessed.
+            await asyncio.to_thread(notion_sync.update_page_title,
+                                     record["notion_page_id"], notion_sync._recording_title(fresh_record))
+            # Also sync the "Speaker N" *properties*, not just the page
+            # body -- without this, a rename made on the dashboard (or a
+            # restore after a Notion-side rename) leaves Notion's property
+            # value stale, which sync_speaker_edits_once() would then treat
+            # as the authoritative source on the next poll cycle and flip
+            # the name right back. This is what keeps the two directions
+            # from fighting each other.
+            slots = {
+                idx: name
+                for sid, name in fresh_record["speaker_names"].items()
+                if (idx := notion_sync.speaker_slot_index(sid))
+            }
+            if slots:
+                await asyncio.to_thread(notion_sync.set_speaker_slot_values, record["notion_page_id"], slots)
+            # Existing Task pages are never revisited by push_tasks (create
+            # only, gated on notion_tasks_synced), so a regenerated action
+            # item with a corrected owner would otherwise leave the Task
+            # itself still titled with the old name.
+            n = await asyncio.to_thread(notion_sync.refresh_task_titles, fresh_record)
+            if n:
+                log.info("refreshed %d Notion Task title(s) for %s", n, content_hash)
+        except Exception as e:
+            log.error("re-summarized %s locally but failed to refresh Notion page: %s", record["name"], e)
+
+    # Obsidian's own note + task notes need the same refresh -- the main
+    # note is rewritten at its EXISTING path (the title just changed, and
+    # writing to the new title's path would leave the old file orphaned
+    # alongside it).
+    if settings.get_all().get("obsidian_vault_path"):
+        import obsidian_sync
+        fresh_record = storage.get_recording(content_hash)
+        try:
+            if fresh_record.get("obsidian_note_path"):
+                await asyncio.to_thread(obsidian_sync.push_recording, fresh_record,
+                                         fresh_record["obsidian_note_path"])
+            n = await asyncio.to_thread(obsidian_sync.refresh_task_notes, fresh_record)
+            if n:
+                log.info("refreshed %d Obsidian task note(s) for %s", n, content_hash)
+        except Exception as e:
+            log.error("re-summarized %s locally but failed to refresh Obsidian: %s", record["name"], e)
+
+
+def _align_meet_entries_to_speakers(record: dict, entries: list, min_confidence: float = 0.7) -> dict:
+    """Aligns Google Meet's official transcript entries (real participant
+    names + absolute start_time/end_time, see google_client.get_meeting_transcript)
+    against our own diarized segments (speaker_id + recording-relative
+    seconds) to resolve which speaker_id is which real person -- voice-ID
+    enrollment path B (see voice_id.py's module docstring).
+
+    Clock skew is expected: meetingcap starts recording once it detects an
+    in-progress meeting, not necessarily at the meeting's true start (the
+    only anchor available is record["created_at"], the local recording's
+    own start), so this measures overlap duration between each segment and
+    each entry rather than requiring exact-time equality. A speaker_id only
+    resolves to a name if that name accounts for at least min_confidence of
+    its TOTAL overlapping time -- an ambiguous split (e.g. diarization
+    merged two real speakers into one speaker_id) is dropped, not guessed."""
+    created_at = record.get("created_at")
+    if not created_at:
+        return {}
+    try:
+        rec_start = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return {}
+
+    timed_entries = []
+    for e in entries:
+        if not e.get("speaker") or not e.get("start_time") or not e.get("end_time"):
+            continue
+        try:
+            e_start = datetime.fromisoformat(e["start_time"].replace("Z", "+00:00"))
+            e_end = datetime.fromisoformat(e["end_time"].replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            continue
+        timed_entries.append((e_start, e_end, e["speaker"]))
+    if not timed_entries:
+        return {}
+
+    votes = {}  # speaker_id -> {name: total_overlap_seconds}
+    for seg in record.get("segments") or []:
+        sid = seg.get("speaker_id")
+        if sid is None:
+            continue
+        seg_start = rec_start + timedelta(seconds=seg.get("start", 0))
+        seg_end = rec_start + timedelta(seconds=seg.get("end", 0))
+        for e_start, e_end, name in timed_entries:
+            overlap = (min(seg_end, e_end) - max(seg_start, e_start)).total_seconds()
+            if overlap > 0:
+                votes.setdefault(sid, {})
+                votes[sid][name] = votes[sid].get(name, 0.0) + overlap
+
+    resolved = {}
+    for sid, name_overlaps in votes.items():
+        total = sum(name_overlaps.values())
+        if total <= 0:
+            continue
+        best_name, best_overlap = max(name_overlaps.items(), key=lambda kv: kv[1])
+        if best_overlap / total >= min_confidence:
+            resolved[sid] = best_name
+    return resolved
+
+
+async def check_official_meeting_transcripts_once():
+    """Opportunistic upgrade path: if the official Google Meet transcript
+    for a meeting recording shows up (paid Workspace plan + admin-enabled +
+    host manually started one during the call -- see
+    google_client.get_meeting_transcript's own docstring for how narrow
+    that is), swap it in and re-summarize, using Google's own real
+    participant names instead of our local diarization guesses.
+
+    Deliberately does NOT gate/delay local recording+transcription+
+    summarization, which already ran immediately as normal by the time
+    this ever has anything to check -- this only ever *upgrades* an
+    already-fully-processed recording in place, never blocks the default
+    path. Bounded by official_transcript_check_until (set in
+    storage.set_meeting) so a meeting that will never get one (the
+    overwhelming majority, on any non-Workspace account) stops being
+    checked after a reasonable window rather than polling forever."""
+    saved = settings.get_all()
+    if not saved.get("google_token"):
+        return
+    import google_client
+
+    for record in storage.list_recordings():
+        meeting = record.get("meeting")
+        if not meeting or not meeting.get("meeting_url"):
+            continue
+        if record.get("official_transcript_status") is not None:
+            continue  # already "applied" or "gave_up"
+
+        check_until = record.get("official_transcript_check_until")
+        if check_until:
+            try:
+                if datetime.now(timezone.utc) > datetime.fromisoformat(check_until.replace("Z", "+00:00")):
+                    storage.mark_official_transcript(record["content_hash"], "gave_up")
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+        try:
+            entries = await asyncio.to_thread(google_client.get_meeting_transcript, meeting["meeting_url"])
+        except Exception as e:
+            log.debug("official transcript check failed for %s: %s", record["name"], e)
+            continue
+        if not entries:
+            continue  # not available yet (or ever) -- try again next cycle, within the window
+
+        # Align the official transcript's ground-truth names against our
+        # own diarized segments (voice-ID enrollment path B, see
+        # voice_id.py's module docstring) -- BEFORE overwriting the
+        # transcript below, since alignment needs our own segments'
+        # speaker_id labels, not Google's speaker-less replacement text.
+        # This also fills in speaker_names with real names for the very
+        # first time on this path (previously always passed {} to
+        # _resummarize_and_repush -- see that call below).
+        speaker_names = {}
+        import voice_id
+        if record.get("segments"):
+            try:
+                speaker_names = _align_meet_entries_to_speakers(record, entries)
+                if speaker_names and voice_id.is_enabled():
+                    wav_bytes = storage.read_audio_bytes(record["content_hash"])
+                    for sid, name in speaker_names.items():
+                        embedding = voice_id.embedding_for_speaker(wav_bytes, record["segments"], sid)
+                        if embedding:
+                            voice_id.enroll_or_update(voice_id.normalize_person_key(name), embedding, display_name=name)
+                    await rescan_voice_suggestions(exclude_content_hash=record["content_hash"])
+            except Exception as e:
+                log.warning("Meet-transcript speaker alignment failed for %s (non-fatal): %s", record["name"], e)
+
+        formatted = "\n".join(f"{e['speaker'] or 'Unknown'}: {e['text']}" for e in entries)
+        storage.update_transcript(record["content_hash"], formatted)
+        await _resummarize_and_repush(record["content_hash"], formatted, speaker_names)
+        storage.mark_official_transcript(record["content_hash"], "applied")
+        log.info("upgraded %s to the official Google Meet transcript", record["name"])
+
+
 _last_retry_attempt = 0.0
 
 
@@ -759,10 +1322,15 @@ async def process_once():
     if retry_due:
         _last_retry_attempt = now
 
-    # Batch-reply detection: more than one queued Jarvis command in the same
-    # pass signals these were recorded while the Mac was unreachable and are
-    # only being executed now as a backlog -- see macOS poller.py for the
-    # parity version/full rationale.
+    # Batch-reply detection: more than one queued Jarvis command showing up
+    # in the same pass is the signal that these were recorded while the Mac
+    # was unreachable and are only being executed now as a backlog -- a
+    # live, single command syncing normally never arrives bundled with
+    # others (see poller.py's command-first sort in sync_once/
+    # get_unprocessed). Per the user's explicit request: batched commands
+    # still execute for real, but get one short summary reply instead of a
+    # descriptive one each. batch_ok/batch_failed accumulate across the loop
+    # below; the summary is spoken once after it, only if this was a batch.
     unprocessed = storage.get_unprocessed()
     pending_commands = [r for r in unprocessed if r.get("kind") == "command"]
     is_command_batch = len(pending_commands) > 1
@@ -784,9 +1352,42 @@ async def process_once():
         try:
             stt_name, transcribe = get_transcriber()
             llm_name, summarize = get_summarizer()
+
+            # Demo-key usage cap (see usage_limit.py) -- only meters/blocks
+            # while this recording would actually be processed using the
+            # developer's bundled key, never a user-supplied one. Checked
+            # here, right before the transcribe call, so a recording that's
+            # over the cap costs nothing (no wasted API call) and is left
+            # `pending` -- NOT marked failed/garbage -- so it processes
+            # automatically the moment the month rolls over or the user
+            # enters their own key, without needing to be re-synced.
+            import usage_limit
+            if usage_limit.is_using_bundled_key(stt_name) and usage_limit.is_over_limit():
+                log.info("skipping %s -- demo key's %d min/month cap reached (used %.1f min); "
+                         "will retry automatically next month, or enter your own API key in Settings",
+                         record["name"], usage_limit.MONTHLY_CAP_MINUTES, usage_limit.minutes_used())
+                status.update(sync_in_progress=False)
+                continue
+
             transcription = await asyncio.to_thread(transcribe, wav_bytes)
             transcript, segments = transcription["text"], transcription.get("segments")
             insights = transcription.get("deepgram_insights")  # None for non-Deepgram providers
+
+            # Silence/garbage guard: a recording can transcribe successfully
+            # (unlike the 0-byte WAV case above, which is caught before this
+            # point) and still have nothing intelligible in it -- background
+            # noise, a stray button press, someone brushing the mic. Pushing
+            # that to Notion/Obsidian just clutters both with blank entries.
+            # Only gates memo recordings -- a Jarvis command (kind=="command")
+            # is inherently short and still needs to run through its own
+            # dispatch below even if brief, so it's deliberately exempted.
+            if record.get("kind") != "command" and _is_garbage_transcript(transcript):
+                log.info("skipping distribution for %s -- transcript is empty/garbage: %r",
+                          record["name"], transcript)
+                storage.mark_processed(content_hash, transcript, segments, {}, stt_name, llm_name,
+                                        deepgram_insights=insights, garbage=True)
+                status.update(sync_ok=True)
+                continue
 
             # Crosstalk mitigation (a noisy venue with other nearby
             # conversations) -- classifies each segment as "primary" or
@@ -798,6 +1399,7 @@ async def process_once():
             if segments and settings.get_all().get("filter_background_conversations", True):
                 import audio_analysis
                 segments = audio_analysis.annotate_segment_loudness(wav_bytes, segments)
+
 
             # Backlog #10: content-based chunk classification (FITS/
             # DIFFERENT_TOPIC/NOISE) -- independent of the acoustic
@@ -870,10 +1472,15 @@ async def process_once():
                             elif len(speaker_ids) == 1 and not voice_id.get_voiceprint(voice_id.OWNER_KEY):
                                 # Bootstrap case: a BOOT-button voice command
                                 # is inherently a solo, owner-only interaction
-                                # -- if the owner has never been enrolled at
-                                # all, silently seed the owner voiceprint
-                                # from the very first command rather than
-                                # requiring a meeting to happen first.
+                                # (unlike a meeting or memo, there's no one
+                                # else it could be) -- if the owner has never
+                                # been enrolled at all (no meeting recording,
+                                # no memo rename yet), silently seed the
+                                # owner voiceprint from the very first
+                                # command rather than requiring a meeting to
+                                # happen first. Only fires once (until
+                                # OWNER_KEY exists), and only when there's
+                                # exactly one speaker in the clip.
                                 owner_display = settings.get_all().get("owner_name") or "You"
                                 voice_id.enroll_or_update(voice_id.OWNER_KEY, embedding, display_name=owner_display)
                         if command_speaker_names:
@@ -893,8 +1500,11 @@ async def process_once():
                         batch_failed += 1
 
                 # Jarvis commands get their own Notion database (see
-                # notion_setup.create_jarvis_database) -- best-effort/
-                # non-fatal, same as every other optional sync destination.
+                # notion_setup.create_jarvis_database) -- previously had no
+                # Notion presence at all, unlike every other recording kind.
+                # Best-effort/non-fatal: an unconfigured or failing Notion
+                # push must never affect the command itself, which already
+                # ran and got its spoken reply before this point.
                 if settings.get_all().get("notion_jarvis_database_id"):
                     try:
                         import notion_sync
@@ -902,6 +1512,16 @@ async def process_once():
                         storage.set_notion_page_id(content_hash, jarvis_page_id)
                     except Exception as e:
                         log.warning("Notion push for Jarvis command %s failed (non-fatal): %s", record["name"], e)
+                # Obsidian gets the command too -- it previously reached
+                # Notion and the dashboard but never the vault, so a
+                # vault-only user had no record of their voice commands.
+                if settings.get_all().get("obsidian_vault_path"):
+                    try:
+                        import obsidian_sync
+                        note_path = await asyncio.to_thread(obsidian_sync.push_command, storage.get_recording(content_hash), jarvis_result)
+                        storage.set_obsidian_note_path(content_hash, note_path)
+                    except Exception as e:
+                        log.warning("Obsidian push for Jarvis command %s failed (non-fatal): %s", record["name"], e)
 
                 status.update(sync_ok=True)
                 continue
@@ -968,23 +1588,33 @@ async def process_once():
                         summary.setdefault("speaker_names", {}).update(extra_guesses)
 
             # Local voice recognition (see voice_id.py) -- opt-in, default
-            # off. For any recording with diarized segments: for a speaker
-            # not already named, check enrolled voiceprints for a match and
-            # surface it as a SUGGESTION only (summary
-            # ["speaker_name_suggestions"]), never silently written into
-            # speaker_names -- the dashboard prefills the rename field
-            # with it, and typing a different name both corrects the
-            # display and re-enrolls under the right name (see
-            # resync_after_rename). NOTE: unlike the macOS copy, this
-            # doesn't auto-enroll the device owner from a meeting
-            # recording's mic channel -- that heuristic assumes
-            # meetingcap's specific left=system/right=mic stereo layout,
-            # which hasn't been verified to hold for Windows' meeting
-            # capture path. Owner voice still gets enrolled fine via the
-            # normal rename path (path C) once named like anyone else.
+            # off. Two things happen here, both best-effort (never fails
+            # the recording over a voice-ID hiccup):
+            #  1. Meeting recordings: silently auto-enroll/update the
+            #     device owner's own voiceprint using the mic-vs-system
+            #     channel heuristic (no confirmation needed -- this is a
+            #     structural signal, not a guess). See
+            #     voice_id.guess_owner_speaker_id.
+            #  2. Any recording with diarized segments: for a speaker not
+            #     already named, check enrolled voiceprints for a match and
+            #     surface it as a SUGGESTION only (summary
+            #     ["speaker_name_suggestions"]), never silently written into
+            #     speaker_names -- the dashboard prefills the rename field
+            #     with it, and typing a different name both corrects the
+            #     display and re-enrolls under the right name (see
+            #     resync_after_rename).
             import voice_id
             if segments and voice_id.is_enabled():
                 try:
+                    if record.get("meeting"):
+                        owner_sid = voice_id.guess_owner_speaker_id(wav_bytes, segments)
+                        if owner_sid:
+                            owner_embedding = voice_id.embedding_for_speaker(wav_bytes, segments, owner_sid, channel_index=1)
+                            if owner_embedding:
+                                owner_display = settings.get_all().get("owner_name") or "You"
+                                voice_id.enroll_or_update(voice_id.OWNER_KEY, owner_embedding, display_name=owner_display)
+                                await rescan_voice_suggestions()
+
                     suggestions = {}
                     candidates = {}
                     for sid in dict.fromkeys(seg.get("speaker_id") for seg in segments):
@@ -1015,16 +1645,18 @@ async def process_once():
                 except Exception as e:
                     log.warning("voice recognition failed for %s (non-fatal): %s", record["name"], e)
 
+            _resolve_speaker_labels_in_summary(summary)
             storage.mark_processed(content_hash, transcript, segments, summary, stt_name, llm_name,
                                     deepgram_insights=insights)
             storage.apply_speaker_name_guesses(content_hash, summary.get("speaker_names"))
 
+            # Index into rag_index for Jarvis's search_memory() -- best-effort,
+            # never fails the recording itself over an indexing hiccup.
             try:
                 import rag_index
                 rag_index.add_recording(storage.get_recording(content_hash))
             except Exception as e:
                 log.warning("rag_index indexing failed for %s (non-fatal): %s", record["name"], e)
-
             log.info("processed %s via stt=%s llm=%s%s%s", record["name"], stt_name, llm_name,
                       " (diarized)" if segments else "",
                       " (deepgram-insights)" if insights else "")
@@ -1036,7 +1668,10 @@ async def process_once():
             analytics.track_event("llm_provider_counts", key=llm_name)
             analytics.track_event(
                 "recordings_journal_count" if summary.get("type") == "journal" else "recordings_actionable_count")
-            analytics.track_event("total_recording_seconds", seconds=_wav_duration_seconds(wav_bytes))
+            duration_seconds = _wav_duration_seconds(wav_bytes)
+            analytics.track_event("total_recording_seconds", seconds=duration_seconds)
+            if usage_limit.is_using_bundled_key(stt_name):
+                usage_limit.record_seconds(duration_seconds)
         except Exception as e:
             log.error("failed to process %s: %s", record["name"], e)
             storage.mark_failed(content_hash, str(e))
@@ -1192,9 +1827,24 @@ async def distribute_once():
                 storage.mark_distributed(record["content_hash"], "notion")
                 continue
             try:
-                page_id = await asyncio.to_thread(notion_sync.push_recording, record)
-                storage.set_notion_page_id(record["content_hash"], page_id)
-                storage.mark_distributed(record["content_hash"], "notion")
+                # A crash between the page-create call below and persisting
+                # notion_page_id/notion_synced (e.g. the app dying mid-cycle)
+                # leaves notion_synced=False on disk even though the page
+                # already exists in Notion -- the next distribute_once() pass
+                # would otherwise call push_recording() again and create a
+                # duplicate page. notion_page_id surviving that same crash
+                # window is the real signal a page already exists, so check
+                # it first and update in place instead of re-creating.
+                existing_page_id = record.get("notion_page_id")
+                if existing_page_id:
+                    title = record.get("summary", {}).get("summary") or record["name"]
+                    await asyncio.to_thread(notion_sync.update_page_title, existing_page_id, title)
+                    await asyncio.to_thread(notion_sync.update_all_blocks, existing_page_id, record)
+                    storage.mark_distributed(record["content_hash"], "notion")
+                else:
+                    page_id = await asyncio.to_thread(notion_sync.push_recording, record)
+                    storage.set_notion_page_id(record["content_hash"], page_id)
+                    storage.mark_distributed(record["content_hash"], "notion")
                 import analytics
                 analytics.track_event("notion_pushes")
             except Exception as e:
@@ -1216,9 +1866,11 @@ async def distribute_once():
                 storage.mark_distributed(record["content_hash"], "notion_tasks")
                 continue
             try:
-                email_links = await asyncio.to_thread(notion_sync.push_tasks, record, record["notion_page_id"])
+                email_links, all_links = await asyncio.to_thread(notion_sync.push_tasks, record, record["notion_page_id"])
                 if email_links:
                     storage.set_task_email_links(record["content_hash"], email_links)
+                if all_links:
+                    storage.set_task_status_links(record["content_hash"], all_links)
                 storage.mark_distributed(record["content_hash"], "notion_tasks")
             except Exception as e:
                 log.error("failed to push %s's tasks to Notion: %s", record["name"], e)
@@ -1279,7 +1931,21 @@ async def distribute_once():
                 storage.mark_distributed(record["content_hash"], "obsidian")
                 continue
             try:
-                note_path = await asyncio.to_thread(obsidian_sync.push_recording, record)
+                # Same crash-window race as the Notion block above: if
+                # obsidian_note_path survived a mid-cycle crash but
+                # obsidian_synced didn't get persisted, re-running
+                # push_recording() would re-derive the title from whatever
+                # the summary says *now* -- which can differ from the first
+                # pass (e.g. after a speaker rename) and write a second,
+                # differently-named stray file instead of updating the
+                # original. Reuse the existing path so it overwrites in
+                # place, same as _write_note() already does for the
+                # same-filename case.
+                existing_path = record.get("obsidian_note_path")
+                if existing_path:
+                    note_path = await asyncio.to_thread(obsidian_sync.push_recording, record, existing_path)
+                else:
+                    note_path = await asyncio.to_thread(obsidian_sync.push_recording, record)
                 if note_path:
                     storage.set_obsidian_note_path(record["content_hash"], note_path)
                 storage.mark_distributed(record["content_hash"], "obsidian")
@@ -1594,7 +2260,15 @@ async def sync_speaker_edits_once():
             idx = notion_sync.speaker_slot_index(speaker_id)
             if not idx:
                 continue
-            notion_value = notion_slots.get(idx, "")
+            # A page pushed before the providers/base.py _denull fix can
+            # still have the literal placeholder text "unknown" sitting in
+            # its "Speaker N" property -- without this filter, every poll
+            # cycle re-imports that stale text as a "confirmed" name,
+            # permanently undoing any local cleanup (confirmed live: a
+            # manually-cleared "unknown" speaker_names entry kept coming
+            # back within one poll interval).
+            raw_notion_value = notion_slots.get(idx, "")
+            notion_value = raw_notion_value if raw_notion_value.strip().lower() not in ("unknown", "null", "none", "n/a") else ""
             local_value = current_names.get(speaker_id, "")
             if notion_value and notion_value != local_value:
                 storage.set_speaker_name(record["content_hash"], speaker_id, notion_value)
@@ -1735,6 +2409,42 @@ async def check_notion_jarvis_done_once():
         new_status = "done" if checked else "pending"
         if new_status != current:
             storage.set_jarvis_user_status(record["content_hash"], new_status)
+
+
+async def check_obsidian_task_done_once():
+    """Reads each Task note's "done" frontmatter back into the recording,
+    so ticking a task off inside Obsidian marks it done in Clicky (and,
+    via the mirror below, in Notion too).
+
+    Obsidian's half of the two-way sync the dashboard and Notion already
+    had. Only acts on an actual disagreement, so a note with no "done"
+    value (or none at all) is left alone rather than being read as False
+    and silently un-ticking a completed item."""
+    if not settings.get_all().get("obsidian_vault_path"):
+        return
+    import obsidian_sync
+    for record in storage.list_recordings():
+        if record.get("status") != "done" or record.get("merged_into"):
+            continue
+        items = (record.get("summary") or {}).get("action_items") or []
+        for i, item in enumerate(items, start=1):
+            try:
+                vault_done = await asyncio.to_thread(obsidian_sync.read_task_done, record, i)
+            except Exception as e:
+                log.debug("could not read Obsidian task done state (non-fatal): %s", e)
+                continue
+            if vault_done is None or bool(item.get("done")) == vault_done:
+                continue
+            storage.set_action_item_done(record["content_hash"], i - 1, vault_done)
+            log.info("action item %d on %s marked %s from Obsidian",
+                     i, record["name"], "done" if vault_done else "not done")
+            task_page_id = storage.get_task_page_id(record["content_hash"], i)
+            if task_page_id:
+                try:
+                    import notion_sync
+                    await asyncio.to_thread(notion_sync.set_task_done, task_page_id, vault_done)
+                except Exception as e:
+                    log.warning("failed to mirror Obsidian done state to Notion: %s", e)
 
 
 async def check_obsidian_email_approvals_once():
@@ -1924,16 +2634,20 @@ def _past_context_for_attendees(attendees: list, meeting_title: str = None, limi
     given attendee emails (matched via record["meeting"]["attendees"], the
     same field Notion People email-matching uses -- see notion_sync.py's
     _attendee_email_for_name), ranks them by SEMANTIC relevance to the
-    upcoming meeting (rag_index.rank_by_similarity, not literal title-word
-    overlap -- see macOS poller.py for the full rationale) then recency,
-    and collects a dated summary + open action items owned by them. Also
-    pulls each person's Notion People "Note" (role/relationship), if the
-    People database is configured, so the note isn't just a bare name.
+    upcoming meeting (rag_index.rank_by_similarity against each candidate's
+    summary, not literal title-word overlap -- catches a past conversation
+    about the same project phrased differently) then recency, and collects
+    a dated summary + open action items owned by them. Also pulls each
+    person's Notion People "Note" (role/relationship), if the People
+    database is configured, so the note isn't just a bare name.
 
-    Attendee matching itself stays exact -- only the ranking among
-    already-matched candidates is fuzzy/semantic. Returns {email: {"name",
-    "role", "items": [{"text","date_label","relevant"}], "open_items":
-    [...]}}, only for attendees who actually have prior history."""
+    Attendee matching itself stays exact (real email equality) -- only the
+    RANKING among already-matched candidates is fuzzy/semantic; this is
+    deliberate, see rag_index.rank_by_similarity's own docstring. Returns
+    {email: {"name", "role", "items": [{"text","date_label","relevant"}],
+    "open_items": [...]}}, only for attendees who actually have prior
+    history (a first-time meeting with someone correctly yields nothing for
+    them, rather than fabricated context)."""
     import rag_index
 
     emails = {a["email"].lower(): a.get("name", a["email"]) for a in attendees if a.get("email")}
@@ -1963,6 +2677,11 @@ def _past_context_for_attendees(attendees: list, meeting_title: str = None, limi
                 if (item.get("owner") or "").strip().lower() == emails[email].strip().lower():
                     open_items[email].append(item.get("text", ""))
 
+    # One batched embedding call across every candidate summary collected
+    # above (not one call per record) -- see rag_index.rank_by_similarity.
+    # Falls back to relevance=0 for everyone (still correct, just unranked
+    # by topic -- recency alone still applies below) if embedding fails for
+    # any reason, e.g. the model can't be loaded.
     all_summaries = [summary for items in candidates.values() for _created_at, summary in items]
     try:
         scores = rag_index.rank_by_similarity(meeting_title or "", all_summaries) if meeting_title else [0.0] * len(all_summaries)
@@ -2123,6 +2842,14 @@ async def poll_once():
     await sync_once()
     await process_once()
     await merge_continuations_once()
+    # Runs BEFORE distribute_once so a note found missing this cycle is
+    # rewritten in the same cycle rather than the next one.
+    repair_missing_obsidian_notes_once()
+    # Drains the pre-compression backlog a few recordings at a time (see
+    # storage.compress_existing_audio). Off the event loop -- FLAC encoding
+    # a long recording is CPU-bound and would otherwise block every other
+    # poll task behind it.
+    await asyncio.to_thread(storage.compress_existing_audio)
     await distribute_once()
     await generate_drafts_once()
     await generate_standalone_email_drafts_once()
@@ -2130,9 +2857,14 @@ async def poll_once():
     await check_notion_email_approvals_once()
     await check_notion_jarvis_done_once()
     await check_obsidian_email_approvals_once()
+    await check_obsidian_task_done_once()
     await check_social_post_generation_triggers_once()
+    await check_notion_action_item_triggers_once()
+    await check_obsidian_action_item_triggers_once()
+    await check_email_watches_once()
     await check_publication_approvals_once()
     await check_social_publish_once()
+    await check_official_meeting_transcripts_once()
     await check_usage_report_once()
     await check_meeting_auto_start_once()
     await check_meeting_prep_once()
@@ -2197,51 +2929,6 @@ def generate_social_posts(transcript: str, meeting: dict = None) -> dict:
             "notion_page_id": None, "scheduled_at": None, "published_at": None, "url": None, "error": None,
         }
     return posts
-
-
-def push_social_posts_now(content_hash: str) -> dict:
-    """Pushes a record's already-generated social_posts to whichever of
-    Notion Publications DB / Obsidian vault is configured RIGHT NOW --
-    called by the dashboard's "Sync now" button (see app.py's
-    /social/sync-now route) and by jarvis.py's _action_social_post right
-    after generating a post, in case a backend happens to already be
-    configured. Unlike check_social_post_generation_triggers_once, this
-    does NOT require the record to already have a Notion Notes/Journal
-    page id -- related_page_id is simply None when there isn't one (both
-    notion_sync.push_social_posts and obsidian_sync.push_social_posts
-    already tolerate that, since a Jarvis-generated post has no source
-    Note page at all)."""
-    record = storage.get_recording(content_hash)
-    if not record or not record.get("social_posts"):
-        return {"pushed": False, "error": "no_posts"}
-    saved = settings.get_all()
-    notion_configured = bool(saved.get("notion_publications_database_id") and saved.get("notion_token"))
-    obsidian_configured = bool(saved.get("obsidian_vault_path"))
-    if not notion_configured and not obsidian_configured:
-        return {"pushed": False, "error": "not_configured"}
-
-    pushed_any = False
-    if notion_configured and not record.get("notion_publication_page_id"):
-        try:
-            import notion_sync
-            related = record.get("notion_page_id") or record.get("notion_journal_page_id")
-            created = notion_sync.push_social_posts(record, related)
-            if created.get("notion_page_id"):
-                storage.set_notion_publication_page_id(content_hash, created["notion_page_id"])
-                pushed_any = True
-        except Exception as e:
-            log.error("failed to push social posts for %s to Notion: %s", record["name"], e)
-    if obsidian_configured and not record.get("obsidian_publication_note_path"):
-        try:
-            import obsidian_sync
-            related = record.get("obsidian_note_path") or record.get("obsidian_journal_note_path")
-            path = obsidian_sync.push_social_posts(record, related)
-            if path:
-                storage.set_obsidian_publication_note_path(content_hash, path)
-                pushed_any = True
-        except Exception as e:
-            log.error("failed to push social posts for %s to Obsidian: %s", record["name"], e)
-    return {"pushed": pushed_any}
 
 
 async def check_social_post_generation_triggers_once():
@@ -2365,6 +3052,209 @@ async def check_social_post_generation_triggers_once():
         import analytics
         for platform in posts:
             analytics.track_event("social_posts_generated", key=platform)
+
+
+async def check_obsidian_action_item_triggers_once():
+    """Obsidian counterpart of check_notion_action_item_triggers_once():
+    fills "new_action_item" and ticks "add_action_item" in a recording
+    note's frontmatter to add an action item from inside the vault, and it
+    becomes a real Task note plus a real item on the recording.
+
+    Same ensure/poll/reset shape and the same storage side-effects
+    (add_action_item + append_task_status_link) as the Notion trigger, so
+    an item added from either destination is indistinguishable afterwards
+    -- which is the whole point of this parity pass."""
+    if not settings.get_all().get("obsidian_vault_path"):
+        return
+    import obsidian_sync
+    for record in storage.list_recordings():
+        if record.get("status") != "done" or record.get("merged_into"):
+            continue
+        for path in filter(None, [record.get("obsidian_note_path"),
+                                   record.get("obsidian_journal_note_path")]):
+            try:
+                await asyncio.to_thread(obsidian_sync.ensure_action_item_trigger_fields, path)
+                text = await asyncio.to_thread(obsidian_sync.read_action_item_trigger, path)
+            except Exception as e:
+                log.error("failed to read Obsidian action-item trigger for %s: %s", record["name"], e)
+                continue
+            if not text:
+                continue
+            try:
+                item_index = storage.add_action_item(record["content_hash"], {"text": text})
+                task_path = await asyncio.to_thread(
+                    obsidian_sync.push_single_task, text, storage.get_recording(record["content_hash"]), item_index)
+                storage.append_task_status_link(record["content_hash"],
+                                                 {"index": item_index, "task_note_path": task_path})
+                await asyncio.to_thread(obsidian_sync.reset_action_item_trigger, path)
+                log.info("created Task from Obsidian-added action item on %s: %r", record["name"], text)
+                import analytics
+                analytics.track_event("obsidian_action_item_added")
+            except Exception as e:
+                log.error("failed to create Task from Obsidian action item on %s: %s", record["name"], e)
+
+
+async def check_notion_action_item_triggers_once():
+    """Polls the "Add Action Item" checkbox (notion_sync.read_action_item_trigger)
+    on each recording's Notes/Journal page -- typing text into "New Action
+    Item" and checking the box lets a user add a new action item directly
+    in Notion after the recording's already been processed, and have it
+    turn into a real Task page (notion_sync.push_single_task), same as
+    action items the LLM originally extracted. Same
+    ensure-property-then-poll-then-reset shape as
+    check_social_post_generation_triggers_once, just for a text field
+    instead of a generate-now action."""
+    saved = settings.get_all()
+    if not (saved.get("notion_token") and saved.get("notion_tasks_database_id")):
+        return  # Tasks isn't configured -- nothing to create the new item into
+    import notion_sync
+
+    if saved.get("notion_database_id"):
+        await asyncio.to_thread(notion_sync.ensure_action_item_trigger_properties, saved["notion_database_id"])
+    if saved.get("notion_journal_database_id"):
+        await asyncio.to_thread(notion_sync.ensure_action_item_trigger_properties, saved["notion_journal_database_id"])
+
+    for record in storage.list_recordings():
+        if record["status"] != "done":
+            continue
+        for page_id in filter(None, [record.get("notion_page_id"), record.get("notion_journal_page_id")]):
+            try:
+                text = await asyncio.to_thread(notion_sync.read_action_item_trigger, page_id)
+            except Exception as e:
+                log.error("failed to read Add Action Item checkbox for %s: %s", record["name"], e)
+                continue
+            if not text:
+                continue
+            try:
+                item_index = storage.add_action_item(record["content_hash"], {"text": text})
+                task_page_id = await asyncio.to_thread(
+                    notion_sync.push_single_task, text, page_id, saved["notion_tasks_database_id"])
+                storage.append_task_status_link(record["content_hash"], {"index": item_index, "task_page_id": task_page_id})
+                await asyncio.to_thread(notion_sync.reset_action_item_trigger, page_id)
+                log.info("created Task from Notion-added action item on %s: %r", record["name"], text)
+                import analytics
+                analytics.track_event("notion_action_item_added")
+            except Exception as e:
+                log.error("failed to create Task from Notion-added action item for %s: %s", record["name"], e)
+
+
+async def check_email_watches_once():
+    """Polls Mac Mail.app (apple_mail.search_messages) for every action
+    item with an active email watch (item["watch_query"] set,
+    item["watch_triggered"] not yet True -- see app.py's
+    set_action_item_watch route, which is where a watch actually gets
+    created/cleared). A "new" match is one whose message id isn't already
+    in item["watch_seen_ids"] -- the baseline snapshot taken when the
+    watch was created -- which is what makes this "alert on NEW mail",
+    not "alert on whatever's already in the inbox" (see storage.
+    set_action_item_watch's docstring). macOS only: apple_mail.py drives
+    Mail.app via AppleScript, so this is a silent no-op on Windows (no
+    watches ever get set there in practice since the dashboard route that
+    creates them also needs apple_mail, but this guard is the belt-and-
+    braces version in case a watch_query somehow ends up on a Windows-
+    synced record, e.g. shared settings.json)."""
+    import sys
+    if sys.platform != "darwin":
+        return
+    try:
+        import apple_mail
+    except ImportError:
+        return
+
+    notion_configured = bool(settings.get_all().get("notion_token"))
+    obsidian_configured = bool(settings.get_all().get("obsidian_vault_path"))
+    notion_sync = None
+    obsidian_sync = None
+
+    for record in storage.list_recordings():
+        if record["status"] != "done":
+            continue
+        items = (record.get("summary") or {}).get("action_items") or []
+        for i, item in enumerate(items):
+            query = item.get("watch_query")
+            if not query or item.get("watch_triggered"):
+                continue
+            try:
+                results = await asyncio.to_thread(apple_mail.search_messages, query)
+            except Exception as e:
+                log.error("email watch search failed for %r on %s: %s", query, record["name"], e)
+                continue
+            seen_ids = set(item.get("watch_seen_ids") or [])
+            new_matches = [m for m in results if m["id"] not in seen_ids]
+            if not new_matches:
+                continue
+
+            all_seen_ids = list(seen_ids | {m["id"] for m in new_matches})
+            storage.mark_action_item_watch_triggered(record["content_hash"], i, new_matches, all_seen_ids)
+
+            title = "📧 Watched email arrived"
+            body = f"{item.get('text', '')[:80]}\n{new_matches[0].get('from', '')}: {new_matches[0].get('subject', '')}"
+            _notify_macos(title, body)
+            log.info("email watch triggered for %r on %s: %d new message(s)", query, record["name"], len(new_matches))
+
+            task_page_id = storage.get_task_page_id(record["content_hash"], i + 1)
+            if task_page_id and notion_configured:
+                if notion_sync is None:
+                    import notion_sync
+                try:
+                    await asyncio.to_thread(notion_sync.set_task_watch_alert, task_page_id, new_matches)
+                except Exception as e:
+                    log.warning("failed to mirror watch alert to Notion Task %s: %s", task_page_id, e)
+            if obsidian_configured:
+                if obsidian_sync is None:
+                    import obsidian_sync
+                try:
+                    await asyncio.to_thread(obsidian_sync.set_task_watch_alert, record, i, new_matches)
+                except Exception as e:
+                    log.warning("failed to mirror watch alert to Obsidian for %s: %s", record["content_hash"], e)
+
+            import analytics
+            analytics.track_event("email_watch_triggered")
+
+
+def push_social_posts_now(content_hash: str) -> dict:
+    """Pushes a record's already-generated social_posts to whichever of
+    Notion Publications DB / Obsidian vault is configured RIGHT NOW --
+    called by the dashboard's "Sync now" button (see app.py's
+    /social/sync-now route) and by jarvis.py's _action_social_post right
+    after generating a post, in case a backend happens to already be
+    configured. Unlike check_social_post_generation_triggers_once, this
+    does NOT require the record to already have a Notion Notes/Journal
+    page id -- related_page_id is simply None when there isn't one (both
+    notion_sync.push_social_posts and obsidian_sync.push_social_posts
+    already tolerate that, since a Jarvis-generated post has no source
+    Note page at all)."""
+    record = storage.get_recording(content_hash)
+    if not record or not record.get("social_posts"):
+        return {"pushed": False, "error": "no_posts"}
+    saved = settings.get_all()
+    notion_configured = bool(saved.get("notion_publications_database_id") and saved.get("notion_token"))
+    obsidian_configured = bool(saved.get("obsidian_vault_path"))
+    if not notion_configured and not obsidian_configured:
+        return {"pushed": False, "error": "not_configured"}
+
+    pushed_any = False
+    if notion_configured and not record.get("notion_publication_page_id"):
+        try:
+            import notion_sync
+            related = record.get("notion_page_id") or record.get("notion_journal_page_id")
+            created = notion_sync.push_social_posts(record, related)
+            if created.get("notion_page_id"):
+                storage.set_notion_publication_page_id(content_hash, created["notion_page_id"])
+                pushed_any = True
+        except Exception as e:
+            log.error("failed to push social posts for %s to Notion: %s", record["name"], e)
+    if obsidian_configured and not record.get("obsidian_publication_note_path"):
+        try:
+            import obsidian_sync
+            related = record.get("obsidian_note_path") or record.get("obsidian_journal_note_path")
+            path = obsidian_sync.push_social_posts(record, related)
+            if path:
+                storage.set_obsidian_publication_note_path(content_hash, path)
+                pushed_any = True
+        except Exception as e:
+            log.error("failed to push social posts for %s to Obsidian: %s", record["name"], e)
+    return {"pushed": pushed_any}
 
 
 async def check_publication_approvals_once():

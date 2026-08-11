@@ -55,6 +55,19 @@ bool ble_sync_is_paired();
 void ble_sync_start_pairing();  // fast advertising, ~120s auto-timeout
 void ble_sync_stop_pairing();   // back to normal (slow-adv if paired, silent if not)
 
+// Clears the sticky NVS "paired" flag and immediately enters pairing mode
+// (fast advertising) -- the only user-reachable recovery path once a
+// device is paired, on WiFi, and has proven HTTP-reachable (see
+// resumeIdleAdvertising()'s doc comment in ble_sync.cpp): in that
+// combination advertising is permanently suppressed and there was
+// previously no way at all to make the device discoverable to a second
+// laptop, since `paired` never clears itself and ble_sync_start_pairing()
+// otherwise only ever fires once, at boot, for a never-paired device. Call
+// from a deliberate user gesture (main.cpp's BOOT long-press) -- never
+// automatically, since it un-pairs the device from whatever laptop it was
+// already working with.
+void ble_sync_forget_and_repair();
+
 // BLE is a backup sync/control path, not a peer to WiFi -- call
 // periodically (e.g. indicatorTask's 1s tick) so idle BLE advertising
 // stops the moment WiFi is actually connected, and resumes automatically

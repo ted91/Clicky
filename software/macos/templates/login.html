@@ -3,19 +3,12 @@
 <head>
   <meta charset="utf-8">
   <title>Log in — Clicky Notes</title>
+  <link rel="stylesheet" href="/static/design.css">
   <style>
-    :root { --bg: #fff; --fg: #1a1a1a; --border: #ddd; --muted: #666; --error: #c0392b; }
-    @media (prefers-color-scheme: dark) {
-      :root { --bg: #121212; --fg: #eee; --border: #3a3a3a; --muted: #aaa; --error: #ff6b5e; }
-    }
-    :root[data-theme="dark"] { --bg: #121212; --fg: #eee; --border: #3a3a3a; --muted: #aaa; --error: #ff6b5e; }
-    :root[data-theme="light"] { --bg: #fff; --fg: #1a1a1a; --border: #ddd; --muted: #666; --error: #c0392b; }
-    body { font-family: -apple-system, sans-serif; background: var(--bg); color: var(--fg); display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-    form { border: 1px solid var(--border); border-radius: 8px; padding: 2rem; width: 260px; }
-    h1 { font-size: 1.2rem; margin: 0 0 1rem; }
-    input { width: 100%; box-sizing: border-box; padding: 0.5rem; margin-bottom: 1rem; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--fg); }
-    button { width: 100%; padding: 0.6rem; border: none; border-radius: 4px; background: #0a7; color: #fff; font-weight: 600; cursor: pointer; }
-    .error { color: var(--error); font-size: 0.85rem; margin-bottom: 1rem; }
+    body { display: flex; align-items: center; justify-content: center; height: 100vh; }
+    form { border: 1px solid var(--border); border-radius: var(--radius); padding: 2rem; width: 280px; background: var(--card-bg); box-shadow: var(--shadow); }
+    input { margin-bottom: 1rem; }
+    button { width: 100%; margin-top: 0; }
   </style>
 </head>
 <body>

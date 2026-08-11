@@ -64,6 +64,11 @@ a = Analysis(
         'bleak',
         'bleak.backends.winrt',  # Windows' actual BLE backend -- bleak picks this automatically at runtime, but PyInstaller needs it listed to bundle it at all
         'yaml',  # obsidian_sync.py's frontmatter read/write
+        # audio_store.py's lossless FLAC compression -- see the macOS spec's
+        # note: imported inside functions and degrades silently to
+        # uncompressed WAV if missing, so it must be listed explicitly.
+        'soundfile',
+        'audio_store',
         # voice_id.py's speaker-embedding model -- torch/speechbrain's own
         # dynamic import patterns are extensive; this list is a starting
         # point, not guaranteed complete -- expect to add entries after a

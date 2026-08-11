@@ -47,9 +47,52 @@ This needs its own design pass (storage schema for voiceprints, enrollment
 UX, privacy implications of storing biometric voice data) before building --
 tracked here so the idea isn't lost, not started yet.
 """
+import array
+
 import requests
 
 import config
+
+
+def _has_distinct_channels(wav_bytes: bytes, probe_frames: int = 4000) -> bool:
+    """Whether this WAV carries genuinely different audio per channel.
+
+    True only for meetingcap's one-participant-per-channel capture (system
+    audio L / mic R), which is what makes `multichannel` the right call.
+    False for the ESP32's single mic recorded into both channels, where
+    multichannel would just transcribe the same audio twice and invent a
+    second speaker who doesn't exist.
+
+    Mirrors noise_reduction._channels_differ deliberately rather than
+    importing it: this module is a provider and shouldn't depend on the
+    app's audio pipeline, and both need to survive the other being
+    changed. Any failure answers False -- the previous single-channel
+    behaviour -- since guessing wrong toward multichannel would corrupt
+    attribution rather than merely fail to improve it."""
+    try:
+        if len(wav_bytes) < 44 or wav_bytes[0:4] != b"RIFF" or wav_bytes[8:12] != b"WAVE":
+            return False
+        channels = int.from_bytes(wav_bytes[22:24], "little")
+        bits = int.from_bytes(wav_bytes[34:36], "little")
+        if channels < 2 or bits != 16:
+            return False
+        data = wav_bytes[44:]
+        data = data[:len(data) - (len(data) % 2)]
+        samples = array.array("h")
+        samples.frombytes(data)
+        total_frames = len(samples) // channels
+        if total_frames == 0:
+            return False
+        step = max(1, total_frames // probe_frames)
+        for f in range(0, total_frames, step):
+            base = f * channels
+            first = samples[base]
+            for c in range(1, channels):
+                if samples[base + c] != first:
+                    return True
+        return False
+    except Exception:
+        return False
 
 API_BASE = "https://api.deepgram.com/v1/listen"
 
@@ -131,6 +174,15 @@ def transcribe(wav_bytes: bytes) -> dict:
         },
         params={
             "model": config.DEEPGRAM_STT_MODEL,
+            # multichannel is set only when the audio genuinely carries one
+            # participant per channel (meetingcap puts system audio on L
+            # and the mic on R). Then each channel IS a speaker: attribution
+            # becomes a fact about which track the words came from rather
+            # than an acoustic guess, which is strictly better than
+            # diarizing a mix -- and diarization on a two-person mono mix
+            # was measurably getting turns wrong (a one-word answer landing
+            # on whoever asked the question).
+            **({"multichannel": "true"} if _has_distinct_channels(wav_bytes) else {}),
             "diarize": "true",
             "utterances": "true",
             "punctuate": "true",
@@ -151,6 +203,12 @@ def transcribe(wav_bytes: bytes) -> dict:
     results = data.get("results", {})
 
     utterances = results.get("utterances") or []
+    # Sorted here, once, rather than on `segments` alone: with multichannel
+    # Deepgram groups utterances per channel, and the flat `text` below is
+    # built from this same list -- sorting only the segments would leave
+    # the transcript text reading as one speaker's entire side followed by
+    # the other's.
+    utterances = sorted(utterances, key=lambda u: u.get("start", 0.0))
     segments = None
     if utterances:
         # Deepgram's speaker id is a bare int (0, 1, ...); prefixed to match
@@ -158,15 +216,28 @@ def transcribe(wav_bytes: bytes) -> dict:
         # other diarizing provider (see providers/base.py's speaker_slot_index,
         # notion_sync's Speaker-N property mapping -- both parse a trailing
         # number off this exact string).
+        # With multichannel, the CHANNEL is the speaker -- meetingcap puts
+        # exactly one participant on each (system audio L / mic R), so
+        # channel 0/1 maps to speaker_1/speaker_2 directly. Prefer it over
+        # Deepgram's acoustic `speaker` field, which is a guess made from
+        # the audio; the channel is a fact about how it was recorded.
+        # Falls back to `speaker` whenever the response has no channel
+        # information (every non-multichannel request, and any provider
+        # response shape that omits it).
         segments = [
             {
-                "speaker_id": f"speaker_{u['speaker'] + 1}",
+                "speaker_id": f"speaker_{(u['channel'] if u.get('channel') is not None else u.get('speaker', 0)) + 1}",
                 "text": u.get("transcript", ""),
                 "start": u.get("start", 0.0),
                 "end": u.get("end", 0.0),
             }
             for u in utterances
         ]
+        # Utterances arrive grouped per channel when multichannel is on;
+        # the rest of the pipeline (merge_consecutive_segments, the
+        # transcript display, loudness annotation) assumes chronological
+        # order, so interleave them back into real conversation order.
+        segments.sort(key=lambda s: s["start"])
 
     text = " ".join(u.get("transcript", "") for u in utterances) if utterances else (
         results.get("channels", [{}])[0].get("alternatives", [{}])[0].get("transcript", "")

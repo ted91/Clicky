@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -58,6 +59,9 @@ _STOP_TIMEOUT_SECONDS = 10
 _MAX_RELAUNCH_ATTEMPTS = 3
 _RELAUNCH_BACKOFF_SECONDS = 5
 _relaunch_attempts = 0
+# How long _kill_orphaned_agents() polls a SIGTERM'd orphan for real exit
+# before escalating to SIGKILL -- see that function's docstring.
+_ORPHAN_KILL_GRACE_SECONDS = 3
 _shutting_down = False  # set by shutdown() so a deliberate quit doesn't trigger a relaunch
 
 _pending_meeting = None  # calendar metadata to attach to the *next* recording that starts (Phase B)
@@ -80,6 +84,76 @@ def helper_path():
     else:
         candidate = os.path.join(os.path.dirname(os.path.abspath(__file__)), "meetingcap", "meetingcap")
     return candidate if os.path.isfile(candidate) and os.access(candidate, os.X_OK) else None
+
+
+def _kill_orphaned_agents(helper: str):
+    """Kills any meetingcap process left over from a previous app instance,
+    before launching our own.
+
+    Live-confirmed leak: the app's single-instance lock (see
+    main_packaged.py) supersedes a stale *parent* Clicky process, but
+    meetingcap is spawned as a separate child that does NOT die with it --
+    so every restart/redeploy stacked another agent, each holding its own
+    microphone session open. Observed in the wild: 18 simultaneous
+    meetingcap processes, 18 microphone indicators in the menu bar, four of
+    them stuck at 80%+ CPU for over a day. Nothing reaps these otherwise,
+    since their parent is already gone by the time we start.
+
+    Safe to kill unconditionally here: this runs at our own startup, before
+    we spawn ours, so any process matching the helper path necessarily
+    belongs to a dead or superseded instance -- it has no live parent left
+    to report results to.
+
+    SIGTERM, then verify: live-confirmed (4 simultaneous stuck agents,
+    each pegged ~90%+ CPU, after a screen-recording-permission-denied
+    error triggered several rapid _attempt_relaunch cycles) that a
+    meetingcap process can end up somewhere (e.g. mid-teardown of a
+    ScreenCaptureKit session after a TCC denial) where it doesn't act on
+    SIGTERM promptly. Since this function runs again on every relaunch
+    attempt, a SIGTERM that's merely slow -- not dead-on-arrival -- meant
+    each retry's scan still saw last cycle's zombie-in-progress as
+    "already handled" and moved on to spawn a fresh agent anyway, so they
+    piled up across a crash-loop instead of any single one ever actually
+    being cleared before the next was started. Now polls for real exit for
+    up to _ORPHAN_KILL_GRACE_SECONDS and escalates to SIGKILL on any
+    survivor, so launch() only ever proceeds once every prior agent this
+    scan found is verifiably gone.
+    """
+    try:
+        result = subprocess.run(["pgrep", "-f", helper], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.debug("could not scan for orphaned meetingcap agents (non-fatal): %s", e)
+        return
+    pids = [int(p) for p in result.stdout.split() if p.strip().isdigit() and int(p) != os.getpid()]
+    if not pids:
+        return
+    log.warning("killing %d orphaned meetingcap agent(s) from a previous instance: %s",
+                len(pids), ", ".join(str(p) for p in pids))
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError as e:
+            log.debug("could not SIGTERM orphaned meetingcap pid %s (non-fatal): %s", pid, e)
+
+    def _still_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)  # signal 0: existence check only, no actual signal sent
+            return True
+        except OSError:
+            return False  # ESRCH -- process is gone
+
+    deadline = time.time() + _ORPHAN_KILL_GRACE_SECONDS
+    survivors = set(pids)
+    while survivors and time.time() < deadline:
+        time.sleep(0.2)
+        survivors = {p for p in survivors if _still_alive(p)}
+    for pid in survivors:
+        log.warning("orphaned meetingcap pid %s ignored SIGTERM for %ds -- sending SIGKILL",
+                    pid, _ORPHAN_KILL_GRACE_SECONDS)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError as e:
+            log.debug("could not SIGKILL orphaned meetingcap pid %s (non-fatal): %s", pid, e)
 
 
 def _is_valid_wav(data: bytes) -> bool:
@@ -143,6 +217,8 @@ def launch():
                                 "in a packaged build this is a packaging bug.")
         log.warning(_agent["error"])
         return
+
+    _kill_orphaned_agents(helper)
 
     env = dict(os.environ)
     env["CLICKY_DATA_DIR"] = paths.APP_DATA_DIR

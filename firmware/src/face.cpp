@@ -373,14 +373,18 @@ static void drawStatus(Status status) {
 }
 
 // First-time setup screen -- shown automatically at boot while unpaired
-// (see face_set_paired/main.cpp's setup()), and reachable via BOOT cycling
-// too as long as pairing hasn't completed yet (see face_next_status()).
+// (see face_set_paired/main.cpp's setup()). BOOT-button status cycling
+// was dropped entirely (main.cpp:35-36), so this screen is no longer
+// reachable that way once shown -- it clears itself the moment the device
+// actually pairs (see ble_sync.cpp's onConnect() -> face_set_paired(true)).
 // Deliberately skips drawStatus()'s decorative ring/face entirely and uses
 // almost the whole panel for actual instructions -- a returning, already-
 // paired user never sees this at all, so it doesn't need to match the
 // idle smiley's playful aesthetic, just be readable at a glance.
-// BOOT long-press (face_clear_status(), see main.cpp) is the "I don't want
-// to follow these, just get me to the idle screen" escape hatch.
+// A BOOT long-press on an ALREADY-paired device is a different gesture --
+// ble_sync_forget_and_repair() (main.cpp), which re-enters this same
+// pairing state deliberately, as the one user-reachable way to make a
+// paired device discoverable to a new laptop again.
 static void drawPairingSetup() {
     drawTextCentered("SETUP", 8, 2);
     drawTextWrapped(

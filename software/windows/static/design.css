@@ -1,0 +1,121 @@
+/* Shared design system for every dashboard page -- replaces 9 previously
+   duplicated inline <style> blocks (each redefining :root, dark-mode
+   overrides, .app-nav, resets, and buttons independently). Every template
+   links this file, then adds only its own genuinely page-specific rules
+   in a small local <style> block.
+
+   Token naming is now canonical (one name per concept) -- earlier
+   templates disagreed: some used --owner, some --ok, for the same accent
+   color; some used --card, some --card-bg. Every template's markup was
+   updated to match these names when this file was introduced.
+
+   Palette: "meditation" -- soft sage green + warm cream, a calm, organic
+   pairing instead of a stark neutral-gray/saturated-emerald scheme.
+   Cards use a light glass effect (translucent background + backdrop
+   blur) over a soft cream page background, with generous rounded
+   corners throughout. Kept soft/quiet so the actual content
+   (transcripts, summaries, settings forms) stays the visual focus. */
+
+:root {
+  --bg: #f7f3e9;
+  --fg: #33392f;
+  --muted: #7a8271;
+  --muted2: #a3aa98;
+  --border: #ded6c1;
+  --card-bg: rgba(255, 253, 246, 0.72);
+  --card-bg-solid: #fffdf6;
+  --pre-bg: #f1ead9;
+  --sidebar: #f1ebda;
+  --accent: #7c9473;
+  --accent-fg: #2f3a28;
+  --warn: #b8874f;
+  --error: #c1614f;
+  --shadow: 0 1px 2px rgba(90,80,50,0.05), 0 8px 24px rgba(90,80,50,0.07);
+  --glass-blur: blur(14px);
+  --radius: 20px;
+  --radius-sm: 12px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c2019; --fg: #e9e7da; --muted: #9aa290; --muted2: #6c7364; --border: #333a2c;
+    --card-bg: rgba(38, 44, 34, 0.6); --card-bg-solid: #262c22; --pre-bg: #232920; --sidebar: #1f2419;
+    --accent: #9db78f; --accent-fg: #1c2019; --warn: #d8a869; --error: #e08a76;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px rgba(0,0,0,0.25);
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #1c2019; --fg: #e9e7da; --muted: #9aa290; --muted2: #6c7364; --border: #333a2c;
+  --card-bg: rgba(38, 44, 34, 0.6); --card-bg-solid: #262c22; --pre-bg: #232920; --sidebar: #1f2419;
+  --accent: #9db78f; --accent-fg: #1c2019; --warn: #d8a869; --error: #e08a76;
+  --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px rgba(0,0,0,0.25);
+}
+:root[data-theme="light"] {
+  --bg: #f7f3e9; --fg: #33392f; --muted: #7a8271; --muted2: #a3aa98; --border: #ded6c1;
+  --card-bg: rgba(255, 253, 246, 0.72); --card-bg-solid: #fffdf6; --pre-bg: #f1ead9; --sidebar: #f1ebda;
+  --accent: #7c9473; --accent-fg: #2f3a28; --warn: #b8874f; --error: #c1614f;
+  --shadow: 0 1px 2px rgba(90,80,50,0.05), 0 8px 24px rgba(90,80,50,0.07);
+}
+
+* { box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+  margin: 0; color: var(--fg); background: var(--bg);
+  -webkit-font-smoothing: antialiased; line-height: 1.5;
+}
+h1 { font-size: 1.375rem; font-weight: 650; letter-spacing: -0.01em; margin: 0 0 0.35rem; }
+h2 { font-size: 1.05rem; font-weight: 650; margin: 0 0 0.5rem; }
+a { color: var(--accent); }
+.desc, .hint { color: var(--muted); font-size: 0.85rem; }
+.meta { color: var(--muted); font-size: 0.8rem; margin-bottom: 1.75rem; }
+
+/* Site-wide left nav (templates/_nav.html), shared across index/settings/
+   jarvis/social/admin. */
+.app-nav { width: 216px; flex-shrink: 0; background: var(--sidebar); border-right: 1px solid var(--border); padding: 1rem 0.6rem; }
+.app-nav-item {
+  display: flex; align-items: center; gap: 0.65rem; padding: 0.5rem 0.75rem;
+  font-size: 0.875rem; color: var(--muted); text-decoration: none; border-radius: var(--radius-sm);
+  background: none; border: none; width: 100%; text-align: left; cursor: pointer; font: inherit;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.app-nav-item .icon { font-size: 1.05rem; width: 1.3rem; text-align: center; }
+.app-nav-item:hover { background: rgba(128,128,128,0.1); color: var(--fg); }
+.app-nav-item.active { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); font-weight: 600; }
+.app-nav-logout { margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 0.9rem; }
+
+.page-content { flex: 1; max-width: 1400px; margin: 2.5rem auto; padding: 0 2.5rem; overflow-y: auto; }
+
+/* Forms -- shared across settings/setup/login/pair/notion-pick-page. */
+fieldset {
+  border: 1px solid var(--border); border-radius: var(--radius); padding: 1.1rem 1.35rem; margin-bottom: 1rem;
+  background: var(--card-bg); backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--shadow);
+}
+legend { padding: 0 0.4rem; font-size: 0.8rem; font-weight: 600; color: var(--muted); }
+label { display: block; margin: 0.75rem 0 0.3rem; font-size: 0.875rem; }
+input, select, textarea {
+  width: 100%; box-sizing: border-box; padding: 0.55rem 0.65rem; border: 1px solid var(--border);
+  border-radius: var(--radius-sm); background: var(--bg); color: var(--fg); font-family: inherit; font-size: 0.9rem;
+}
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+button, .btn {
+  padding: 0.55rem 1.1rem; margin-top: 1rem; border: none; border-radius: var(--radius-sm);
+  background: var(--accent); color: #fff; font-weight: 600; cursor: pointer; font-size: 0.875rem;
+  transition: opacity 0.12s ease;
+}
+button:hover, .btn:hover { opacity: 0.9; }
+button.secondary {
+  background: none; border: 1px solid var(--border); color: var(--fg);
+}
+button.secondary:hover { border-color: var(--accent); color: var(--accent); opacity: 1; }
+button.danger, .danger { background: none; border: 1px solid var(--error); color: var(--error); }
+button.danger:hover, .danger:hover { background: var(--error); color: #fff; }
+.saved { color: var(--accent); font-size: 0.85rem; margin-bottom: 1rem; }
+.error-text, .error { color: var(--error); font-size: 0.85rem; margin: 0.25rem 0; }
+
+/* Badges -- used on index.html recording cards and settings connection status. */
+.badge { display: inline-block; font-size: 0.7rem; padding: 0.15rem 0.5rem; border-radius: 999px; margin-left: 0.5rem; vertical-align: middle; }
+.badge.pending { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
+.badge.failed { background: color-mix(in srgb, var(--error) 20%, transparent); color: var(--error); }
+.badge.dest { background: var(--accent); color: #fff; opacity: 0.85; }
+
+.empty { color: var(--muted2); }

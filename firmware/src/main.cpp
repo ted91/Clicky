@@ -286,6 +286,21 @@ static void bootButtonTask(void *arg) {
             Serial.printf("timing: BOOT click handled in %lums (wifiOnAtClick=%d wifiXferAtClick=%d)\n",
                           (unsigned long)(millis() - tClick), wifiOnAtClick, wifiXferAtClick);
         }
+        // BOOT long-press: the only user-reachable way to make a paired
+        // device discoverable to a NEW laptop again. Live-confirmed bug --
+        // once a device is paired, on WiFi, and has served one HTTP
+        // request, BLE advertising is permanently suppressed
+        // (resumeIdleAdvertising() in ble_sync.cpp) with no way to
+        // re-arm it: `paired` is a sticky NVS flag that never clears
+        // itself, and ble_sync_start_pairing() otherwise only ever fires
+        // once, at boot, for a device that's never been paired at all. A
+        // second laptop's BLE scan saw the device nowhere, with no
+        // recovery path short of erasing NVS by hand. Gated on IDLE so a
+        // long BOOT hold mid-recording/capture can't hijack the gesture.
+        if (get_bit_button(bits, 1) && s_state == AppState::IDLE) {
+            Serial.println("main: BOOT long-press -> forgetting pairing, re-entering pairing mode");
+            ble_sync_forget_and_repair();
+        }
     }
 }
 
@@ -303,6 +318,18 @@ static void syncWatchTask(void *arg) {
         // recorder_was_cancelled() would otherwise still reflect a stale,
         // unrelated previous recording.
         bool recorderPathActive = !s_jarvisActive || !s_jarvisLive || voice_agent_used_recorder_fallback();
+        // Also recover from RECORDING when the recorder stopped on its own
+        // (e.g. the PSRAM 60s cap in recordToRam, recorder.cpp -- exits its
+        // loop with no stop request when a device has no SD card) -- without
+        // this, s_state never leaves RECORDING, the face shows recording
+        // forever, the audio is never advertised for sync, and sleep stays
+        // blocked indefinitely. A real button-initiated stop already
+        // transitions to SYNCING itself (buttonTask/bootButtonTask), so this
+        // is purely the self-stopped case.
+        if (s_state == AppState::RECORDING && !recorder_is_recording() && !voice_agent_is_active()) {
+            Serial.println("main: recorder stopped itself (capacity cap?) -- recovering from stale RECORDING state");
+            s_state = AppState::SYNCING;
+        }
         if (s_state == AppState::SYNCING && !recorder_is_recording() && !voice_agent_is_active()) {
             // Recording (and its final WAV flush) is done -- drop back to
             // the 80 MHz baseline before the cosmetic syncing-face pause.
@@ -422,6 +449,19 @@ static void indicatorTask(void *arg) {
 // for both tiers.
 static void sleepWatchTask(void *arg) {
     for (;;) {
+        // Defense-in-depth for the sleep-during-recording data-loss bug
+        // (see `eligible`'s new recorder_is_recording()/voice_agent_
+        // is_active() terms below, and the TOCTOU re-checks before each
+        // sleep call): power_mgr_note_activity() was previously ONLY
+        // called on button events, never while a recording is actually in
+        // progress, so the idle clock could reach its threshold mid-
+        // recording with nothing pinning it. This keeps the clock fresh
+        // for the whole duration of any live capture, independent of the
+        // `eligible` checks -- belt-and-braces, not the primary fix.
+        if (recorder_is_recording() || voice_agent_is_active()) {
+            power_mgr_note_activity();
+        }
+
         // !wifi_sync_radio_is_on() is already the real "is sync done"
         // signal, not a fixed timer: the radio only turns off once the Mac
         // actually confirms sync (POST /synced), or -- as an intentional
@@ -461,7 +501,22 @@ static void sleepWatchTask(void *arg) {
         // sleep for a real, freshly-shown notification (giving the user a
         // genuine chance to notice it), just not forever off one nobody
         // was there to dismiss -- see that function's own doc comment.
+        // !recorder_is_recording() && !voice_agent_is_active() -- live-
+        // confirmed data-loss bug: s_state is main.cpp's UI-level state,
+        // NOT a reliable "is audio actually being captured right now"
+        // signal. Stop/cancel sets s_state = SYNCING immediately
+        // (buttonTask/bootButtonTask) while recorder_stop()/recorder_cancel()
+        // only raise a flag -- recordTask keeps writing/flushing/closing
+        // for a real interval afterward. syncWatchTask already gets this
+        // right (see its own `!recorder_is_recording() && !voice_agent_
+        // is_active()` check above) -- sleepWatchTask never did, which is
+        // exactly why a device could deep-sleep mid-recording: reported
+        // live, confirmed by tracing a PWR press landing in the window
+        // between this eligibility snapshot and the actual sleep call
+        // below (see the re-check immediately before each sleep entry).
         bool eligible = s_state == AppState::IDLE &&
+                        !recorder_is_recording() &&
+                        !voice_agent_is_active() &&
                         !wifi_sync_radio_is_on() &&
                         !ble_sync_is_connected() &&
                         !power_mgr_external_power_override_active() &&
@@ -501,15 +556,31 @@ static void sleepWatchTask(void *arg) {
             millis() - s_lastDiagMs > 30000) {
             s_lastDiagMs = millis();
             Serial.printf(
-                "diag: sleep blocked -- state=%d wifi_on=%d ble_conn=%d ext_pwr=%d "
+                "diag: sleep blocked -- state=%d recording=%d voice_active=%d wifi_on=%d ble_conn=%d ext_pwr=%d "
                 "usb=%d boot_grace=%d notif=%d pending(SD-has-any-wav)=%d idle_ms=%lu/%lu(deep)\n",
-                (int)s_state, wifi_sync_radio_is_on(), ble_sync_is_connected(),
+                (int)s_state, recorder_is_recording(), voice_agent_is_active(),
+                wifi_sync_radio_is_on(), ble_sync_is_connected(),
                 power_mgr_external_power_override_active(), power_mgr_usb_host_attached(),
                 power_mgr_boot_grace_period_active(), face_notification_blocks_sleep(),
                 pending, (unsigned long)power_mgr_ms_since_activity(), 10UL * 60 * 1000);
         }
 
         if (eligible && power_mgr_deep_sleep_fallback_due()) {
+            // Re-check right before the point of no return -- `eligible` above
+            // is a snapshot from the top of this loop iteration, and is NOT
+            // re-verified before this branch runs. Live-confirmed data-loss
+            // bug: buttonTask/bootButtonTask are priority 5 on this same core
+            // (sleepWatchTask is priority 1), so a PWR press landing in the
+            // gap between the snapshot and here preempts immediately, starts
+            // a real recording, and then this task resumed on its now-stale
+            // `eligible == true` and powered the audio rail down out from
+            // under it before deep-sleeping. This second check closes that
+            // window; the recorder_is_recording()/voice_agent_is_active()
+            // terms added to `eligible` above are the primary fix, this is
+            // defense-in-depth for the TOCTOU gap itself.
+            if (recorder_is_recording() || voice_agent_is_active() || s_state != AppState::IDLE) {
+                Serial.println("main: deep-sleep aborted -- activity started after eligibility was checked");
+            } else {
             Serial.println("main: 10min genuinely idle -- falling back to deep sleep");
             // "Sleeping..." draw is deliberately ONLY on this rare, long-idle
             // path, not on the routine light-sleep tier below -- light sleep
@@ -531,7 +602,16 @@ static void sleepWatchTask(void *arg) {
             audio_bsp_power_down();
             s_power.POWEER_Audio_OFF();
             power_mgr_enter_deep_sleep(); // never returns
+            }
         } else if (eligible && power_mgr_idle_timeout_reached()) {
+            // Same TOCTOU re-check as the deep-sleep branch above -- light
+            // sleep is non-destructive (it returns rather than rebooting),
+            // but powering down the audio rail mid-recording would still
+            // corrupt whatever's being captured.
+            if (recorder_is_recording() || voice_agent_is_active() || s_state != AppState::IDLE) {
+                Serial.println("main: light-sleep aborted -- activity started after eligibility was checked");
+                continue;
+            }
             audio_bsp_power_down();
             s_power.POWEER_Audio_OFF();
             // Paused before every light sleep (restored default -- an

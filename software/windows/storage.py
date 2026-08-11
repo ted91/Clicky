@@ -13,13 +13,15 @@ named "ram_recording.wav" and would otherwise look like a duplicate of
 itself every time it's overwritten with new audio.
 """
 import json
+import logging
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import config
 import paths
 
+log = logging.getLogger("storage")
 _lock = threading.Lock()
 AUDIO_DIR = paths.AUDIO_DIR
 
@@ -97,6 +99,9 @@ def _load():
         r.setdefault("meeting", None)      # calendar metadata for meeting recordings (meeting_recorder.py)
         r.setdefault("drafts", None)       # post-meeting follow-up drafts pending user approval (poller.py)
         r.setdefault("task_email_links", [])  # notion_sync.push_tasks()'s email-item Task/People page ids (poller.check_notion_email_approvals_once)
+        r.setdefault("task_status_links", [])  # notion_sync.push_tasks()'s per-action-item Task page ids (dashboard checkbox -> Notion Status, see app.py's set_action_item_done)
+        r.setdefault("official_transcript_status", None)  # None | "applied" | "gave_up" -- see poller.check_official_meeting_transcripts_once
+        r.setdefault("official_transcript_check_until", None)  # ISO timestamp bound on how long to keep polling for one
         r.setdefault("social_posts", {})  # {platform: {status, body, title, notion_page_id, scheduled_at, published_at, url, error}}
         r.setdefault("notion_journal_page_id", None)
         r.setdefault("notion_publication_page_id", None)
@@ -183,10 +188,21 @@ def add_pending(name: str, size: int, content_hash: str, wav_bytes: bytes) -> di
     wav_bytes = noise_reduction.denoise_wav(wav_bytes)
     wav_bytes = audio_utils.normalize_wav(wav_bytes)
 
+    # Compressed losslessly for storage -- see audio_store's docstring for
+    # why lossy is off the table (the audio is evidence: voice-ID trains
+    # on it, re-transcription re-reads it, the user plays it back to check
+    # a quote). Both stages are applied AFTER denoise/normalize so what
+    # gets stored is exactly what the pipeline produced.
+    import audio_store
+    stored_bytes, ext = audio_store.encode(wav_bytes)
     os.makedirs(AUDIO_DIR, exist_ok=True)
-    wav_path = os.path.join(AUDIO_DIR, f"{content_hash}.wav")
+    wav_path = os.path.join(AUDIO_DIR, f"{content_hash}{ext}")
     with open(wav_path, "wb") as f:
-        f.write(wav_bytes)
+        f.write(stored_bytes)
+    if len(stored_bytes) < len(wav_bytes):
+        log.info("stored %s as %s -- %.1fMB -> %.1fMB (%.0f%% smaller, lossless)",
+                 name, ext.lstrip("."), len(wav_bytes)/1e6, len(stored_bytes)/1e6,
+                 100 * (1 - len(stored_bytes) / max(1, len(wav_bytes))))
 
     record = {
         "id": f"{name}-{content_hash[:8]}",
@@ -246,8 +262,14 @@ def get_unprocessed():
     cycle can retry without touching the device at all.
 
     Jarvis voice commands (kind=="command") are sorted first -- a spoken
-    command is a live, waited-on interaction, unlike a memo/meeting
-    recording processed in the background with no one watching a clock."""
+    command is a live, waited-on interaction (the user is standing there
+    expecting a spoken reply), unlike a memo/meeting recording that gets
+    processed in the background with no one watching a clock. Without this,
+    a command queued behind a large, slow-to-transcribe memo recording (or
+    several) sits waiting its turn with no reason to, which is exactly the
+    "most time goes in sync/transcribing before acting" latency reported --
+    this fixes the queuing order, not the per-file transcription time
+    itself (see poller.py's kind=="command" branch for that side)."""
     with _lock:
         records = _load()
     unprocessed = [r for r in records if r["status"] in ("pending", "failed")]
@@ -257,7 +279,7 @@ def get_unprocessed():
 
 def mark_processed(content_hash: str, transcript: str, segments,
                     summary: dict, stt_provider: str, llm_provider: str,
-                    deepgram_insights: dict = None):
+                    deepgram_insights: dict = None, garbage: bool = False):
     with _lock:
         records = _load()
         record = _find(records, content_hash)
@@ -271,6 +293,13 @@ def mark_processed(content_hash: str, transcript: str, segments,
         record["stt_provider"] = stt_provider
         record["llm_provider"] = llm_provider
         record["error"] = None
+        # True for an empty/near-empty transcript (silence, a stray button
+        # press, pure noise with nothing intelligible) -- see poller.py's
+        # _is_garbage_transcript(). The recording still shows up locally on
+        # the dashboard for audit purposes, but get_undistributed() excludes
+        # it from every push destination (Notion, Obsidian) so a blank
+        # entry doesn't clutter either.
+        record["garbage"] = garbage
         _save(records)
 
 
@@ -386,6 +415,26 @@ def set_jarvis_user_status(content_hash: str, status: str) -> bool:
         return True
 
 
+def set_action_item_done(content_hash: str, item_index: int, done: bool) -> bool:
+    """Toggles the done/undone checkbox state on one action item -- action
+    items have no stable id of their own (see providers/base.py's summarize
+    output shape), so item_index (position in summary.action_items) is the
+    only identifier; safe since the list itself is never reordered after
+    summarize() writes it. Returns False if the recording/item doesn't
+    exist."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return False
+        items = (record.get("summary") or {}).get("action_items")
+        if not items or item_index < 0 or item_index >= len(items):
+            return False
+        items[item_index]["done"] = done
+        _save(records)
+        return True
+
+
 def apply_speaker_name_guesses(content_hash: str, guesses: dict):
     """Auto-fills speaker_names from the summarizer's self-identification
     guesses (see providers/base.py's "speaker_names" field) -- only for
@@ -405,24 +454,114 @@ def apply_speaker_name_guesses(content_hash: str, guesses: dict):
         _save(records)
 
 
-def set_speaker_name(content_hash: str, speaker_id: str, name: str) -> bool:
+def set_speaker_name(content_hash: str, speaker_id: str, name: str):
     """Assigns a display name to a diarized speaker_id for one recording.
     An empty `name` clears the override, falling back to "Speaker X" again.
-    Returns False if no such recording/speaker_id exists."""
+
+    Returns (ok, previous_name): previous_name is whatever this speaker was
+    called before, so the caller can reconcile other places that recorded
+    the person under that old label (see
+    poller._reconcile_stakeholders_after_rename -- an LLM-guessed
+    "Sanjit" stakeholder entry is the same human as the corrected
+    "Sanchit" speaker, but nothing can know that without the old name)."""
     with _lock:
         records = _load()
         record = _find(records, content_hash)
         if record is None:
-            return False
+            return False, None
         if not any((s.get("speaker_id") == speaker_id) for s in (record.get("segments") or [])):
-            return False
+            return False, None
         names = record.setdefault("speaker_names", {})
+        previous = names.get(speaker_id)
         if name:
             names[speaker_id] = name
         else:
             names.pop(speaker_id, None)
         _save(records)
+    return True, previous
+
+
+def set_summary_text(content_hash: str, text: str) -> bool:
+    """Replaces the summary prose with the user's own wording and records
+    that it was hand-edited (summary_edited=True).
+
+    That flag is load-bearing: the summary is the one field that gets read
+    later (dashboard, Notion page, Obsidian note, RAG index), and until now
+    a wrong one was permanent -- no amount of prompt tuning makes the model
+    right every time, so the durable fix is being able to correct it. Any
+    pass that would regenerate this text must check the flag first and
+    leave an edited summary alone (see poller.resync_after_rename, which
+    switches to a targeted name-correction for exactly this reason)."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None or not isinstance(record.get("summary"), dict):
+            return False
+        record["summary"]["summary"] = text.strip()
+        record["summary_edited"] = True
+        _save(records)
     return True
+
+
+def set_stakeholder(content_hash: str, index: int, name: str, note: str = None) -> bool:
+    """Renames (or, with an empty `name`, removes) one stakeholder entry by
+    its 0-based position in summary["stakeholders"].
+
+    Stakeholders are LLM-extracted from the transcript, so they carry the
+    LLM's guess at each person's name -- which can disagree with a speaker
+    name the user has since corrected on the dashboard (the same human
+    appearing twice under two spellings). Nothing else lets the user fix
+    that, hence this direct edit path. Passing note=None leaves the
+    existing note untouched."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return False
+        stakeholders = (record.get("summary") or {}).get("stakeholders")
+        if not isinstance(stakeholders, list) or not (0 <= index < len(stakeholders)):
+            return False
+        if not name.strip():
+            stakeholders.pop(index)
+        else:
+            stakeholders[index]["name"] = name.strip()
+            if note is not None:
+                stakeholders[index]["note"] = note.strip() or None
+        _save(records)
+    return True
+
+
+def merge_duplicate_stakeholders(content_hash: str) -> int:
+    """Collapses stakeholder entries that share a name (case-insensitively)
+    into one, keeping the first non-empty note. Returns how many entries
+    were removed. Used after a rename reconciles two spellings of the same
+    person into a single name, which would otherwise leave the list showing
+    that person twice."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return 0
+        stakeholders = (record.get("summary") or {}).get("stakeholders")
+        if not isinstance(stakeholders, list):
+            return 0
+        seen, merged = {}, []
+        for entry in stakeholders:
+            key = (entry.get("name") or "").strip().lower()
+            if not key:
+                continue
+            if key in seen:
+                existing = merged[seen[key]]
+                if not existing.get("note") and entry.get("note"):
+                    existing["note"] = entry["note"]
+            else:
+                seen[key] = len(merged)
+                merged.append(entry)
+        removed = len(stakeholders) - len(merged)
+        if removed:
+            record["summary"]["stakeholders"] = merged
+            _save(records)
+    return removed
 
 
 def mark_distributed(content_hash: str, destination: str):
@@ -449,6 +588,23 @@ def update_summary(content_hash: str, summary: dict):
         if record is None:
             return
         record["summary"] = summary
+        _save(records)
+
+
+def update_transcript(content_hash: str, transcript: str):
+    """Replaces just the transcript text -- used when an official Google
+    Meet transcript becomes available (see
+    poller.check_official_meeting_transcripts_once) to upgrade from the
+    locally-diarized one. Deliberately leaves `segments` (our own
+    diarization) untouched -- _enforce_journal_rule's multi-speaker check
+    still needs it, and it's still a reasonable record of the local
+    recording even once the transcript text itself has been superseded."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return
+        record["transcript"] = transcript
         _save(records)
 
 
@@ -590,6 +746,129 @@ def set_task_email_links(content_hash: str, links: list):
         _save(records)
 
 
+def add_action_item(content_hash: str, item: dict) -> int:
+    """Appends one action item (e.g. typed into Notion's "New Action Item"
+    field and triggered via its "Add Action Item" checkbox -- see
+    poller.check_notion_action_item_triggers_once) to this recording's
+    summary.action_items. Returns the item's 1-based index (matching
+    notion_sync.push_tasks()'s own enumerate(..., start=1) numbering, so
+    the caller can immediately record a task_status_links entry for it),
+    or 0 if the recording doesn't exist."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return 0
+        summary = record.setdefault("summary", {}) or {}
+        items = summary.setdefault("action_items", [])
+        items.append(item)
+        record["summary"] = summary
+        _save(records)
+        return len(items)
+
+
+def set_action_item_watch(content_hash: str, item_index: int, watch_query: str, seen_ids: list = None) -> bool:
+    """Sets (or clears, if watch_query is empty) the email watch on one
+    action item -- poller.check_email_watches_once() periodically searches
+    Mail.app (apple_mail.search_messages) for watch_query and alerts the
+    first time a message id shows up that ISN'T already in watch_seen_ids.
+    seen_ids is the baseline snapshot taken at watch-creation time (the
+    caller searches once immediately and passes back whatever already
+    matches) -- this is what makes the watch mean "alert on NEW mail
+    matching this", not "alert on whatever already exists in the inbox".
+    Setting a *new* query on an item that was already triggered resets
+    watch_triggered, since that's a fresh "start watching again" request.
+    item_index is 0-based, matching the dashboard's loop.index0."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return False
+        items = (record.get("summary") or {}).get("action_items")
+        if not items or item_index < 0 or item_index >= len(items):
+            return False
+        item = items[item_index]
+        watch_query = (watch_query or "").strip()
+        if watch_query:
+            item["watch_query"] = watch_query
+            item["watch_seen_ids"] = seen_ids or []
+            item["watch_triggered"] = False
+            item["watch_matches"] = []
+        else:
+            item.pop("watch_query", None)
+            item.pop("watch_seen_ids", None)
+            item.pop("watch_triggered", None)
+            item.pop("watch_matches", None)
+        _save(records)
+        return True
+
+
+def mark_action_item_watch_triggered(content_hash: str, item_index: int, new_matches: list, all_seen_ids: list):
+    """Records that an action item's email watch found new mail --
+    new_matches is [{"from", "subject"}] (the newly-arrived ones only,
+    from apple_mail.search_messages) and all_seen_ids is the updated
+    full seen-id list (old baseline + these new ones), so the next poll
+    doesn't re-alert on the same messages. Leaves watch_query in place so
+    the dashboard/Notion/Obsidian still show what's being watched for."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return
+        items = (record.get("summary") or {}).get("action_items")
+        if not items or item_index < 0 or item_index >= len(items):
+            return
+        items[item_index]["watch_triggered"] = True
+        items[item_index]["watch_matches"] = new_matches
+        items[item_index]["watch_seen_ids"] = all_seen_ids
+        _save(records)
+
+
+def append_task_status_link(content_hash: str, link: dict):
+    """Adds one {"index", "task_page_id"} entry to task_status_links
+    without disturbing existing ones -- used when a single new action item
+    (not a full re-push) gets its own Task page, e.g. one added via
+    add_action_item() above."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return
+        links = record.get("task_status_links") or []
+        links.append(link)
+        record["task_status_links"] = links
+        _save(records)
+
+
+def set_task_status_links(content_hash: str, links: list):
+    """Records notion_sync.push_tasks()'s per-action-item {"index",
+    "task_page_id"} mapping (every action item, not just email ones -- see
+    task_email_links for that narrower subset) so the dashboard's
+    action-item checkbox (app.py's set_action_item_done route) can find
+    the matching Notion Task page and mirror its done state there via
+    notion_sync.set_task_done()."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return
+        record["task_status_links"] = links
+        _save(records)
+
+
+def get_task_page_id(content_hash: str, item_index: int):
+    """1-based item_index, matching notion_sync.push_tasks()'s own
+    enumerate(action_items, start=1). Returns None if this recording has
+    no Notion Tasks pushed yet, or the index is out of range."""
+    record = get_recording(content_hash)
+    if record is None:
+        return None
+    for link in record.get("task_status_links") or []:
+        if link.get("index") == item_index:
+            return link.get("task_page_id")
+    return None
+
+
 def merge_task_email_links(content_hash: str, links: list):
     """Like set_task_email_links(), but merges by "index" into whatever's
     already there instead of overwriting -- used when Notion and Obsidian
@@ -626,7 +905,22 @@ def get_undistributed(destination: str):
     field = f"{destination}_synced"
     with _lock:
         records = _load()
-    return [r for r in records if r["status"] == "done" and not r.get(field) and not r.get("merged_into")]
+    # kind=="command" (Jarvis voice commands) never has a "summary" --
+    # mark_jarvis_processed() writes jarvis_result instead, since a command
+    # skips the memo summarize()/Notion/Obsidian pipeline and gets pushed
+    # via its own dedicated notion_sync.push_command() call right where
+    # it's processed (see poller.py's kind=="command" branch). Live-
+    # confirmed bug: without this exclusion, a command with no configured
+    # Jarvis database (or one that arrived before that feature existed)
+    # fell through into this generic queue every single poll cycle and
+    # crashed on record["summary"] being None -- forever, since the
+    # exception was never caught as "distributed" and nothing here could
+    # ever satisfy it. That tight failing loop was also observed
+    # correlating with delayed syncing of *other*, unrelated recordings.
+    return [r for r in records
+            if r["status"] == "done" and not r.get(field)
+            and not r.get("merged_into") and not r.get("garbage")
+            and r.get("kind") != "command"]
 
 
 def mark_failed(content_hash: str, error: str):
@@ -721,13 +1015,40 @@ def delete_recording_from_device(content_hash: str) -> dict:
 def set_meeting(content_hash: str, meeting: dict):
     """Attaches calendar metadata ({title, start, end, attendees:[{name,
     email}]}) to a meeting recording -- set once by meeting_recorder.stop(),
-    read by the summarization prompt and Notion People email matching."""
+    read by the summarization prompt and Notion People email matching.
+
+    Also seeds official_transcript_check_until (meeting end + ~20 minutes,
+    a reasonable bound on Google's own transcript-processing delay) so
+    poller.check_official_meeting_transcripts_once() knows how long it's
+    worth polling for an official Google Meet transcript before giving up
+    -- see that function and google_client.get_meeting_transcript()."""
     with _lock:
         records = _load()
         record = _find(records, content_hash)
         if record is None:
             return
         record["meeting"] = meeting
+        end = (meeting or {}).get("end")
+        if end:
+            try:
+                end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                record["official_transcript_check_until"] = (end_dt + timedelta(minutes=20)).isoformat()
+            except (ValueError, TypeError):
+                pass
+        _save(records)
+
+
+def mark_official_transcript(content_hash: str, status: str):
+    """status: "applied" (an official Google Meet transcript was found and
+    the recording upgraded to use it) or "gave_up" (the check-until window
+    lapsed with nothing found) -- see
+    poller.check_official_meeting_transcripts_once()."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return
+        record["official_transcript_status"] = status
         _save(records)
 
 
@@ -797,10 +1118,69 @@ def get_recording(content_hash: str):
 
 
 def get_wav_path(content_hash: str):
+    """The stored audio file's real path, whatever format it's in.
+
+    Falls back to resolving by extension when the recorded path no longer
+    exists -- a recording stored as WAV before compression shipped, then
+    migrated to FLAC, has a stale path in its record until the migration
+    updates it, and a stale path must not read as "audio missing"."""
     with _lock:
         records = _load()
     record = _find(records, content_hash)
-    return record["wav_path"] if record else None
+    if not record:
+        return None
+    path = record.get("wav_path")
+    if path and os.path.isfile(path):
+        return path
+    import audio_store
+    return audio_store.resolve_path(os.path.join(AUDIO_DIR, content_hash))
+
+
+def compress_existing_audio(limit: int = 3) -> int:
+    """Compresses a few already-stored WAV recordings per call, updating
+    each record's wav_path. Returns how many were converted.
+
+    Rate-limited rather than done in one sweep: encoding a long recording
+    takes real CPU, and a library of them would otherwise stall startup or
+    spike the machine while the user is trying to use the app. A handful
+    per poll cycle drains any backlog within minutes, invisibly.
+
+    Safety lives in audio_store.compress_in_place, which verifies the
+    decoded audio matches before the original is removed."""
+    import audio_store
+    converted = 0
+    with _lock:
+        records = _load()
+        candidates = [r for r in records
+                      if (r.get("wav_path") or "").lower().endswith(audio_store.WAV_EXT)
+                      and os.path.isfile(r.get("wav_path") or "")][:limit]
+    for record in candidates:
+        old = record["wav_path"]
+        new = audio_store.compress_in_place(old)
+        if new == old:
+            continue
+        with _lock:
+            fresh = _load()
+            target = _find(fresh, record["content_hash"])
+            if target is not None:
+                target["wav_path"] = new
+                _save(fresh)
+        converted += 1
+    return converted
+
+
+def read_audio_bytes(content_hash: str) -> bytes:
+    """The recording as ordinary WAV bytes, decoding FLAC transparently.
+
+    Every consumer (voice-ID embeddings, transcription upload, duration
+    measurement) wants PCM WAV and shouldn't care how it's stored -- so
+    the storage format stays an implementation detail of this module
+    rather than something each caller has to branch on."""
+    path = get_wav_path(content_hash)
+    if not path or not os.path.isfile(path):
+        raise FileNotFoundError(f"no stored audio for {content_hash}")
+    import audio_store
+    return audio_store.decode_to_wav(path)
 
 
 def list_recordings():

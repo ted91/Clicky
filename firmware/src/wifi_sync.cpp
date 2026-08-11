@@ -18,6 +18,7 @@
 #include <Update.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 // ESP32-S3 shares one physical radio between WiFi and BLE (time-division
 // coexistence, see beginConnectAttempt()'s own comment on this same
@@ -85,6 +86,17 @@ static bool s_httpProvenReachable = false;
 static void noteHttpActivity() {
     s_lastHttpMs = millis();
     s_httpProvenReachable = true;
+    // Live-confirmed incident: the 10s BLE-presence-confirmed quick window
+    // (see wifi_sync_radio_on()) was staying in effect for the whole
+    // session, not just the initial "is anyone there" check -- so a normal
+    // pause between file transfers (Mac transcribing one recording before
+    // requesting the next) could exceed 10s and wifi_sync_tick() would cut
+    // the radio, aborting the sync partway through with recordings still
+    // left on the device. Any real HTTP hit proves an active sync partner
+    // beyond doubt, so widen back to the normal, generous window for the
+    // rest of this session -- the quick window's only job was avoiding a
+    // long wait for a BLE ping that never turns into anything.
+    s_activeInactivityMs = SYNC_INACTIVITY_MS;
 }
 
 bool wifi_sync_http_proven_reachable() {
@@ -170,6 +182,57 @@ static void handleList() {
     s_server.send(200, "application/json", json);
 }
 
+// Producer/consumer state for streamFileDoubleBuffered() -- single
+// in-flight transfer at a time (this device serves one HTTP client), so
+// plain statics are fine, no need for a struct passed through xTaskCreate.
+static int s_dbFd = -1;
+static uint8_t *s_dbBufs[2] = {nullptr, nullptr};
+static size_t s_dbBufLen = 0;
+static ssize_t s_dbLen[2] = {0, 0};
+static SemaphoreHandle_t s_dbReady[2] = {nullptr, nullptr}; // producer -> consumer: buffer[i] has data (or EOF, len<=0)
+static SemaphoreHandle_t s_dbFree[2] = {nullptr, nullptr};  // consumer -> producer: buffer[i] free to refill
+
+static void sdReaderTask(void *arg) {
+    int i = 0;
+    for (;;) {
+        xSemaphoreTake(s_dbFree[i], portMAX_DELAY);
+        s_dbLen[i] = read(s_dbFd, s_dbBufs[i], s_dbBufLen);
+        xSemaphoreGive(s_dbReady[i]);
+        if (s_dbLen[i] <= 0) break; // EOF or error -- consumer sees it via s_dbLen and stops too
+        i = 1 - i;
+    }
+    vTaskDelete(nullptr);
+}
+
+// Overlaps SD reads with TCP writes across both cores instead of the old
+// synchronous read-then-write loop (see handleGetFile's comment on why
+// that crawled on a large file). sdReaderTask runs on core 1 (idle during
+// a sync -- no recording happening then) filling one buffer while THIS
+// task, already running on core 0 via wifiTask, writes the other buffer
+// to the socket; they swap on each iteration.
+static void streamFileDoubleBuffered(int fd, uint8_t *bufA, uint8_t *bufB, size_t bufLen) {
+    s_dbFd = fd;
+    s_dbBufs[0] = bufA;
+    s_dbBufs[1] = bufB;
+    s_dbBufLen = bufLen;
+    for (int i = 0; i < 2; i++) {
+        if (!s_dbReady[i]) s_dbReady[i] = xSemaphoreCreateBinary();
+        if (!s_dbFree[i]) s_dbFree[i] = xSemaphoreCreateBinary();
+        xSemaphoreGive(s_dbFree[i]); // both buffers start empty/available to the producer
+    }
+
+    xTaskCreatePinnedToCore(sdReaderTask, "sdReader", 3 * 1024, nullptr, 2, nullptr, 1);
+
+    int i = 0;
+    for (;;) {
+        xSemaphoreTake(s_dbReady[i], portMAX_DELAY);
+        if (s_dbLen[i] <= 0) break;
+        s_server.client().write(s_dbBufs[i], s_dbLen[i]);
+        xSemaphoreGive(s_dbFree[i]);
+        i = 1 - i;
+    }
+}
+
 static bool sanitizedPath(char *out, size_t outLen) {
     if (!s_server.hasArg("name")) return false;
     String name = s_server.arg("name");
@@ -236,15 +299,22 @@ static void handleGetFile() {
     // is the standard fix for "small buffered writes crawl over WiFi".
     s_server.client().setNoDelay(true);
 
-    // 32KB PSRAM buffer per request -- now actually meaningful now that
-    // read() honors it, unlike fread() above. Falls back to a small
-    // static buffer if PSRAM is momentarily unavailable (still correct,
-    // just slower).
-    static uint8_t fallbackBuf[4096];
-    const size_t bigLen = 32 * 1024;
-    uint8_t *big = (uint8_t *)heap_caps_malloc(bigLen, MALLOC_CAP_SPIRAM);
-    uint8_t *buf = big ? big : fallbackBuf;
-    size_t bufLen = big ? bigLen : sizeof(fallbackBuf);
+    // Double-buffered producer/consumer, not a single synchronous
+    // read()-then-write() loop -- live-confirmed the old version crawled
+    // at a few hundred KB/s on a large file (79MB took several minutes),
+    // because SD read and TCP write never overlapped: every chunk paid
+    // the full SD latency AND the full socket-write latency back to back.
+    // A dedicated task (sdReaderTask below) fills one 32KB PSRAM buffer
+    // from SD while THIS task (running on core 0 via wifiTask, see
+    // main.cpp) writes the OTHER buffer to the socket -- genuine
+    // dual-core overlap, since core 1 is otherwise idle during a sync
+    // (no recording happening then). Falls back to the old single-buffer
+    // synchronous path if PSRAM for both buffers isn't available.
+    const size_t bufLen = 32 * 1024;
+    uint8_t *bufs[2] = {
+        (uint8_t *)heap_caps_malloc(bufLen, MALLOC_CAP_SPIRAM),
+        (uint8_t *)heap_caps_malloc(bufLen, MALLOC_CAP_SPIRAM),
+    };
 
     s_transferInProgress = true;
     pauseBleAdvertisingForTransfer();
@@ -253,15 +323,25 @@ static void handleGetFile() {
     // low power (see wifi_sync_tick's CONNECTED comment).
     WiFi.setSleep(false);
     power_mgr_set_profile(PowerProfile::HIGH_240, "wifi file streaming");
-    ssize_t n;
-    while ((n = read(fd, buf, bufLen)) > 0) {
-        s_server.client().write(buf, n);
+
+    if (bufs[0] && bufs[1]) {
+        streamFileDoubleBuffered(fd, bufs[0], bufs[1], bufLen);
+    } else {
+        // PSRAM momentarily unavailable -- fall back to the old
+        // synchronous single-buffer path (still correct, just slower).
+        static uint8_t fallbackBuf[4096];
+        ssize_t n;
+        while ((n = read(fd, fallbackBuf, sizeof(fallbackBuf))) > 0) {
+            s_server.client().write(fallbackBuf, n);
+        }
     }
+
     power_mgr_set_profile(PowerProfile::LOW_80, "wifi file streamed");
     WiFi.setSleep(true);
     resumeBleAdvertisingAfterTransfer();
     s_transferInProgress = false;
-    if (big) heap_caps_free(big);
+    if (bufs[0]) heap_caps_free(bufs[0]);
+    if (bufs[1]) heap_caps_free(bufs[1]);
     close(fd);
 }
 

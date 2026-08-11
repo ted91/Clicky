@@ -35,7 +35,7 @@ function checkbox(r) {
 function renderRecording(r) {
   const audio = `<audio controls preload="none" src="/audio/${escapeHtml(r.content_hash)}.wav"></audio>`;
   const downloadBtn = `<a class="download-audio-btn" href="/audio/${escapeHtml(r.content_hash)}.wav?download=1" download title="Download original recording">Download</a>`;
-  const left = `<div class="recording-left"><div class="recording-left-controls">${checkbox(r)}${deleteButton(r)}</div>${audio}${downloadBtn}</div>`;
+  const audioRow = `<div class="audio-row">${audio}${downloadBtn}</div>`;
 
   if (r.status !== "done") {
     const badge = r.status === "pending"
@@ -46,16 +46,13 @@ function renderRecording(r) {
       : `<p class="providers">Audio synced, waiting to be transcribed and summarized&hellip;</p>`;
     return `
       <div class="recording">
-        <div class="recording-row">
-          ${left}
-          <div class="recording-right">
-            <div class="recording-header">
-              <h3>${escapeHtml(r.name)} ${badge}</h3>
-            </div>
-            <div class="timestamp">${escapeHtml(r.created_at)}</div>
-            ${body}
-          </div>
+        <div class="recording-header">
+          <div class="recording-title">${checkbox(r)}<h3>${escapeHtml(r.name)} ${badge}</h3></div>
+          <div class="recording-actions">${deleteButton(r)}</div>
         </div>
+        <div class="timestamp">${escapeHtml(r.created_at)}</div>
+        ${audioRow}
+        ${body}
       </div>
     `;
   }
@@ -68,28 +65,33 @@ function renderRecording(r) {
     const jr = r.jarvis_result || {};
     return `
       <div class="recording">
-        <div class="recording-row">
-          ${left}
-          <div class="recording-right">
-            <div class="recording-header">
-              <h3>${escapeHtml(r.name)}</h3>
-            </div>
-            <div class="timestamp">${escapeHtml(r.created_at)}</div>
-            <div class="recording-columns">
-              <div class="summary-col">
-                <span class="badge sentiment-${jr.ok ? "positive" : "negative"}">🗣️ Jarvis — ${escapeHtml(jr.action_type || "unknown")}</span>
-                <p><strong>Heard:</strong> ${escapeHtml(jr.transcript || "")}</p>
-                ${jr.spoken ? `<p><strong>Replied:</strong> ${escapeHtml(jr.spoken)}</p>` : ""}
-              </div>
-            </div>
-          </div>
+        <div class="recording-header">
+          <div class="recording-title">${checkbox(r)}<h3>${escapeHtml(r.name)}</h3></div>
+          <div class="recording-actions">${deleteButton(r)}</div>
         </div>
+        <div class="timestamp">${escapeHtml(r.created_at)}</div>
+        ${audioRow}
+        <span class="badge sentiment-${jr.ok ? "positive" : "negative"}">🗣️ Jarvis — ${escapeHtml(jr.action_type || "unknown")}</span>
+        <p><strong>Heard:</strong> ${escapeHtml(jr.transcript || "")}</p>
+        ${jr.spoken ? `<p><strong>Replied:</strong> ${escapeHtml(jr.spoken)}</p>` : ""}
       </div>
     `;
   }
 
+  const watchBlock = (item, i) => {
+    let statusHtml;
+    if (item.watch_triggered) {
+      const first = (item.watch_matches && item.watch_matches[0]) || {};
+      statusHtml = `<div class="watch-alert">📧 New mail matching "${escapeHtml(item.watch_query)}"${first.subject ? ` &mdash; ${escapeHtml(first.subject)}` : ""}<a href="javascript:void(0)" class="watch-toggle" data-index="${i}">change</a></div>`;
+    } else if (item.watch_query) {
+      statusHtml = `<div class="watch-status">👁 watching for "${escapeHtml(item.watch_query)}" <a href="javascript:void(0)" class="watch-toggle" data-index="${i}">change</a></div>`;
+    } else {
+      statusHtml = `<a href="javascript:void(0)" class="watch-toggle" data-index="${i}">+ watch for email</a>`;
+    }
+    return `${statusHtml}<span class="watch-form"><input type="text" class="watch-input" placeholder="email or keyword to watch for" value="${escapeHtml(item.watch_query || "")}"><button type="button" class="watch-save">Save</button><button type="button" class="watch-clear">Clear</button></span>`;
+  };
   const actionItems = (r.summary.action_items || [])
-    .map(item => `<li>${escapeHtml(item.text)}${item.owner ? ` &mdash; <span class="owner">${escapeHtml(item.owner)}</span>` : ""}${item.due_date ? ` <span class="due">(due ${escapeHtml(item.due_date)})</span>` : ""}</li>`)
+    .map((item, i) => `<li class="${item.done ? "action-item-done" : ""}"><label class="action-item-check"><input type="checkbox" class="action-item-checkbox" data-index="${i}" ${item.done ? "checked" : ""}><span>${escapeHtml(item.text)}${item.owner ? ` &mdash; <span class="owner">${escapeHtml(item.owner)}</span>` : ""}${item.due_date ? ` <span class="due">(due ${escapeHtml(item.due_date)})</span>` : ""}</span></label>${watchBlock(item, i)}</li>`)
     .join("");
   const followUps = (r.summary.follow_ups || [])
     .map(fu => `<li>${escapeHtml(fu.text)}${fu.owner ? ` &mdash; <span class="owner">${escapeHtml(fu.owner)}</span>` : ""}</li>`)
@@ -103,7 +105,30 @@ function renderRecording(r) {
       <span class="contact-status"></span>
     </span>`;
   const stakeholders = (r.summary.stakeholders || [])
-    .map(s => `<li><span class="owner">${escapeHtml(s.name)}</span>${s.note ? ` &mdash; ${escapeHtml(s.note)}` : ""}${contactWidget(s.name)}</li>`)
+    .map((s, i) => `<li data-stakeholder-index="${i}"><span class="owner">${escapeHtml(s.name)}</span>${s.note ? ` &mdash; ${escapeHtml(s.note)}` : ""}${contactWidget(s.name)}
+      <a class="stakeholder-edit" href="javascript:void(0)">edit</a>
+      <span class="stakeholder-form" style="display:none;">
+        <input type="text" class="stakeholder-name" value="${escapeHtml(s.name)}" placeholder="name">
+        <button type="button" class="stakeholder-save">Save</button>
+        <button type="button" class="stakeholder-remove danger">Remove</button>
+        <span class="stakeholder-status"></span>
+      </span></li>`)
+    .join("");
+  // Mirrors providers.base.format_organization / ORGANIZATION_ROLE_LABELS --
+  // an unnamed org is shown, not hidden (see that function's docstring).
+  const ORG_ROLES = {
+    employer_of_speaker: "speaker's employer",
+    subject: "under discussion",
+    client: "client",
+    investor: "investor",
+    other: "mentioned",
+  };
+  const organizations = (r.summary.organizations || [])
+    .map(o => {
+      const name = (o.name || "").trim() || "(unnamed)";
+      const role = ORG_ROLES[o.role] || o.role || "";
+      return `<li><span class="owner">${escapeHtml(name)}</span>${role ? ` <span class="org-role">${escapeHtml(role)}</span>` : ""}${o.note ? ` &mdash; ${escapeHtml(o.note)}` : ""}</li>`;
+    })
     .join("");
   const calendarEvents = (r.summary.calendar_events || [])
     .map(ev => `<li>📅 ${escapeHtml(ev.title)}${ev.date ? ` &mdash; ${escapeHtml(ev.date)}` : ""}${ev.time ? ` ${escapeHtml(ev.time)}` : ""}</li>`)
@@ -118,7 +143,11 @@ function renderRecording(r) {
     ? `<div class="transcript" data-hash="${escapeHtml(r.content_hash)}">${mergedSegments.map(seg => {
         const isBackground = seg.loudness_class === "background";
         const tag = isBackground ? `<span class="background-tag" title="Classified as a quieter, more distant conversation -- excluded from the summary">background</span>` : "";
-        return `<p class="${isBackground ? "background-line" : ""}">${tag}<span class="speaker rename-speaker" data-speaker-id="${escapeHtml(seg.speaker_id)}" title="Click to rename">${escapeHtml(speakerNames[seg.speaker_id] || `Speaker ${seg.speaker_id}`)}:</span> ${escapeHtml(seg.text)}</p>`;
+        // The space after ${tag} is load-bearing: these are inline
+        // elements, so without it the tag and the speaker name run
+        // together when the transcript is copied out of the page
+        // ("backgroundBen Wiggins:" -- reported from a real paste).
+        return `<p class="${isBackground ? "background-line" : ""}">${tag}${tag ? " " : ""}<span class="speaker rename-speaker" data-speaker-id="${escapeHtml(seg.speaker_id)}" title="Click to rename">${escapeHtml(speakerNames[seg.speaker_id] || `Speaker ${seg.speaker_id}`)}:</span> ${escapeHtml(seg.text)}</p>`;
       }).join("")}</div>`
     : `<pre class="transcript">${escapeHtml(r.transcript)}</pre>`;
 
@@ -132,7 +161,9 @@ function renderRecording(r) {
   const suggestions = (r.summary && r.summary.speaker_name_suggestions) || {};
   const candidatesBySid = (r.summary && r.summary.speaker_name_candidates) || {};
   const speakersSection = speakerIds.length ? `
-      <div class="section-label">Speakers</div>
+      <div class="section-label">Speakers
+        <a class="fix-names" href="javascript:void(0)" title="Re-check the summary, action items, follow-ups and stakeholders against these confirmed names, and fix any misspelled or leftover references">fix names everywhere</a>
+      </div>
       <ul class="action-items speakers-list" data-hash="${escapeHtml(r.content_hash)}">
         ${speakerIds.map(sid => {
           const hasName = speakerNames[sid];
@@ -176,41 +207,52 @@ function renderRecording(r) {
         ${(r.meeting.attendees || []).map(a => `<span class="attendee-chip">${escapeHtml(a.name)}</span>`).join("")}
       </div>` : "";
 
+  // Each non-empty section becomes its own small "info card" in a
+  // responsive grid (see .info-grid/.info-card in index.html's <style>)
+  // instead of two fixed-height columns -- cards wrap to fill whatever
+  // width is available rather than leaving one side mostly empty.
+  const infoCards = [
+    actionItems ? `<div class="info-card"><div class="section-label">Action items</div><ul class="action-items" data-hash="${escapeHtml(r.content_hash)}">${actionItems}</ul></div>` : "",
+    followUps ? `<div class="info-card"><div class="section-label">Follow-ups</div><ul class="action-items">${followUps}</ul></div>` : "",
+    stakeholders ? `<div class="info-card"><div class="section-label">Stakeholders</div><ul class="action-items">${stakeholders}</ul></div>` : "",
+    organizations ? `<div class="info-card"><div class="section-label">Organizations</div><ul class="action-items">${organizations}</ul></div>` : "",
+    calendarEvents ? `<div class="info-card"><div class="section-label">Calendar events</div><ul class="action-items">${calendarEvents}</ul></div>` : "",
+    speakersSection ? `<div class="info-card">${speakersSection}</div>` : "",
+    renderDrafts(r) ? `<div class="info-card">${renderDrafts(r)}</div>` : "",
+  ].join("");
+
   return `
-    <div class="recording">
-      <div class="recording-row">
-        ${left}
-        <div class="recording-right">
-          <div class="recording-header">
-            <h3>${escapeHtml(r.name)}</h3>
-            ${(r.notion_url || r.obsidian_url) ? `<span class="quick-open-links">
-              ${r.notion_url ? `<a href="${escapeHtml(r.notion_url)}" target="_blank" rel="noopener" class="quick-open-link">Open in Notion</a>` : ""}
-              ${r.obsidian_url ? `<a href="${escapeHtml(r.obsidian_url)}" class="quick-open-link">Open in Obsidian</a>` : ""}
-            </span>` : ""}
-          </div>
-          <div class="timestamp">${escapeHtml(r.created_at)}</div>
-          <div class="recording-columns">
-            <div class="summary-col">
-              ${meetingHeader}
-              ${sentimentBadge}
-              ${topicsHtml}
-              <p>${escapeHtml(r.summary.summary)}</p>
-              ${r.summary.excluded_background_note ? `<p class="providers" style="font-style: italic;">${escapeHtml(r.summary.excluded_background_note)}</p>` : ""}
-              ${actionItems ? `<div class="section-label">Action items</div><ul class="action-items">${actionItems}</ul>` : ""}
-              ${followUps ? `<div class="section-label">Follow-ups</div><ul class="action-items">${followUps}</ul>` : ""}
-              ${stakeholders ? `<div class="section-label">Stakeholders</div><ul class="action-items">${stakeholders}</ul>` : ""}
-              ${calendarEvents ? `<div class="section-label">Calendar events</div><ul class="action-items">${calendarEvents}</ul>` : ""}
-            </div>
-            <div class="detail-col">
-              ${speakersSection}
-              ${renderDrafts(r)}
-              <details>
-                <summary>Full transcript</summary>
-                ${transcriptHtml}
-              </details>
-              <div class="providers">stt=${escapeHtml(r.stt_provider)} · llm=${escapeHtml(r.llm_provider)} ${destBadges}</div>
-            </div>
-          </div>
+    <div class="recording" data-hash="${escapeHtml(r.content_hash)}">
+      <div class="recording-header">
+        <div class="recording-title">${checkbox(r)}<h3>${escapeHtml(r.name)}</h3></div>
+        <div class="recording-actions">
+          ${r.notion_url ? `<a href="${escapeHtml(r.notion_url)}" target="_blank" rel="noopener" class="quick-open-link">Open in Notion</a>` : ""}
+          ${r.obsidian_url ? `<a href="${escapeHtml(r.obsidian_url)}" class="quick-open-link">Open in Obsidian</a>` : ""}
+          ${deleteButton(r)}
+        </div>
+      </div>
+      <div class="timestamp">${escapeHtml(r.created_at)}</div>
+      ${audioRow}
+      ${meetingHeader}
+      ${sentimentBadge}
+      ${topicsHtml}
+      <p class="summary-text">${escapeHtml(r.summary.summary)}${r.summary_edited ? ` <span class="edited-badge" title="You edited this summary; automatic passes leave it alone">edited</span>` : ""}
+        <a class="summary-edit" href="javascript:void(0)">edit</a></p>
+      <div class="summary-form" style="display:none;">
+        <textarea class="summary-input" rows="4">${escapeHtml(r.summary.summary)}</textarea>
+        <button type="button" class="summary-save">Save</button>
+        <button type="button" class="summary-cancel secondary">Cancel</button>
+        <span class="summary-status"></span>
+      </div>
+      ${r.summary.excluded_background_note ? `<p class="providers" style="font-style: italic;">${escapeHtml(r.summary.excluded_background_note)}</p>` : ""}
+      <div class="info-grid">
+        ${infoCards}
+        <div class="info-card transcript-card">
+          <details>
+            <summary>Full transcript</summary>
+            ${transcriptHtml}
+          </details>
+          <div class="providers">stt=${escapeHtml(r.stt_provider)} · llm=${escapeHtml(r.llm_provider)} ${destBadges}</div>
         </div>
       </div>
     </div>
@@ -257,16 +299,36 @@ function renderDrafts(r) {
 
 async function refresh() {
   try {
+    // The render below replaces #recordings' innerHTML wholesale, which
+    // would destroy whatever the user is part-way through typing. Any open
+    // edit form means "leave the DOM alone" -- the next poll (or the save
+    // handler's own forced refresh) picks it up once they're done.
+    if (document.querySelector(".summary-form[style*='block'], .stakeholder-form[style*='inline']")) return;
+
     const resp = await fetch("/api/recordings");
     if (!resp.ok) return;
     const recordings = await resp.json();
 
     // Re-render on any change to id/status/distribution, not just count --
     // a recording going pending -> done, or later getting pushed to
-    // Notion/Obsidian, doesn't change how many there are.
+    // Notion/Obsidian, doesn't change how many there are. Also include the
+    // summary text itself and speaker_names -- a rename triggers
+    // poller.resync_after_rename to rewrite summary.summary/stakeholders
+    // in place (see storage.update_summary) without touching status or
+    // any *_synced flag, so without this the corrected prose was saved
+    // server-side but the page would never re-render to show it.
     const signature = recordings.map(r => {
       const draftStatuses = (r.drafts && r.drafts.items || []).map(d => d.status).join("|");
-      return `${r.id}:${r.status}:${r.notion_synced}:${r.notion_tasks_synced}:${r.notion_people_synced}:${r.notion_events_synced}:${r.obsidian_synced}:${draftStatuses}`;
+      const summaryText = (r.summary && r.summary.summary) || "";
+      const speakerNamesSig = JSON.stringify(r.speaker_names || {});
+      const actionItemsSig = ((r.summary && r.summary.action_items) || [])
+        .map(it => `${it.done}:${it.watch_query || ""}:${it.watch_triggered}`).join("|");
+      // Stakeholders and organizations are both directly user-editable, so
+      // they need to be in the signature for the same reason summaryText
+      // is -- otherwise an edit saves server-side and never re-renders.
+      const stakeholdersSig = JSON.stringify((r.summary && r.summary.stakeholders) || []);
+      const orgsSig = JSON.stringify((r.summary && r.summary.organizations) || []);
+      return `${r.id}:${r.status}:${r.notion_synced}:${r.notion_tasks_synced}:${r.notion_people_synced}:${r.notion_events_synced}:${r.obsidian_synced}:${draftStatuses}:${summaryText}:${r.summary_edited}:${speakerNamesSig}:${actionItemsSig}:${stakeholdersSig}:${orgsSig}`;
     }).join(",");
     if (signature === lastSignature) return;
     lastSignature = signature;
@@ -481,10 +543,22 @@ async function commitSpeakerSlot(input) {
 
 document.getElementById("recordings").addEventListener("change", (e) => {
   const cb = e.target.closest(".recording-select");
-  if (!cb) return;
-  if (cb.checked) selectedHashes.add(cb.dataset.hash);
-  else selectedHashes.delete(cb.dataset.hash);
-  updateBulkBar();
+  if (cb) {
+    if (cb.checked) selectedHashes.add(cb.dataset.hash);
+    else selectedHashes.delete(cb.dataset.hash);
+    updateBulkBar();
+    return;
+  }
+  const itemCb = e.target.closest(".action-item-checkbox");
+  if (itemCb) {
+    const hash = itemCb.closest(".action-items")?.dataset.hash;
+    const li = itemCb.closest("li");
+    li.classList.toggle("action-item-done", itemCb.checked);
+    fetch(`/recordings/${encodeURIComponent(hash)}/action-item/${itemCb.dataset.index}`, {
+      method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"},
+      body: `done=${itemCb.checked}`,
+    }).catch(() => {});
+  }
 });
 
 document.getElementById("recordings").addEventListener("focusout", (e) => {
@@ -517,6 +591,141 @@ document.getElementById("recordings").addEventListener("click", async (e) => {
       input.value = candidateChip.dataset.name;
       input.focus();
     }
+    return;
+  }
+
+  const watchToggle = e.target.closest(".watch-toggle");
+  if (watchToggle) {
+    const form = watchToggle.closest("li").querySelector(".watch-form");
+    form.classList.toggle("active");
+    return;
+  }
+
+  const watchSaveBtn = e.target.closest(".watch-save");
+  if (watchSaveBtn) {
+    const li = watchSaveBtn.closest("li");
+    const hash = li.closest(".action-items").dataset.hash;
+    const index = li.querySelector(".watch-toggle")?.dataset.index ?? li.querySelector(".action-item-checkbox")?.dataset.index;
+    const query = li.querySelector(".watch-input").value.trim();
+    await fetch(`/recordings/${encodeURIComponent(hash)}/action-item/${index}/watch`, {
+      method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"},
+      body: `watch_query=${encodeURIComponent(query)}`,
+    }).catch(() => {});
+    lastSignature = "";
+    refresh();
+    return;
+  }
+
+  const watchClearBtn = e.target.closest(".watch-clear");
+  if (watchClearBtn) {
+    const li = watchClearBtn.closest("li");
+    const hash = li.closest(".action-items").dataset.hash;
+    const index = li.querySelector(".watch-toggle")?.dataset.index ?? li.querySelector(".action-item-checkbox")?.dataset.index;
+    await fetch(`/recordings/${encodeURIComponent(hash)}/action-item/${index}/watch`, {
+      method: "POST", headers: {"Content-Type": "application/x-www-form-urlencoded"},
+      body: `watch_query=`,
+    }).catch(() => {});
+    lastSignature = "";
+    refresh();
+    return;
+  }
+
+  const fixNames = e.target.closest(".fix-names");
+  if (fixNames) {
+    const hash = fixNames.closest(".recording").dataset.hash;
+    const original = fixNames.textContent;
+    fixNames.textContent = "fixing...";
+    fetch(`/recordings/${hash}/fix-names`, { method: "POST" })
+      .then(r => r.json())
+      .then(d => {
+        // The correction runs as a background task (an LLM call plus a
+        // Notion/Obsidian re-push), so there's nothing to show yet -- the
+        // 5s poll picks up the corrected text when it lands.
+        fixNames.textContent = d.ok ? "fixing in background..." : "failed";
+        setTimeout(() => { fixNames.textContent = original; }, 8000);
+      })
+      .catch(() => { fixNames.textContent = "failed"; });
+    return;
+  }
+
+  const summaryEdit = e.target.closest(".summary-edit");
+  if (summaryEdit) {
+    const p = summaryEdit.closest(".summary-text");
+    const form = p.nextElementSibling;
+    p.style.display = "none";
+    form.style.display = "block";
+    form.querySelector(".summary-input").focus();
+    return;
+  }
+
+  const summaryCancel = e.target.closest(".summary-cancel");
+  if (summaryCancel) {
+    const form = summaryCancel.closest(".summary-form");
+    form.style.display = "none";
+    form.previousElementSibling.style.display = "";
+    return;
+  }
+
+  const summarySave = e.target.closest(".summary-save");
+  if (summarySave) {
+    const form = summarySave.closest(".summary-form");
+    const hash = form.closest(".recording").dataset.hash;
+    const text = form.querySelector(".summary-input").value;
+    const statusEl = form.querySelector(".summary-status");
+    statusEl.textContent = "Saving...";
+    fetch(`/recordings/${hash}/summary`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `summary=${encodeURIComponent(text)}`,
+    })
+      .then(r => r.json())
+      .then(d => {
+        if (!d.ok) { statusEl.textContent = "Failed."; return; }
+        // Close the form BEFORE refreshing: refresh() deliberately bails
+        // out while any edit form is open (see its guard), so leaving it
+        // open here would suppress the very re-render we're asking for.
+        form.style.display = "none";
+        form.previousElementSibling.style.display = "";
+        lastSignature = "";  // force a re-render so the new text and "edited" badge appear
+        refresh();
+      })
+      .catch(() => { statusEl.textContent = "Failed."; });
+    return;
+  }
+
+  const stakeholderEdit = e.target.closest(".stakeholder-edit");
+  if (stakeholderEdit) {
+    const form = stakeholderEdit.nextElementSibling;
+    form.style.display = form.style.display === "none" ? "inline" : "none";
+    return;
+  }
+
+  const stakeholderSave = e.target.closest(".stakeholder-save");
+  const stakeholderRemove = e.target.closest(".stakeholder-remove");
+  if (stakeholderSave || stakeholderRemove) {
+    const btn = stakeholderSave || stakeholderRemove;
+    const li = btn.closest("li");
+    const hash = btn.closest(".recording").dataset.hash;
+    const index = li.dataset.stakeholderIndex;
+    // An empty name is how the backend expresses "remove this entry"
+    // (storage.set_stakeholder) -- so Remove is just a save of "".
+    const name = stakeholderRemove ? "" : li.querySelector(".stakeholder-name").value.trim();
+    const statusEl = li.querySelector(".stakeholder-status");
+    statusEl.textContent = "Saving...";
+    fetch(`/recordings/${hash}/stakeholder/${index}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `name=${encodeURIComponent(name)}`,
+    })
+      .then(r => r.json())
+      .then(d => {
+        if (!d.ok) { statusEl.textContent = "Failed."; return; }
+        // Close before refreshing -- refresh() bails while a form is open.
+        li.querySelector(".stakeholder-form").style.display = "none";
+        lastSignature = "";  // force a re-render so the edited list reappears
+        refresh();
+      })
+      .catch(() => { statusEl.textContent = "Failed."; });
     return;
   }
 
@@ -750,6 +959,24 @@ document.getElementById("bulk-clear-btn").addEventListener("click", () => {
   selectedHashes.clear();
   document.querySelectorAll(".recording-select").forEach(cb => cb.checked = false);
   updateBulkBar();
+});
+
+// "Select all" / "Delete all" -- reuse the existing bulk-select state and
+// bulkDelete() rather than a separate all-at-once endpoint, so the same
+// per-item confirm/failure handling applies.
+function selectAllRecordings() {
+  document.querySelectorAll(".recording-select").forEach(cb => {
+    cb.checked = true;
+    selectedHashes.add(cb.dataset.hash);
+  });
+  updateBulkBar();
+}
+const selectAllLink = document.getElementById("select-all-link");
+if (selectAllLink) selectAllLink.addEventListener("click", selectAllRecordings);
+const deleteAllLink = document.getElementById("delete-all-link");
+if (deleteAllLink) deleteAllLink.addEventListener("click", () => {
+  selectAllRecordings();
+  bulkDelete(false);
 });
 
 // --- "Confirm who this is" queue ---
