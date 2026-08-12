@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import json
 import os
 import re
 import urllib.parse
@@ -25,6 +26,7 @@ import substack_client
 import meeting_recorder
 import settings
 import status
+import card_agents
 import storage
 import poller
 from poller import poll_forever
@@ -113,6 +115,63 @@ templates.env.globals["social_enabled"] = _social_enabled
 # paint and the JS re-render agree.
 templates.env.globals["org_role_label"] = \
     lambda role: providers_base.ORGANIZATION_ROLE_LABELS.get(role, role or "")
+
+
+def _asset_fingerprint() -> str:
+    """Short hash of the static assets, appended to their URLs as ?v=.
+
+    Exists because of a real, twice-hit failure: the dashboard's HTML is
+    server-rendered fresh on every load, but /static/app.js is served by
+    StaticFiles with no Cache-Control, so browsers apply heuristic caching
+    and keep an old copy. The visible symptom is bizarre and hard to
+    attribute -- new server-rendered content appears on first paint, then
+    *vanishes* ~5s later when the stale app.js re-renders #recordings
+    without it -- and it looks exactly like a broken feature rather than a
+    caching artifact.
+
+    Fingerprinting file CONTENT rather than APP_VERSION on purpose: a
+    version constant only busts the cache if someone remembers to bump it,
+    and the whole point is that this can't be forgotten. Computed once at
+    import; the files can't change under a running packaged app."""
+    import hashlib
+    h = hashlib.sha256()
+    # Bare relative paths, matching the StaticFiles/Jinja2Templates mounts
+    # above -- main_packaged.py chdir()s to sys._MEIPASS before importing
+    # this module, so these resolve in both dev and packaged runs.
+    for name in ("static/app.js", "static/design.css"):
+        try:
+            with open(name, "rb") as f:
+                h.update(f.read())
+        except OSError:
+            # A missing asset shouldn't break page rendering -- fall back to
+            # the app version so the URL is still stable and valid.
+            h.update(config.APP_VERSION.encode())
+    return h.hexdigest()[:10]
+
+
+templates.env.globals["asset_v"] = _asset_fingerprint()
+# Same reasoning for the action-item agent's action types -- app.js has its
+# own copy of this mapping, and both must read from the one definition in
+# providers.base.AGENT_ACTION_LABELS.
+# Same reasoning for the action-item agent's action types -- app.js has its
+# own copy of this mapping, and both must read from the one definition in
+# providers.base.AGENT_ACTION_LABELS.
+templates.env.globals["agent_action_label"] = \
+    lambda action: providers_base.AGENT_ACTION_LABELS.get(action, action or "")
+# Card names come from the card_agents registry -- the one definition of
+# what cards exist. app.js keeps a mirrored copy of the labels (same
+# convention as AGENT_ACTION_LABELS), and both must agree with the ids the
+# add/remove routes accept.
+templates.env.globals["card_label"] = \
+    lambda card_id: card_agents.CARD_LABELS.get(card_id, card_id or "")
+# Visibility and the add menu are computed by the registry, not the
+# template, so the Jinja first paint and app.js's re-render can't diverge.
+templates.env.globals["visible_cards"] = card_agents.visible_cards
+templates.env.globals["addable_cards"] = card_agents.addable_cards
+templates.env.globals["empty_cards"] = card_agents.empty_cards
+# Handed to app.js via a <script type="application/json"> tag so the browser
+# reads the same registry rather than keeping its own copy of the card list.
+templates.env.globals["card_registry_json"] = json.dumps(card_agents.CARD_LABELS)
 
 
 def _gate(request: Request):
@@ -428,6 +487,61 @@ def set_action_item_done(request: Request, content_hash: str, item_index: int, d
     return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
 
 
+@app.post("/recordings/{content_hash}/cards/{card_id}")
+def set_recording_card(request: Request, content_hash: str, card_id: str, hidden: bool = Form(...)):
+    """Adds or removes one card on one recording. Adding a card backed by an
+    agent (Correspondence, Drafts) also queues that agent to fetch its
+    content -- see storage.set_card_hidden and
+    poller.refresh_requested_cards_once."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    ok = storage.set_card_hidden(content_hash, card_id, hidden)
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+
+@app.post("/recordings/{content_hash}/action-item/{item_index}/assign-agent")
+def assign_action_item_agent(request: Request, content_hash: str, item_index: int):
+    """Queues one agent-capable action item for the agent to work on. Only
+    marks it queued -- the poller picks it up and does the actual work (see
+    poller.run_assigned_agent_tasks_once), so this returns immediately
+    rather than holding the request open for an LLM call."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    ok, err = storage.assign_action_item_to_agent(content_hash, item_index)
+    if not ok:
+        code = 404 if err == "not_found" else 409
+        return JSONResponse({"error": err}, status_code=code)
+    return JSONResponse({"ok": True, "status": "queued"})
+
+
+@app.post("/recordings/{content_hash}/action-item/{item_index}/agent-approve")
+def approve_action_item_agent(request: Request, content_hash: str, item_index: int):
+    """Approves the agent's result, which is what actually commits it (Mail
+    draft / Notion task / filed note). All the real logic lives in
+    poller.approve_agent_result -- same thin-wrapper shape as the existing
+    draft approve route."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    result = poller.approve_agent_result(content_hash, item_index)
+    return JSONResponse(result["body"], status_code=result["status_code"])
+
+
+@app.post("/recordings/{content_hash}/action-item/{item_index}/agent-reject")
+def reject_action_item_agent(request: Request, content_hash: str, item_index: int):
+    """Discards the agent's result and returns the item to unassigned, so
+    it can be re-assigned (with better context) or just done by hand. The
+    result is deliberately left on the record rather than deleted -- seeing
+    what the agent produced is useful even when rejecting it."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    ok = storage.set_action_item_agent_status(content_hash, item_index, "rejected")
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+
 @app.post("/recordings/{content_hash}/action-item/{item_index}/watch")
 def set_action_item_watch(request: Request, content_hash: str, item_index: int, watch_query: str = Form("")):
     """Sets (or clears, if watch_query is blank) an email watch on one
@@ -435,19 +549,32 @@ def set_action_item_watch(request: Request, content_hash: str, item_index: int, 
     searches Mac Mail.app for it and alerts on new matches. Mirrored
     best-effort onto the matching Notion Task page and Obsidian Tasks note
     (macOS only -- apple_mail.py needs Mail.app, so this route is a no-op
-    watch on Windows builds beyond just persisting the query text)."""
+    watch on Windows builds beyond just persisting the query text).
+
+    Whatever ALREADY matches at setup time is surfaced immediately, not
+    just used to build a "these are old, ignore them" baseline -- "keep an
+    eye out for Ben's document" means the document Ben already sent counts
+    too, not only ones that arrive after the watch is created."""
     redirect = _gate(request)
     if redirect:
         return redirect
     watch_query = watch_query.strip()
     seen_ids = []
+    existing_matches = []
     if watch_query:
         try:
             import apple_mail
-            seen_ids = [m["id"] for m in apple_mail.search_messages(watch_query)]
+            existing_matches = apple_mail.search_messages(watch_query)
+            seen_ids = [m["id"] for m in existing_matches]
         except Exception as e:
             log.warning("baseline Mail.app search failed for watch %r (watch still set, will search fresh next poll): %s", watch_query, e)
     ok = storage.set_action_item_watch(content_hash, item_index, watch_query, seen_ids)
+    if ok and existing_matches:
+        # mark_action_item_watch_triggered both records these as real
+        # matches AND updates watch_seen_ids -- reuse it rather than a
+        # separate append path, so "found at setup time" and "found on a
+        # later poll" go through the exact same storage logic.
+        storage.mark_action_item_watch_triggered(content_hash, item_index, existing_matches, seen_ids)
     if ok:
         task_page_id = storage.get_task_page_id(content_hash, item_index + 1)
         if task_page_id:
@@ -464,6 +591,73 @@ def set_action_item_watch(request: Request, content_hash: str, item_index: int, 
                     obsidian_sync.set_task_watch(record, item_index, watch_query)
             except Exception as e:
                 log.warning("failed to mirror watch to Obsidian for %s: %s", content_hash, e)
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+
+@app.post("/recordings/{content_hash}/action-item/{item_index}/watch-match/{match_id}/delete")
+def delete_watch_match(request: Request, content_hash: str, item_index: int, match_id: str):
+    """Removes one matched-email card -- the user saying "that one's not
+    it" or clearing a stale/manual entry. Local-only: there's no Notion/
+    Obsidian mirror of individual matches (only the watch query itself is
+    mirrored there), so nothing else needs to be told."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    ok = storage.remove_watch_match(content_hash, item_index, match_id)
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+
+@app.post("/recordings/{content_hash}/action-item/{item_index}/watch-match")
+def add_watch_match(request: Request, content_hash: str, item_index: int,
+                    link: str = Form(...), subject: str = Form("")):
+    """Hand-adds a link to an action item's watch list -- for when the
+    user already found the email themselves, or the auto-search missed it
+    (a name spelled differently in the inbox than in the watch query,
+    mail filed to a different folder than the inbox this searches, etc).
+    Any URL is accepted, not just message:// -- a Gmail web link works
+    just as well if that's what the user has open."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    link = link.strip()
+    if not link:
+        return JSONResponse({"error": "link is required"}, status_code=400)
+    ok = storage.add_watch_match_manual(content_hash, item_index, link, subject)
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+
+@app.post("/recordings/{content_hash}/correspondence")
+def add_correspondence(request: Request, content_hash: str, link: str = Form(...), subject: str = Form("")):
+    """Hand-adds a correspondence link to a recording -- same escape hatch
+    as add_watch_match, one level up (recording, not one action item)."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    link = link.strip()
+    if not link:
+        return JSONResponse({"error": "link is required"}, status_code=400)
+    ok = storage.add_correspondence_match_manual(content_hash, link, subject)
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+
+@app.post("/recordings/{content_hash}/correspondence/{match_id}/delete")
+def delete_correspondence(request: Request, content_hash: str, match_id: str):
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    ok = storage.remove_correspondence_match(content_hash, match_id)
+    return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+
+@app.post("/recordings/{content_hash}/correspondence/toggle")
+def toggle_correspondence(request: Request, content_hash: str, enabled: bool = Form(...)):
+    """Turns automatic correspondence search on/off for one recording --
+    the opt-out for a private/sensitive conversation (see
+    poller.check_recording_correspondence_once)."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    ok = storage.set_correspondence_enabled(content_hash, enabled)
     return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
 
 

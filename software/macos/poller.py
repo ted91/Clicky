@@ -2261,14 +2261,18 @@ async def sync_speaker_edits_once():
             if not idx:
                 continue
             # A page pushed before the providers/base.py _denull fix can
-            # still have the literal placeholder text "unknown" sitting in
-            # its "Speaker N" property -- without this filter, every poll
-            # cycle re-imports that stale text as a "confirmed" name,
-            # permanently undoing any local cleanup (confirmed live: a
-            # manually-cleared "unknown" speaker_names entry kept coming
-            # back within one poll interval).
+            # still have LLM placeholder text sitting in its "Speaker N"
+            # property -- without this filter, every poll cycle re-imports
+            # that stale text as a "confirmed" name, permanently undoing
+            # any local cleanup or rename. Confirmed live TWICE with two
+            # different placeholder strings: first "unknown", then
+            # "unidentified" -- this list must stay in sync with
+            # providers.base._denull's own placeholder set, or a name
+            # typed on the dashboard (or in Notion itself) keeps getting
+            # silently reverted every ~30s forever.
             raw_notion_value = notion_slots.get(idx, "")
-            notion_value = raw_notion_value if raw_notion_value.strip().lower() not in ("unknown", "null", "none", "n/a") else ""
+            notion_value = raw_notion_value if raw_notion_value.strip().lower() not in \
+                ("unknown", "unidentified", "null", "none", "n/a") else ""
             local_value = current_names.get(speaker_id, "")
             if notion_value and notion_value != local_value:
                 storage.set_speaker_name(record["content_hash"], speaker_id, notion_value)
@@ -2862,6 +2866,15 @@ async def poll_once():
     await check_notion_action_item_triggers_once()
     await check_obsidian_action_item_triggers_once()
     await check_email_watches_once()
+    await check_recording_correspondence_once()
+    # Triage first, then run: an item can't be assigned until it's been
+    # classified agent-capable, so classifying before executing means a
+    # freshly-processed recording is actionable on the same cycle.
+    await triage_action_items_once()
+    await run_assigned_agent_tasks_once()
+    # User-initiated, so it runs after the periodic sweeps rather than
+    # waiting behind their throttles.
+    await refresh_requested_cards_once()
     await check_publication_approvals_once()
     await check_social_publish_once()
     await check_official_meeting_transcripts_once()
@@ -3138,6 +3151,422 @@ async def check_notion_action_item_triggers_once():
                 log.error("failed to create Task from Notion-added action item for %s: %s", record["name"], e)
 
 
+_CORRESPONDENCE_SWEEP_INTERVAL_SECONDS = 15 * 60
+_last_correspondence_sweep = 0.0
+
+# Relevance cutoff, expressed RELATIVE to the best-scoring email rather
+# than as a fixed number. Absolute cosine scores shift a lot with how long
+# and specific a recording's summary is, so a fixed threshold that filters
+# well for one conversation keeps everything (or nothing) for another --
+# measured live: one recording's ten emails spanned 0.20-0.60, where a
+# fixed 0.25 kept nine of them. Scoring relative to the best match asks the
+# right question instead: "is this email in the same league as the most
+# relevant one?"
+CORRESPONDENCE_RELEVANCE_RATIO = 0.65
+# Absolute floor so that when NOTHING is really relevant, near-zero matches
+# don't get kept just for being the best of a bad set.
+CORRESPONDENCE_RELEVANCE_FLOOR = 0.20
+# Hard cap on how many survive, so one busy thread can't refill the card.
+CORRESPONDENCE_MAX_KEPT = 6
+
+
+def _relevant_correspondence(messages: list, record: dict) -> list:
+    """Filters a person's emails down to the ones about THIS conversation.
+
+    Scores each email's subject+body against the recording's own summary
+    and topics using local embeddings (rag_index.rank_by_similarity) rather
+    than an LLM call: this runs over every message of every speaker on
+    every sweep, so a per-email LLM call would be both slow and expensive,
+    and semantic similarity is exactly the judgment being made here.
+
+    Fails OPEN in every degraded case -- index disabled, no summary to
+    compare against, embedding error, nothing scoring above the threshold.
+    Showing all of someone's email is the old, merely-noisy behaviour;
+    showing none of it looks like the feature is broken, which is what the
+    user actually reported before relevance filtering existed."""
+    if not messages:
+        return []
+
+    summary = (record.get("summary") or {})
+    topics = ((record.get("deepgram_insights") or {}).get("topics") or [])
+    query = " ".join(filter(None, [
+        summary.get("title") or "",
+        summary.get("summary") or "",
+        " ".join(topics),
+    ])).strip()
+    if not query:
+        return messages  # nothing to compare against -- don't hide anything
+
+    try:
+        import rag_index
+        if not rag_index.is_enabled():
+            return messages
+        candidates = [
+            f"{m.get('subject') or ''} {m.get('body') or ''}".strip() or (m.get("from") or "")
+            for m in messages
+        ]
+        scores = rag_index.rank_by_similarity(query, candidates)
+    except Exception as e:
+        log.warning("correspondence relevance scoring failed (showing all): %s", e)
+        return messages
+
+    scored = sorted(zip(messages, scores), key=lambda x: -x[1])
+    for m, s in scored:
+        m["relevance"] = round(s, 3)
+
+    best = scored[0][1]
+    cutoff = max(best * CORRESPONDENCE_RELEVANCE_RATIO, CORRESPONDENCE_RELEVANCE_FLOOR)
+    keep = [m for m, s in scored if s >= cutoff][:CORRESPONDENCE_MAX_KEPT]
+    if not keep:
+        # Nothing cleared even the floor. Show the single best rather than
+        # an empty card -- "no relevant email" and "the feature is broken"
+        # look identical to the user, and that confusion is exactly what
+        # was reported before any of this existed.
+        keep = [scored[0][0]]
+    log.info("correspondence relevance for %s: kept %d/%d (best %.2f, cutoff %.2f)",
+             record.get("name"), len(keep), len(messages), best, cutoff)
+    return keep
+
+
+async def refresh_requested_cards_once():
+    """Runs the agent behind a card the user just added.
+
+    Adding "Correspondence" to a recording that never had it should go and
+    search the mail, not present an empty panel and wait up to 15 minutes
+    for the throttled sweep to come round -- the user's add IS the request,
+    so it bypasses that throttle for this one recording. Same idea for
+    Drafts.
+
+    Each refresh is claimed via storage.take_card_refresh before any slow
+    work starts, so two overlapping poll passes can't run the same sweep
+    twice."""
+    for content_hash, card_ids in storage.records_with_card_refresh():
+        record = storage.get_recording(content_hash)
+        if not record:
+            continue
+        for card_id in card_ids:
+            if not storage.take_card_refresh(content_hash, card_id):
+                continue  # someone else claimed it
+            try:
+                # Registry dispatch, not an if/elif chain: a new card is one
+                # entry in card_agents.CARDS and needs no change here.
+                import card_agents
+                card = card_agents.CARDS.get(card_id)
+                if not (card and card.populate):
+                    continue  # display-only card, or one that no longer exists
+                await card.populate(record)
+                log.info("refreshed %r card for %s", card_id, record.get("name"))
+            except Exception as e:
+                log.warning("card refresh failed for %r on %s: %s", card_id, record.get("name"), e)
+
+
+async def _refresh_correspondence_for(record: dict):
+    """One recording's correspondence sweep, ignoring the global throttle.
+    Factored out of check_recording_correspondence_once so an explicit user
+    request and the periodic sweep share the same matching/relevance logic
+    rather than drifting apart."""
+    import sys
+    if sys.platform != "darwin":
+        return
+    try:
+        import apple_mail
+    except ImportError:
+        return
+
+    owner_name = (settings.get_all().get("owner_name") or "").strip().lower()
+    speaker_names = record.get("speaker_names") or {}
+    candidates = {
+        n.strip() for n in speaker_names.values()
+        if n and n.strip() and n.strip().lower() != owner_name
+        and not re.fullmatch(r"speaker[_ ]?\d+", n.strip(), re.I)
+    }
+    if not candidates:
+        log.info("correspondence card added to %s but it has no named speakers to search for",
+                 record.get("name"))
+        return
+
+    seen_ids = set(record.get("correspondence_seen_ids") or [])
+    new_matches, all_seen = [], set(seen_ids)
+    for name in candidates:
+        try:
+            results = await asyncio.to_thread(apple_mail.search_messages, name, 15, True, True)
+        except Exception as e:
+            log.warning("correspondence search failed for %r on %s: %s", name, record["name"], e)
+            continue
+        relevant_ids = {m["id"] for m in _relevant_correspondence(results, record)}
+        for m in results:
+            all_seen.add(m["id"])
+            if m["id"] in relevant_ids and m["id"] not in seen_ids:
+                new_matches.append(m)
+    added = storage.add_correspondence_matches(record["content_hash"], new_matches, list(all_seen))
+    log.info("correspondence card refresh for %s: %d new match(es)", record["name"], added)
+
+
+async def triage_action_items_once():
+    """Tags every action item as agent-capable or needs-the-human.
+
+    Runs automatically for any done recording whose action items haven't
+    been triaged yet -- one cheap LLM call per recording, never per item.
+    Idempotent by the "does any item lack an agent block" check, so it
+    costs nothing on subsequent passes; a re-summarize (which replaces
+    action_items wholesale, dropping the agent blocks with them) naturally
+    re-triggers it, which is correct."""
+    for record in storage.list_recordings():
+        if record.get("status") != "done" or record.get("merged_into"):
+            continue
+        items = (record.get("summary") or {}).get("action_items") or []
+        if not items:
+            continue
+        if all(isinstance(it.get("agent"), dict) and "capable" in it["agent"] for it in items):
+            continue
+
+        try:
+            from providers.base import build_action_triage_prompt, parse_action_triage
+            owner_name = (settings.get_all().get("owner_name") or "").strip()
+            prompt = build_action_triage_prompt(
+                items, (record.get("summary") or {}).get("summary") or "", owner_name)
+            _, complete = get_completer()
+            raw = await asyncio.to_thread(complete, prompt)
+            verdicts = parse_action_triage(raw, len(items))
+        except Exception as e:
+            log.warning("action-item triage failed for %s: %s", record["name"], e)
+            continue
+
+        if storage.set_action_item_triage(record["content_hash"], verdicts):
+            capable = sum(1 for v in verdicts if v.get("capable"))
+            log.info("triaged %d action item(s) for %s: %d agent-capable, %d need you",
+                     len(verdicts), record["name"], capable, len(verdicts) - capable)
+            try:
+                import analytics
+                analytics.track_event("action_items_triaged")
+            except Exception:
+                pass
+
+
+async def run_assigned_agent_tasks_once():
+    """Executes action items the user assigned to the agent.
+
+    One item per pass, deliberately: each run makes an LLM call and may do
+    a multi-second Mail.app sweep, and doing them one at a time keeps the
+    poll cycle responsive and makes a runaway obvious instead of firing a
+    dozen calls at once. The rest stay queued and are picked up on
+    following passes."""
+    queued = storage.get_queued_agent_items()
+    if not queued:
+        return
+    content_hash, item_index, item, record = queued[0]
+    log.info("agent starting: %r on %s (%d more queued)",
+             (item.get("text") or "")[:60], record.get("name"), len(queued) - 1)
+    # to_thread: agent_runner does blocking work (embeddings, AppleScript,
+    # the LLM call) that would otherwise stall every other poll task.
+    import agent_runner
+    result = await asyncio.to_thread(agent_runner.run_item, content_hash, item_index)
+    if result.get("error"):
+        log.warning("agent failed on %s item %d: %s", record.get("name"), item_index, result["error"])
+    else:
+        try:
+            import analytics
+            analytics.track_event("agent_task_completed")
+        except Exception:
+            pass
+
+
+def approve_agent_result(content_hash: str, item_index: int) -> dict:
+    """Commits an approved agent result -- the ONLY place an agent artifact
+    turns into a real side effect (a Mail.app draft, a Notion task, a
+    calendar event, a filed note). Everything before this point is private
+    and reversible.
+
+    Mirrors approve_and_send_draft's contract: returns
+    {"body": <json>, "status_code": int} so the route can pass both
+    straight through. A failure leaves the item in "awaiting_approval" with
+    the error attached, so it can be retried rather than being lost.
+
+    Note what "commit" means per action type -- an email becomes a DRAFT in
+    Mail.app, not a sent message. Approving the agent's work is not the
+    same as approving delivery to a third party, and the user gets the
+    normal mail client review before anything leaves the machine."""
+    record = storage.get_recording(content_hash)
+    if not record:
+        return {"body": {"error": "not_found"}, "status_code": 404}
+    items = (record.get("summary") or {}).get("action_items") or []
+    if item_index < 0 or item_index >= len(items):
+        return {"body": {"error": "not_found"}, "status_code": 404}
+    agent = items[item_index].get("agent") or {}
+    if agent.get("status") != "awaiting_approval":
+        return {"body": {"error": "not_awaiting_approval", "status": agent.get("status")},
+                "status_code": 409}
+
+    result = agent.get("result") or {}
+    action = result.get("action") or agent.get("action")
+    title = (result.get("title") or (items[item_index].get("text") or "Untitled"))[:200]
+    body = result.get("body") or ""
+    committed = None
+
+    try:
+        if action == "draft_email":
+            import jarvis
+            to_email = ""
+            recipient = result.get("recipient")
+            if recipient:
+                to_email = jarvis._lookup_email_for_name(recipient) or ""
+            err = jarvis._mail_create_draft(title, body, to_email)
+            if err:
+                raise RuntimeError(err)
+            committed = f"Mail.app draft created{f' to {to_email}' if to_email else ''}"
+
+        elif action in ("research", "draft_document"):
+            # Filed to whichever destination is configured; Obsidian first
+            # since it's local and always writable when set up.
+            written = []
+            vault = settings.get_all().get("obsidian_vault_path")
+            if vault:
+                import obsidian_sync
+                if obsidian_sync.write_agent_note(title, body, record):
+                    written.append("Obsidian")
+            if settings.get_all().get("notion_database_id"):
+                import notion_sync
+                if notion_sync.push_agent_note(title, body, record):
+                    written.append("Notion")
+            if not written:
+                raise RuntimeError("no destination configured (set up Obsidian or Notion first)")
+            committed = "Saved to " + " and ".join(written)
+
+        elif action == "schedule_or_task":
+            import notion_sync
+            page_id = notion_sync.push_agent_task(title, body, record)
+            if not page_id:
+                raise RuntimeError("could not create the task (is the Notion Tasks database set up?)")
+            committed = "Notion task created"
+
+        else:
+            raise RuntimeError(f"don't know how to commit action type {action!r}")
+
+    except Exception as e:
+        log.error("agent approval failed for %s item %d: %s", record.get("name"), item_index, e)
+        storage.set_action_item_agent_status(content_hash, item_index, "awaiting_approval",
+                                             error=str(e)[:300])
+        return {"body": {"error": str(e)[:300]}, "status_code": 500}
+
+    storage.set_action_item_agent_status(content_hash, item_index, "approved")
+    # Approving the agent's work means the action item itself is handled.
+    storage.set_action_item_done(content_hash, item_index, True)
+    log.info("agent result approved for %s item %d: %s", record.get("name"), item_index, committed)
+    try:
+        import analytics
+        analytics.track_event("agent_result_approved")
+    except Exception:
+        pass
+    return {"body": {"ok": True, "committed": committed}, "status_code": 200}
+
+
+async def check_recording_correspondence_once():
+    """For every done recording, automatically searches Mail.app for
+    correspondence with each identified speaker (excluding the device
+    owner) and surfaces matches as that recording's "Correspondence" list
+    -- no per-item watch setup required.
+
+    This is the automatic counterpart to the action-item email watch
+    (check_email_watches_once): "Ben said he'd forward a document" means
+    the user wants Ben's emails visible on this conversation, not that
+    they should have to manually type "Ben" into a watch box first. Same
+    macOS-only guard, same non-fatal-on-search-failure handling.
+
+    Deliberately name-only, not email-address matching -- there's no
+    reliable local cache of "this speaker's real email address" to search
+    by instead (that lives in Notion/Obsidian People records, which this
+    function doesn't query), and apple_mail.search_messages already
+    matches sender OR subject, so a name is normally enough to find real
+    correspondence. Skipped per-recording via correspondence_enabled
+    (default True) for anything the user doesn't want triggering a mail
+    search (a private journal entry, a sensitive topic)."""
+    import sys
+    if sys.platform != "darwin":
+        return
+    try:
+        import apple_mail
+    except ImportError:
+        return
+
+    owner_name = (settings.get_all().get("owner_name") or "").strip().lower()
+
+    # A full-store Mail.app sweep takes seconds per name (measured 4-23s),
+    # and the poll loop runs every few seconds -- without throttling this
+    # would keep Mail.app permanently busy for no benefit, since new mail
+    # from a past conversation's participants arrives on the order of
+    # hours, not seconds.
+    now = time.time()
+    global _last_correspondence_sweep
+    if now - _last_correspondence_sweep < _CORRESPONDENCE_SWEEP_INTERVAL_SECONDS:
+        return
+    _last_correspondence_sweep = now
+
+    for record in storage.list_recordings():
+        if record.get("status") != "done" or record.get("merged_into"):
+            continue
+        if not record.get("correspondence_enabled", True):
+            continue
+        speaker_names = record.get("speaker_names") or {}
+        # Skip the recording's owner and anything not a real confirmed name
+        # (a raw "speaker_2" label, or empty) -- searching Mail.app for
+        # the user's own name, or for a diarization id, finds nothing
+        # useful and just burns an AppleScript round-trip every cycle.
+        candidates = {
+            n.strip() for n in speaker_names.values()
+            if n and n.strip() and n.strip().lower() != owner_name
+            and not re.fullmatch(r"speaker[_ ]?\d+", n.strip(), re.I)
+        }
+        if not candidates:
+            continue
+
+        seen_ids = set(record.get("correspondence_seen_ids") or [])
+        existing_ids = {m.get("id") for m in (record.get("correspondence") or [])}
+        new_matches, all_seen = [], set(seen_ids)
+        for name in candidates:
+            try:
+                # fuzzy=True: the name came from a transcript, so its
+                # spelling is only approximately right (see
+                # apple_mail.search_messages).
+                results = await asyncio.to_thread(apple_mail.search_messages, name, 15, True, True)
+            except Exception as e:
+                # WARNING, not debug: a failed search and "this person has
+                # no email" are indistinguishable downstream (both end as
+                # an empty Correspondence card), so a silent failure here
+                # reads to the user as a wrong answer rather than a broken
+                # one -- which is exactly what happened with a Mail.app
+                # search that was quietly timing out.
+                log.warning("correspondence search failed for %r on %s: %s", name, record["name"], e)
+                continue
+            # Keep only the emails that actually discuss THIS conversation.
+            # Without this the card lists every email that person ever sent,
+            # which buries the two or three that carry the thread the
+            # recording is about.
+            relevant_ids = {m["id"] for m in _relevant_correspondence(results, record)}
+            for m in results:
+                # Mark EVERY hit seen, including the ones filtered out --
+                # they were considered and rejected, and re-judging them on
+                # every sweep would burn an embedding pass forever for a
+                # result that can't change.
+                all_seen.add(m["id"])
+                if m["id"] in relevant_ids and m["id"] not in seen_ids:
+                    new_matches.append(m)
+        if not new_matches:
+            if all_seen != seen_ids:
+                # Nothing NEW, but the seen-set grew (e.g. a message that
+                # matched on an earlier cycle for a different speaker name)
+                # -- persist it so it isn't re-considered "new" later.
+                with_seen = list(all_seen)
+                storage.add_correspondence_matches(record["content_hash"], [], with_seen)
+            continue
+
+        added = storage.add_correspondence_matches(record["content_hash"], new_matches, list(all_seen))
+        if added:
+            log.info("found %d new correspondence match(es) for %s (speakers: %s)",
+                     added, record["name"], ", ".join(sorted(candidates)))
+            import analytics
+            analytics.track_event("correspondence_found")
+
+
 async def check_email_watches_once():
     """Polls Mac Mail.app (apple_mail.search_messages) for every action
     item with an active email watch (item["watch_query"] set,
@@ -3172,7 +3601,15 @@ async def check_email_watches_once():
         items = (record.get("summary") or {}).get("action_items") or []
         for i, item in enumerate(items):
             query = item.get("watch_query")
-            if not query or item.get("watch_triggered"):
+            # Deliberately does NOT stop once watch_triggered -- a watch
+            # means "keep an eye out for Ben's document", not "tell me
+            # about the first matching email and then go quiet". Ben
+            # sending a follow-up or a resend with the actual attachment
+            # is exactly the kind of later arrival this should still catch.
+            # watch_seen_ids is what prevents re-alerting on the same
+            # message, so re-checking a triggered watch is safe -- it will
+            # only ever find genuinely NEW mail.
+            if not query:
                 continue
             try:
                 results = await asyncio.to_thread(apple_mail.search_messages, query)

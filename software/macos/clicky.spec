@@ -75,6 +75,18 @@ a = Analysis(
         # work" with nothing in the log pointing at packaging.
         'soundfile',
         'audio_store',
+        # agent_runner.py -- imported inside poller.run_assigned_agent_tasks_once
+        # rather than at module top level (it pulls in rag_index/torch, which
+        # shouldn't load on every poller import). Same silent-failure risk as
+        # audio_store above: without it, assigning an action item to the agent
+        # would fail with an ImportError only visible in the log.
+        'agent_runner',
+        # card_agents.py -- the card registry, imported lazily inside
+        # storage.set_card_hidden and poller.refresh_requested_cards_once
+        # (a top-level import would be a cycle). Same silent-failure
+        # risk as agent_runner above: without it, add/remove card would
+        # fail with an ImportError only visible in the log.
+        'card_agents',
         # voice_id.py's speaker-embedding model -- torch/speechbrain's own
         # dynamic import patterns are extensive; this list is a starting
         # point, not guaranteed complete -- expect to add entries after a

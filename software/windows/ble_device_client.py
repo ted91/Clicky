@@ -224,7 +224,31 @@ async def _ensure_connected():
 async def _list_recordings_async():
     await _ensure_connected()
     raw = await _client.read_gatt_char(LIST_CHAR_UUID)
-    return json.loads(raw.decode("utf-8"))
+
+    # An EMPTY read is transient, not a protocol error. The firmware's
+    # buildListJson() always returns at least "[]", so zero bytes means the
+    # device answered before it could build the list -- in practice a read
+    # landing during the boot that a wake triggers, before the SD card is
+    # mounted. Treating it as "nothing yet" lets the next poll (seconds
+    # later, once the device has settled) succeed.
+    #
+    # Previously this went straight into json.loads(""), which raised
+    # "Expecting value: line 1 column 1 (char 0)" and aborted the entire
+    # sync -- so a device that was connected and had recordings waiting
+    # reported only a confusing parse error, with the real cause (an empty
+    # read) invisible. Live-confirmed on a device that had just woken with
+    # two recordings pending.
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text:
+        log.warning("device returned an empty recording list (still booting?) -- will retry next poll")
+        return []
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Log what actually came back; a bare parse error tells us nothing
+        # about whether this was truncation, a partial read, or garbage.
+        log.error("device returned an unparseable recording list (%d bytes): %r", len(raw), text[:200])
+        raise
 
 
 async def _download_recording_async(name: str) -> bytes:

@@ -1417,15 +1417,43 @@ def find_duplicate_people(people_database_id: str) -> list:
 
 def merge_person_pages(keeper_id: str, loser_id: str):
     """Explicit, user-triggered merge (dashboard "Merge" button, see
-    find_duplicate_people) -- never automatic. Appends the loser's Note
-    content onto the keeper as a labeled block, re-points any Task/
-    Calendar "Related Person" relation from loser to keeper, then archives
-    the loser page. Notion's relation properties don't support a server-
-    side "find everything relating to X" query across databases directly,
-    so this re-points via each configured Tasks/Calendar database's own
-    query filtered on Related Person = loser_id."""
+    find_duplicate_people) -- never automatic. Unions the loser's Related
+    Note relations onto the keeper, appends the loser's Note content as a
+    labeled block, re-points any Task/Calendar "Related Person" relation
+    from loser to keeper, then archives the loser page. Notion's relation
+    properties don't support a server-side "find everything relating to X"
+    query across databases directly, so this re-points via each configured
+    Tasks/Calendar database's own query filtered on Related Person =
+    loser_id."""
     keeper = get_page(keeper_id)
     loser = get_page(loser_id)
+
+    # Related Note must be unioned onto the keeper BEFORE archiving, or
+    # every recording that only the duplicate was linked to silently loses
+    # its person link -- archiving the loser takes its side of the
+    # dual_property relation with it. This is the whole point of merging
+    # rather than deleting: a person's history is split across the two
+    # pages, and the merge exists to reunite it. Live-caught: a real
+    # duplicate pair where the newer page held a recording the older one
+    # didn't, which this function would previously have dropped.
+    keeper_notes = [r["id"] for r in keeper["properties"].get("Related Note", {}).get("relation", [])]
+    loser_notes = [r["id"] for r in loser["properties"].get("Related Note", {}).get("relation", [])]
+    missing = [n for n in loser_notes if n not in keeper_notes]
+    if missing:
+        resp = requests.patch(
+            f"{API_BASE}/pages/{keeper_id}", headers=_headers(),
+            json={"properties": {"Related Note": {
+                "relation": [{"id": pid} for pid in keeper_notes + missing]}}},
+            timeout=15,
+        )
+        if not resp.ok:
+            # Hard-fail rather than continuing to the archive step below --
+            # archiving after a failed union is exactly the data loss this
+            # block exists to prevent.
+            raise RuntimeError(
+                f"Failed to move {len(missing)} note link(s) to the keeper, refusing to archive "
+                f"the duplicate: {resp.status_code} {resp.text[:300]}")
+
     loser_note = "".join(
         t.get("plain_text", "") for t in loser["properties"].get("Note", {}).get("rich_text", [])
     ).strip()
@@ -1455,7 +1483,12 @@ def merge_person_pages(keeper_id: str, loser_id: str):
                 timeout=15,
             )
 
-    archive_resp = requests.patch(f"{API_BASE}/pages/{loser_id}", headers=_headers(), json={"archived": True}, timeout=15)
+    # "in_trash", not "archived": the API version this app pins
+    # (NOTION_VERSION) rejects the old `archived` field outright --
+    # "body.archived should be not present" -- so the legacy spelling made
+    # every merge fail at the final step, after the relations had already
+    # been moved.
+    archive_resp = requests.patch(f"{API_BASE}/pages/{loser_id}", headers=_headers(), json={"in_trash": True}, timeout=15)
     if not archive_resp.ok:
         raise RuntimeError(f"Merged relations but failed to archive duplicate page: {archive_resp.status_code} {archive_resp.text[:300]}")
 
@@ -1557,7 +1590,7 @@ def push_tasks(record: dict, note_page_id: str = None) -> list:
     Notion Task page and mirror its done state via set_task_done()."""
     action_items = (record.get("summary") or {}).get("action_items") or []
     if not action_items:
-        return []
+        return [], []
 
     database_id = settings.get_all().get("notion_tasks_database_id")
     if not database_id:
@@ -2334,4 +2367,77 @@ def push_journal(record: dict, note_page_id: str = None):
     except Exception as e:
         log.warning("rag_index indexing failed for Notion Journal page %s (non-fatal): %s", page_id, e)
 
+    return page_id
+
+
+def push_agent_note(title: str, body: str, record: dict) -> bool:
+    """Files an approved agent deliverable (research briefing / drafted
+    document -- see poller.approve_agent_result) as a Notes page, related
+    back to the recording it came from.
+
+    Goes in Notes rather than its own database on purpose: unlike a Jarvis
+    command, this IS a note about a conversation, and the user wants it
+    alongside the recording's own note where they'll look for it. Returns
+    False rather than raising when Notes isn't configured -- the caller
+    treats each destination as individually optional."""
+    database_id = settings.get_all().get("notion_database_id")
+    if not database_id:
+        return False
+    properties = {"Name": {"title": [{"type": "text", "text": {"content": title[:200]}}]}}
+    resp = requests.post(
+        f"{API_BASE}/pages", headers=_headers(),
+        json={"parent": {"database_id": database_id, "type": "database_id"}, "properties": properties},
+        timeout=15,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Notion API error {resp.status_code}: {resp.text[:300]}")
+    page_id = resp.json()["id"]
+
+    blocks = _text_block("paragraph", body)[:MAX_BLOCKS - 2]
+    blocks.append(_text_block(
+        "paragraph",
+        f"Produced by the agent from the recording {record.get('name', '')}, "
+        f"reviewed and approved by you.")[0])
+    append_blocks(page_id, blocks)
+    log.info("pushed agent note %r to Notion", title)
+    return True
+
+
+def push_agent_task(title: str, body: str, record: dict) -> str:
+    """Creates a Tasks page for an approved schedule_or_task result.
+
+    The agent's proposed date/attendees live in `body` as prose rather than
+    being parsed into a real Notion date property: the model returns them
+    as text, and silently mis-parsing "Tuesday the 14th" into a wrong Date
+    field is worse than showing the user the proposal verbatim and letting
+    them set the date. Returns the page id, or "" if Tasks isn't set up."""
+    database_id = settings.get_all().get("notion_tasks_database_id")
+    if not database_id:
+        return ""
+    properties = {"Name": {"title": [{"type": "text", "text": {"content": title[:200]}}]}}
+    note_page_id = record.get("notion_page_id")
+    if note_page_id:
+        properties["Related Note"] = {"relation": [{"id": note_page_id}]}
+    resp = requests.post(
+        f"{API_BASE}/pages", headers=_headers(),
+        json={"parent": {"database_id": database_id, "type": "database_id"}, "properties": properties},
+        timeout=15,
+    )
+    if not resp.ok:
+        # Related Note may not exist on an older workspace -- retry without
+        # it rather than losing the task over a relation property.
+        if "Related Note" in properties:
+            del properties["Related Note"]
+            resp = requests.post(
+                f"{API_BASE}/pages", headers=_headers(),
+                json={"parent": {"database_id": database_id, "type": "database_id"},
+                      "properties": properties},
+                timeout=15,
+            )
+        if not resp.ok:
+            raise RuntimeError(f"Notion API error {resp.status_code}: {resp.text[:300]}")
+    page_id = resp.json()["id"]
+    if body:
+        append_blocks(page_id, _text_block("paragraph", body)[:MAX_BLOCKS - 1])
+    log.info("pushed agent task %r to Notion", title)
     return page_id

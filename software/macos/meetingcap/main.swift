@@ -751,6 +751,40 @@ func isRealMeetCallURL(_ urlString: String) -> Bool {
     return parts.count == 3 && parts.allSatisfy { $0.count >= 3 && $0.allSatisfy { $0.isLetter } }
 }
 
+/// True for a Zoom or Teams call running IN THE BROWSER rather than the
+/// native app.
+///
+/// Without this, joining a Zoom from Chrome was simply never detected: the
+/// native-app check only matches `us.zoom.xos`/`com.microsoft.teams*`
+/// bundle ids, and the browser check only accepted Google Meet URLs, so a
+/// browser Zoom call fell between the two. Increasingly common in practice
+/// -- guest/one-off links open in the browser by default, and corporate
+/// machines often have no native client installed at all.
+///
+/// Deliberately matches the IN-CALL paths only, not the marketing or
+/// account pages: `zoom.us/j/<id>` (join link), `app.zoom.us/wc/` (web
+/// client), and Teams' `/l/meetup-join/` or `/_#/pre-join-calling/` paths.
+/// Matching a bare `zoom.us` host would fire on someone merely reading
+/// zoom.us/pricing with the mic live for an unrelated reason.
+func isBrowserConferencingCallURL(_ urlString: String) -> Bool {
+    let url = urlString.lowercased()
+    // Zoom web client / join links.
+    if url.contains("zoom.us/wc/") || url.contains("zoom.us/j/") || url.contains("zoom.us/s/") {
+        return true
+    }
+    // Teams web client -- both the join-link form and the in-call route.
+    if url.contains("teams.microsoft.com/") || url.contains("teams.live.com/") {
+        return url.contains("/l/meetup-join/") || url.contains("/pre-join-calling/")
+            || url.contains("/meetup-join/") || url.contains("/calling/")
+    }
+    return false
+}
+
+/// Any browser URL that means "a call is happening in this tab".
+func isBrowserCallURL(_ urlString: String) -> Bool {
+    return isRealMeetCallURL(urlString) || isBrowserConferencingCallURL(urlString)
+}
+
 /// Asks a Chromium/Safari-family browser (via AppleScript -- requires
 /// Automation permission, see clicky.spec's NSAppleEventsUsageDescription)
 /// for every open tab's URL, across all windows. Returns [] on any
@@ -861,7 +895,10 @@ func detectAdhocMeeting() -> (app: String, meetingURL: String?)? {
     for bundleId in micActiveBundleIds {
         guard let browserName = ADHOC_BROWSER_BUNDLE_IDS[bundleId] else { continue }
         let tabURLs = openTabURLs(browserAppName: browserName)
-        if let meetURL = tabURLs.first(where: isRealMeetCallURL) {
+        // Meet, Zoom-in-browser and Teams-in-browser all count -- see
+        // isBrowserCallURL. The mic-active requirement still applies, so a
+        // merely-open call tab with no audio doesn't trigger anything.
+        if let meetURL = tabURLs.first(where: isBrowserCallURL) {
             return (browserName, meetURL)
         }
     }

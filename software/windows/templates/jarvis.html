@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <title>Jarvis — Clicky Notes</title>
-  <link rel="stylesheet" href="/static/design.css">
+  <link rel="stylesheet" href="/static/design.css?v={{ asset_v }}">
   <style>
     body { display: flex; min-height: 100vh; }
     .page-content { flex: 1; padding: 1.75rem 2rem; overflow-y: auto; }
@@ -58,9 +58,9 @@
     <details class="more">
       <summary>How it works</summary>
       <p>
-        Q&amp;A uses the LLM provider under Settings &rarr; Connectors. Calendar/reminder/email requests need
-        Obsidian connected -- Jarvis writes a structured note to your vault's "Jarvis" folder instead of
-        automating Outlook. Coding requests ("build this feature in...") go through the
+        Q&amp;A uses the LLM provider under Settings &rarr; Connectors. Calendar/reminder/email requests use local
+        Mac automation (first use prompts for Automation permission). Coding requests
+        ("build this feature in...") go through the
         <a href="https://docs.claude.com/en/docs/claude-code" target="_blank">Claude Code CLI</a>, scoped to the
         repo path above. Every command is logged to Obsidian if connected.
       </p>

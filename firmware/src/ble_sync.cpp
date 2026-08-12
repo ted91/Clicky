@@ -395,7 +395,11 @@ static const uint16_t SLOW_ADV_MIN = 0x0640, SLOW_ADV_MAX = 0x0780; // ~1.0-1.2s
 // day), and this window only needs to be long enough to open the app and
 // hit Connect once.
 static uint32_t s_bootMs = 0;
-static const uint32_t POST_BOOT_DISCOVERY_MS = 2 * 60 * 1000; // 2 min
+// 5 minutes, or until a central actually connects -- whichever is first.
+// The "until it connects" half needs no timer: ble_sync_reconcile_advertising()
+// bails out while s_centralConnected, so a successful connection ends the
+// window immediately and nothing keeps advertising behind it.
+static const uint32_t POST_BOOT_DISCOVERY_MS = 5 * 60 * 1000; // 5 min
 
 static void applyAdvertisingInterval(uint16_t minInterval, uint16_t maxInterval) {
     NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
@@ -435,10 +439,45 @@ static void applyAdvertisingInterval(uint16_t minInterval, uint16_t maxInterval)
 // IP over BLE and test reachability -- if the network turns out to be
 // isolated, BLE just keeps advertising indefinitely, correctly, since it's
 // the only transport that actually works there.
+// wifi_sync_has_pending_recordings() opens and walks the SD card
+// directory, and resumeIdleAdvertising() is re-evaluated on indicatorTask's
+// 1s tick -- so calling it directly would mean a filesystem scan every
+// second, on the same card recordTask is streaming audio to. The answer
+// only changes when a recording is saved or the Mac deletes a synced one,
+// neither of which needs sub-10s freshness to decide whether to advertise.
+static const uint32_t PENDING_CACHE_MS = 10000;
+
+static bool cachedHasPendingRecordings() {
+    static uint32_t s_checkedAtMs = 0;
+    static bool s_cached = false;
+    uint32_t now = millis();
+    if (s_checkedAtMs == 0 || now - s_checkedAtMs >= PENDING_CACHE_MS) {
+        s_cached = wifi_sync_has_pending_recordings();
+        s_checkedAtMs = now;
+    }
+    return s_cached;
+}
+
 static void resumeIdleAdvertising() {
     if (s_pairingActive) return; // pairing's own fast-adv window owns this
     bool withinPostBootWindow = s_bootMs != 0 && (millis() - s_bootMs) < POST_BOOT_DISCOVERY_MS;
-    if (s_paired && (!wifi_sync_is_connected() || !wifi_sync_http_proven_reachable() || withinPostBootWindow)) {
+
+    // BLE is a presence SIGNAL here, not a data bearer: it exists to tell a
+    // nearby laptop "I have something for you", and onConnect() then brings
+    // WiFi up to actually move the bytes (see the gated
+    // wifi_sync_radio_on() call there). So there is no reason to advertise
+    // when there is nothing to hand over -- an idle device with an empty SD
+    // card just burns battery announcing itself to nobody.
+    //
+    // The post-boot window is deliberately exempt from that gate. It's the
+    // only way a NEW laptop can ever discover this device (pairing is a
+    // sticky NVS flag with no user-reachable reset), and that has to work
+    // even when there's nothing pending -- otherwise a freshly-set-up
+    // machine could never find a device that happens to be caught up.
+    bool haveSomethingToSync = cachedHasPendingRecordings();
+    bool wifiAlreadyCarryingIt = wifi_sync_is_connected() && wifi_sync_http_proven_reachable();
+
+    if (s_paired && (withinPostBootWindow || (haveSomethingToSync && !wifiAlreadyCarryingIt))) {
         applyAdvertisingInterval(SLOW_ADV_MIN, SLOW_ADV_MAX);
         NimBLEDevice::startAdvertising();
     } else {

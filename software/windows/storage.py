@@ -16,6 +16,8 @@ import json
 import logging
 import os
 import threading
+import time
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import config
@@ -113,6 +115,12 @@ def _load():
         r.setdefault("obsidian_journal_note_path", None)
         r.setdefault("obsidian_publications_synced", False)
         r.setdefault("obsidian_publication_note_path", None)
+        r.setdefault("correspondence", [])           # [{"id","from","subject","link","manual"}], same shape as an action item's watch_matches
+        r.setdefault("correspondence_seen_ids", [])   # Mail.app message ids already surfaced, so a poll doesn't re-add the same email
+        r.setdefault("correspondence_enabled", True)  # per-recording opt-out (poller.check_recording_correspondence_once)
+        r.setdefault("cards_hidden", [])   # card ids the user removed from this recording (see CARD_LABELS)
+        r.setdefault("cards_added", [])   # card ids the user explicitly added (render even when empty)
+        r.setdefault("card_refresh", [])   # card ids queued for their agent to (re)fetch content
     return records
 
 
@@ -433,6 +441,267 @@ def set_action_item_done(content_hash: str, item_index: int, done: bool) -> bool
         items[item_index]["done"] = done
         _save(records)
         return True
+
+
+# --- Per-recording cards ---------------------------------------------------
+# Not every conversation wants every card: a quick solo memo has no
+# stakeholders worth a panel, and a private journal entry shouldn't be
+# reaching into the user's email at all.
+#
+# The card set itself, and which cards have an agent behind them, live in
+# card_agents.py -- imported lazily below, since card_agents imports this
+# module back. Two lists per recording:
+#
+#   cards_hidden  cards the user removed. Always wins.
+#   cards_added   cards the user explicitly added, which must render even
+#                 while empty -- otherwise clicking "add" on a card with no
+#                 content yet looks like it did nothing.
+#
+# Both default to empty, so every record that predates this feature (and
+# any card added to the app later) behaves normally with no migration.
+
+
+def hidden_cards(record: dict) -> list:
+    return record.get("cards_hidden") or []
+
+
+def set_card_hidden(content_hash: str, card_id: str, hidden: bool) -> bool:
+    """Shows or hides one card on one recording. Adding a card that has an
+    agent behind it also queues that agent (see records_with_card_refresh)
+    so the user gets content rather than an empty panel."""
+    import card_agents  # lazy: card_agents imports this module
+
+    if card_id not in card_agents.CARDS:
+        return False
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return False
+        hidden_set = set(record.get("cards_hidden") or [])
+        added_set = set(record.get("cards_added") or [])
+        if hidden:
+            hidden_set.add(card_id)
+            # Drop the explicit-add marker too, so re-adding later starts
+            # clean and re-runs the agent rather than showing a stale panel.
+            added_set.discard(card_id)
+        else:
+            hidden_set.discard(card_id)
+            added_set.add(card_id)
+            if card_agents.has_agent(card_id):
+                queue = record.setdefault("card_refresh", [])
+                if card_id not in queue:
+                    queue.append(card_id)
+        record["cards_hidden"] = sorted(hidden_set)
+        record["cards_added"] = sorted(added_set)
+        _save(records)
+        return True
+
+
+def merge_summary_list(content_hash: str, field: str, new_items: list) -> int:
+    """Appends extracted items into one summary list, skipping duplicates.
+
+    Merge rather than replace: a card agent runs against a recording the
+    user may already have edited (renamed a speaker, corrected a
+    stakeholder, ticked an action item), and re-running an extraction must
+    never silently throw that away. Returns how many were actually added.
+
+    Dedup is on the entry's identifying text, case-insensitively -- the
+    same item phrased identically shouldn't appear twice after a re-run,
+    which is the obvious way this gets annoying."""
+    if not new_items:
+        return 0
+
+    def key(entry):
+        return ((entry.get("text") or entry.get("name") or "").strip().lower())
+
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None or not record.get("summary"):
+            return 0
+        existing = record["summary"].setdefault(field, [])
+        seen = {key(e) for e in existing if isinstance(e, dict)}
+        added = 0
+        for item in new_items:
+            k = key(item)
+            if not k or k in seen:
+                continue
+            existing.append(item)
+            seen.add(k)
+            added += 1
+        if added:
+            _save(records)
+    return added
+
+
+def take_card_refresh(content_hash: str, card_id: str) -> bool:
+    """Claims a queued card refresh, returning False if it wasn't queued.
+    Claim-and-clear in one locked step so a slow refresh can't be started
+    twice by overlapping poll passes."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return False
+        queue = record.get("card_refresh") or []
+        if card_id not in queue:
+            return False
+        record["card_refresh"] = [c for c in queue if c != card_id]
+        _save(records)
+        return True
+
+
+def records_with_card_refresh() -> list:
+    """[(content_hash, [card_id, ...])] for everything with queued work."""
+    with _lock:
+        records = _load()
+    return [(r["content_hash"], list(r.get("card_refresh") or []))
+            for r in records if r.get("card_refresh")]
+
+
+# --- Action-item agent -----------------------------------------------------
+# Each action item can carry an item["agent"] block:
+#   {"capable": bool,          # triage verdict (providers/base.parse_action_triage)
+#    "action": str | None,     # one of providers/base.AGENT_ACTIONS
+#    "reason": str,            # why capable / what the human must supply
+#    "status": str,            # see AGENT_STATUSES below
+#    "result": dict | None,    # the produced artifact (title/body/gaps/...)
+#    "error": str | None,
+#    "assigned_at" / "completed_at": ISO strings}
+# Triage writes capable/action/reason automatically; everything else only
+# moves when the user explicitly assigns, approves or rejects.
+AGENT_STATUSES = ("unassigned", "queued", "running", "awaiting_approval",
+                  "approved", "rejected", "failed")
+
+
+def _agent_item(record, item_index):
+    """Shared lookup for the agent setters below. Returns the item dict or
+    None -- callers hold _lock."""
+    items = (record.get("summary") or {}).get("action_items")
+    if not items or item_index < 0 or item_index >= len(items):
+        return None
+    return items[item_index]
+
+
+def set_action_item_triage(content_hash: str, triage: list) -> bool:
+    """Writes the whole recording's triage verdicts in one pass (see
+    poller.triage_action_items_once). `triage` is index-aligned to
+    summary.action_items, exactly as parse_action_triage returns it.
+
+    Deliberately does NOT touch status/result: triage re-runs (e.g. after a
+    re-summarize) must never reset an item the user already assigned or
+    approved. Only the classification fields are overwritten."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return False
+        items = (record.get("summary") or {}).get("action_items") or []
+        if len(triage) != len(items):
+            # Length mismatch means the summary changed under us (a
+            # re-summarize between triage and write). Dropping the stale
+            # verdicts is correct -- applying them by position would
+            # attach each verdict to the wrong item.
+            log.warning("triage length %d != action items %d for %s, discarding",
+                        len(triage), len(items), content_hash)
+            return False
+        for item, verdict in zip(items, triage):
+            agent = item.setdefault("agent", {})
+            agent["capable"] = verdict.get("capable", False)
+            agent["action"] = verdict.get("action")
+            agent["reason"] = verdict.get("reason", "")
+            agent.setdefault("status", "unassigned")
+            agent.setdefault("result", None)
+            agent.setdefault("error", None)
+        _save(records)
+        return True
+
+
+def assign_action_item_to_agent(content_hash: str, item_index: int) -> tuple:
+    """User pressed "Assign to agent". Moves the item to "queued" so the
+    poller picks it up on its next pass. Returns (ok, error) -- refuses if
+    the item isn't agent-capable, or if a run is already in flight, so a
+    double-click can't queue the same work twice."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return False, "not_found"
+        item = _agent_item(record, item_index)
+        if item is None:
+            return False, "not_found"
+        agent = item.setdefault("agent", {})
+        if not agent.get("capable"):
+            return False, "not_agent_capable"
+        if agent.get("status") in ("queued", "running"):
+            return False, "already_running"
+        agent["status"] = "queued"
+        agent["error"] = None
+        agent["assigned_at"] = datetime.now(timezone.utc).isoformat()
+        _save(records)
+        return True, None
+
+
+def set_action_item_agent_status(content_hash: str, item_index: int, status: str,
+                                 error: str = None) -> bool:
+    """Status-only transition (queued -> running -> failed, or the
+    approve/reject terminals)."""
+    if status not in AGENT_STATUSES:
+        return False
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return False
+        item = _agent_item(record, item_index)
+        if item is None:
+            return False
+        agent = item.setdefault("agent", {})
+        agent["status"] = status
+        if error is not None:
+            agent["error"] = error
+        if status in ("approved", "rejected", "failed"):
+            agent["completed_at"] = datetime.now(timezone.utc).isoformat()
+        _save(records)
+        return True
+
+
+def set_action_item_agent_result(content_hash: str, item_index: int, result: dict) -> bool:
+    """Stores the produced artifact and parks the item at
+    "awaiting_approval". This is the furthest the agent gets on its own --
+    nothing is emailed, filed or booked until the user approves (see
+    poller.approve_agent_result)."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return False
+        item = _agent_item(record, item_index)
+        if item is None:
+            return False
+        agent = item.setdefault("agent", {})
+        agent["result"] = result
+        agent["status"] = "awaiting_approval"
+        agent["error"] = None
+        agent["completed_at"] = datetime.now(timezone.utc).isoformat()
+        _save(records)
+        return True
+
+
+def get_queued_agent_items() -> list:
+    """Every action item sitting in "queued", as
+    [(content_hash, item_index, item, record)] -- the poller's work list."""
+    out = []
+    with _lock:
+        records = _load()
+    for record in records:
+        if record.get("merged_into"):
+            continue
+        for i, item in enumerate((record.get("summary") or {}).get("action_items") or []):
+            if (item.get("agent") or {}).get("status") == "queued":
+                out.append((record["content_hash"], i, item, record))
+    return out
 
 
 def apply_speaker_name_guesses(content_hash: str, guesses: dict):
@@ -805,11 +1074,21 @@ def set_action_item_watch(content_hash: str, item_index: int, watch_query: str, 
 
 def mark_action_item_watch_triggered(content_hash: str, item_index: int, new_matches: list, all_seen_ids: list):
     """Records that an action item's email watch found new mail --
-    new_matches is [{"from", "subject"}] (the newly-arrived ones only,
-    from apple_mail.search_messages) and all_seen_ids is the updated
-    full seen-id list (old baseline + these new ones), so the next poll
-    doesn't re-alert on the same messages. Leaves watch_query in place so
-    the dashboard/Notion/Obsidian still show what's being watched for."""
+    new_matches is [{"from", "subject", "message_id", "link"}] (the
+    newly-arrived ones only, from apple_mail.search_messages) and
+    all_seen_ids is the updated full seen-id list (old baseline + these
+    new ones), so the next poll doesn't re-alert on the same messages.
+
+    APPENDS to watch_matches rather than replacing it -- a watch is
+    "Ben's document", not "the first email that happened to match", and
+    the person may send it across several messages (a follow-up, a
+    resend with the actual attachment). watch_triggered is left purely
+    informational (drives the "found" styling); the poller keeps
+    searching for further NEW mail after the first hit rather than
+    stopping, since arrivals after the first are exactly what the ongoing
+    "keep an eye out" request asked for. Each entry gets a stable "id" (a
+    UUID, not Mail.app's internal message id) so a specific card can be
+    deleted without disturbing the others -- see remove_watch_match."""
     with _lock:
         records = _load()
         record = _find(records, content_hash)
@@ -818,10 +1097,170 @@ def mark_action_item_watch_triggered(content_hash: str, item_index: int, new_mat
         items = (record.get("summary") or {}).get("action_items")
         if not items or item_index < 0 or item_index >= len(items):
             return
-        items[item_index]["watch_triggered"] = True
-        items[item_index]["watch_matches"] = new_matches
-        items[item_index]["watch_seen_ids"] = all_seen_ids
+        item = items[item_index]
+        item["watch_triggered"] = True
+        existing = item.get("watch_matches") or []
+        for m in new_matches:
+            existing.append({
+                "id": str(uuid.uuid4()),
+                "from": m.get("from"),
+                "subject": m.get("subject"),
+                "link": m.get("link"),
+                "manual": False,
+            })
+        item["watch_matches"] = existing
+        item["watch_seen_ids"] = all_seen_ids
         _save(records)
+
+
+def _sort_correspondence(matches: list) -> list:
+    """Newest first, by "timestamp" (Unix epoch, set at add-time -- see
+    add_correspondence_matches/add_correspondence_match_manual). A missing
+    timestamp (an entry saved before this field existed) sorts last, not
+    first -- an unknown date is not evidence of being recent."""
+    return sorted(matches, key=lambda m: m.get("timestamp") if m.get("timestamp") is not None else -1, reverse=True)
+
+
+def add_correspondence_matches(content_hash: str, new_matches: list, all_seen_ids: list) -> int:
+    """Record-level counterpart of mark_action_item_watch_triggered --
+    appends automatically-discovered correspondence with this recording's
+    speakers (see poller.check_recording_correspondence_once), rather than
+    requiring the user to set up a watch on a specific action item first.
+    Returns how many were actually added."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return 0
+        existing = record.setdefault("correspondence", [])
+        for m in new_matches:
+            existing.append({
+                "id": str(uuid.uuid4()),
+                "from": m.get("from"),
+                "subject": m.get("subject"),
+                "link": m.get("link"),
+                "timestamp": m.get("timestamp"),
+                # Why this email is on the card (poller._relevant_correspondence).
+                # Kept so the UI can say "these carry the relevant thread"
+                # rather than the user having to take that on trust.
+                "relevance": m.get("relevance"),
+                "manual": False,
+            })
+        # Re-sort every call, not just when new_matches is non-empty --
+        # this is also what upgrades an already-stored, pre-sort-feature
+        # list (saved back when matches had no "timestamp" at all) into
+        # sorted order the next time this recording's sweep runs.
+        record["correspondence"] = _sort_correspondence(existing)
+        record["correspondence_seen_ids"] = all_seen_ids
+        _save(records)
+    return len(new_matches)
+
+
+def remove_correspondence_match(content_hash: str, match_id: str) -> bool:
+    """Deletes one correspondence card -- same reasoning as
+    remove_watch_match: doesn't touch correspondence_seen_ids, so a
+    deleted card's message can't silently reappear on the next poll."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return False
+        matches = record.get("correspondence") or []
+        remaining = [m for m in matches if m.get("id") != match_id]
+        if len(remaining) == len(matches):
+            return False
+        record["correspondence"] = remaining
+        _save(records)
+    return True
+
+
+def add_correspondence_match_manual(content_hash: str, link: str, subject: str = None) -> bool:
+    """Hand-adds a correspondence link -- record-level counterpart of
+    add_watch_match_manual. Timestamped "now": a manually-added link has no
+    real email date to go by, and "just added by the user" is a reasonable
+    stand-in that puts it at the top of the newest-first list rather than
+    unpredictably at the bottom."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return False
+        matches = record.setdefault("correspondence", [])
+        matches.append({
+            "id": str(uuid.uuid4()),
+            "from": None,
+            "subject": (subject or "").strip() or None,
+            "link": (link or "").strip() or None,
+            "timestamp": time.time(),
+            "manual": True,
+        })
+        record["correspondence"] = _sort_correspondence(matches)
+        _save(records)
+    return True
+
+
+def set_correspondence_enabled(content_hash: str, enabled: bool) -> bool:
+    """Per-recording opt-out of automatic correspondence search -- not
+    every conversation should trigger a Mail.app search for its
+    participants (a journal entry about a friend, a sensitive topic)."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return False
+        record["correspondence_enabled"] = bool(enabled)
+        _save(records)
+    return True
+
+
+def remove_watch_match(content_hash: str, item_index: int, match_id: str) -> bool:
+    """Deletes one matched-email card from an action item's watch list --
+    the user confirming "no, that one's not it" or clearing a stale entry.
+    Does not touch watch_seen_ids, so a deleted card's message won't
+    silently reappear on the next poll (it's still a known/seen id, just
+    no longer shown)."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return False
+        items = (record.get("summary") or {}).get("action_items")
+        if not items or item_index < 0 or item_index >= len(items):
+            return False
+        matches = items[item_index].get("watch_matches") or []
+        remaining = [m for m in matches if m.get("id") != match_id]
+        if len(remaining) == len(matches):
+            return False
+        items[item_index]["watch_matches"] = remaining
+        _save(records)
+    return True
+
+
+def add_watch_match_manual(content_hash: str, item_index: int, link: str, subject: str = None) -> bool:
+    """Adds a hand-entered link to an action item's watch list -- the
+    "I already found it myself, or the auto-search missed it" escape
+    hatch. Marked manual=True so the dashboard can distinguish it from an
+    auto-discovered match (e.g. no "from" sender to show)."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return False
+        items = (record.get("summary") or {}).get("action_items")
+        if not items or item_index < 0 or item_index >= len(items):
+            return False
+        item = items[item_index]
+        matches = item.setdefault("watch_matches", [])
+        matches.append({
+            "id": str(uuid.uuid4()),
+            "from": None,
+            "subject": (subject or "").strip() or None,
+            "link": (link or "").strip() or None,
+            "manual": True,
+        })
+        item["watch_triggered"] = True
+        _save(records)
+    return True
 
 
 def append_task_status_link(content_hash: str, link: dict):

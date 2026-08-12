@@ -1105,3 +1105,38 @@ def reset_generate_social_trigger(note_path: str):
     """Unchecks "generate_social_media" after generation runs -- same
     momentary "do it now" contract as notion_sync.reset_generate_social_trigger."""
     _update_frontmatter(note_path, generate_social_media=False)
+
+
+def write_agent_note(title: str, body: str, record: dict) -> bool:
+    """Files an approved agent deliverable (a research briefing or a
+    drafted document -- see poller.approve_agent_result) into Agent/.
+
+    Its own folder for the same reason Jarvis/ has one: this isn't a
+    recording, it's something the agent produced *about* a recording, and
+    mixing it into Notes/ would make the vault's recording list stop
+    meaning "things I recorded". Links back to the source recording's note
+    so the provenance is one click away. Returns False rather than raising
+    if the vault isn't configured -- the caller treats destinations as
+    individually optional."""
+    try:
+        dir_path = _vault_subfolder("Agent")
+    except RuntimeError:
+        return False
+    created_at = record.get("created_at") or ""
+    filename = f"{created_at[:10]} {_slugify(title)}.md"
+    frontmatter = {
+        "created": created_at,
+        "type": "agent-output",
+        "approved": True,
+        "source_recording": record.get("name", ""),
+    }
+    source_link = f"[[{_note_title(record)}]]"
+    full_body = "\n".join([
+        f"# {title}", "",
+        body, "",
+        "---", "",
+        f"Produced by the agent from {source_link}, reviewed and approved by you.",
+    ])
+    _write_note(dir_path, filename, frontmatter, full_body)
+    log.info("wrote agent note %r to Obsidian", title)
+    return True

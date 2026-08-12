@@ -804,7 +804,7 @@ def _denull(value):
     data with `if value:` checks and can't tell a hallucinated "unknown"
     from an actual name."""
     if isinstance(value, str):
-        return None if value.strip().lower() in ("null", "none", "n/a", "unknown", "") else value
+        return None if value.strip().lower() in ("null", "none", "n/a", "unknown", "unidentified", "") else value
     if isinstance(value, dict):
         cleaned = {k: _denull(v) for k, v in value.items()}
         return {k: v for k, v in cleaned.items() if v is not None}
@@ -883,3 +883,336 @@ def parse_social_post_json(raw_text: str) -> dict:
         }
     except (json.JSONDecodeError, AttributeError):
         return {"long_form_title": "", "long_form_body": "", "linkedin_teaser": "", "claims_to_verify": []}
+
+
+# --- Action-item agent: triage + execution -------------------------------
+# Two-stage, deliberately separate LLM calls:
+#   1. TRIAGE (build_action_triage_prompt) -- for every action item on a
+#      recording, decide whether an agent with this app's data and tools
+#      could genuinely do it, or whether it needs the user personally.
+#      One cheap call per recording, run automatically (see
+#      poller.triage_action_items_once).
+#   2. EXECUTION (build_agent_execution_prompt) -- only for items the user
+#      explicitly assigns to the agent, and only then. Gets a much larger
+#      context payload (see agent_runner.gather_context) because this is
+#      the call actually doing the work.
+# Splitting them matters: triage runs on everything and must stay cheap,
+# execution runs rarely and should get every scrap of context available.
+
+# What the agent can actually carry out end-to-end, given this app's real
+# integrations. Deliberately a CLOSED set -- the triage model picks from
+# these, so it can't invent a capability the executor has no handler for
+# (the failure mode where an item gets marked "agent can do this" and then
+# silently no-ops).
+AGENT_ACTIONS = ("research", "draft_email", "draft_document", "schedule_or_task")
+
+AGENT_ACTION_LABELS = {
+    "research": "Research & answer",
+    "draft_email": "Draft an email",
+    "draft_document": "Draft a document",
+    "schedule_or_task": "Schedule / create task",
+}
+
+
+def build_action_triage_prompt(action_items: list, summary_text: str, owner_name: str = "") -> str:
+    """Classifies each action item as agent-doable or needs-the-human.
+
+    The honest split is NOT "hard vs easy" -- it's "can this be completed
+    with information and tools the agent actually has". The agent can read
+    every past recording, note and email in this workspace, and can produce
+    text (an email, a document, an answer) or a calendar/task entry. It
+    cannot make a decision only the user has standing to make, cannot
+    attend anything, cannot talk to a person, cannot access systems this
+    app isn't connected to, and cannot supply facts that exist only in the
+    user's head. Items of that second kind must come back needs_human even
+    when they look trivially phrased -- a wrong "agent can do this" wastes
+    a run and erodes trust in the whole split, which is worse than being
+    conservative."""
+    numbered = "\n".join(
+        f'{i}. {(it.get("text") or "").strip()}'
+        + (f' [owner: {it.get("owner")}]' if it.get("owner") else "")
+        + (f' [due: {it.get("due_date")}]' if it.get("due_date") else "")
+        for i, it in enumerate(action_items)
+    )
+    owner_line = (
+        f'The user (device owner) is "{owner_name}". An item owned by them is theirs to '
+        f"do; an item owned by someone else is generally not something to act on at all.\n\n"
+        if owner_name else ""
+    )
+    return (
+        "You are triaging action items from a conversation, deciding which an AI agent "
+        "could genuinely complete and which need the human personally.\n\n"
+        + owner_line +
+        "The agent's REAL capabilities:\n"
+        "- Search and read every past recording, transcript, note and synced document in "
+        "this workspace, plus the user's email history.\n"
+        "- Write text: an email, a document, a summary, a briefing, an answer.\n"
+        "- Propose a calendar event or a task entry.\n\n"
+        "The agent CANNOT: attend or run a meeting, phone or speak to anyone, negotiate, "
+        "make a decision that is the user's to make, access any system not listed above, "
+        "physically do anything, or invent facts that only exist in the user's head.\n\n"
+        "For EACH item return:\n"
+        '- "index": the item number as given\n'
+        '- "agent_capable": true only if the agent could produce a genuinely useful, '
+        "complete result with the capabilities above; false otherwise\n"
+        '- "action": if agent_capable, exactly one of "research" (find and synthesize an '
+        'answer from existing material), "draft_email" (compose an email to someone), '
+        '"draft_document" (write a document/note deliverable), "schedule_or_task" '
+        '(propose a calendar event or task). If not agent_capable, use null.\n'
+        '- "reason": one short sentence. If needs-human, say specifically WHAT the human '
+        "has to supply or decide -- that sentence is shown to the user, so \"needs your "
+        "input\" alone is useless; name the missing thing.\n\n"
+        "Be conservative: if completing the item depends on knowledge, authority or "
+        "presence the agent lacks, it is NOT agent_capable, however simple it sounds.\n\n"
+        f"Conversation summary for context:\n\"\"\"\n{summary_text}\n\"\"\"\n\n"
+        f"Action items:\n{numbered}\n\n"
+        'Respond with ONLY a JSON object: {"items": [{"index": 0, "agent_capable": true, '
+        '"action": "research", "reason": "..."}]}. No prose, no code fences.'
+    )
+
+
+def parse_action_triage(raw_text: str, expected_count: int) -> list:
+    """Returns a list of per-item dicts aligned to action_items by index.
+
+    Anything the model gets wrong -- a missing item, an out-of-range index,
+    an action outside AGENT_ACTIONS, agent_capable set with no action --
+    degrades to needs-human rather than propagating a bad capability claim
+    into the executor. Same reasoning as the prompt's "be conservative":
+    the expensive failure is confidently offering to do something the
+    agent then can't do."""
+    import json
+
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
+
+    out = [{"capable": False, "action": None, "reason": ""} for _ in range(expected_count)]
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, AttributeError):
+        return out
+
+    for entry in (data.get("items") or []):
+        if not isinstance(entry, dict):
+            continue
+        try:
+            idx = int(entry.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= idx < expected_count:
+            continue
+        action = entry.get("action")
+        capable = bool(entry.get("agent_capable")) and action in AGENT_ACTIONS
+        out[idx] = {
+            "capable": capable,
+            "action": action if capable else None,
+            "reason": (entry.get("reason") or "").strip()[:300],
+        }
+    return out
+
+
+def build_agent_execution_prompt(item: dict, action: str, context: str, owner_name: str = "") -> str:
+    """The agent's actual working prompt, run only on explicit assignment.
+
+    `context` is the assembled evidence payload (see agent_runner.
+    gather_context): the originating conversation, semantically-related
+    past recordings/notes, remembered facts, and any prior email with the
+    people involved. The single most important instruction here is the
+    grounding rule -- this output is going to be turned into a real email
+    or document on approval, so a fabricated detail becomes a real
+    mistake sent to a real person. Anything the agent needed but couldn't
+    find must surface in "gaps" instead of being invented."""
+    text = (item.get("text") or "").strip()
+    owner = item.get("owner") or owner_name or "the user"
+    due = f" It is due {item['due_date']}." if item.get("due_date") else ""
+
+    shape = {
+        "research": (
+            'Produce a briefing that ANSWERS the item. "title": a short label. '
+            '"body": the answer itself, in markdown -- lead with the conclusion, then '
+            "the supporting detail, then anything still open. Cite which recording or "
+            "note each substantive claim came from, inline."
+        ),
+        "draft_email": (
+            'Compose the email. "title": the subject line. "recipient": the person\'s '
+            'name as best you can tell, or null. "body": the full email body, ready to '
+            "send -- greeting through sign-off, in the user's voice as evidenced by "
+            "their prior emails in the context. No placeholders like [NAME]: if you "
+            "genuinely don't know something, leave it out and list it under \"gaps\"."
+        ),
+        "draft_document": (
+            'Write the document. "title": its title. "body": the full document in '
+            "markdown, structured with headings. It should stand on its own to a reader "
+            "who was not in the conversation."
+        ),
+        "schedule_or_task": (
+            'Propose the entry. "title": the event or task title. "body": a short '
+            'description plus, explicitly, your proposed date/time and attendees. Use '
+            "concrete dates (YYYY-MM-DD) resolved from the context, never relative "
+            'phrasing like "next week".'
+        ),
+    }[action]
+
+    return (
+        f"You are completing one action item on behalf of {owner}.\n\n"
+        f'ACTION ITEM: "{text}"{due}\n'
+        f"TASK TYPE: {action}\n\n"
+        "GROUNDING RULES -- these matter more than completeness:\n"
+        "- Use ONLY what the context below supports. Never invent a name, date, number, "
+        "commitment, or fact.\n"
+        "- Your output may be sent to a real person or filed as a real document once "
+        "approved, so an invented detail becomes a real error, not a draft artifact.\n"
+        '- Anything you needed but could not find goes in "gaps" -- do not paper over it.\n'
+        '- If the context is too thin to produce anything useful, say so plainly in '
+        '"body" and put the reason in "gaps" rather than padding.\n\n'
+        f"WHAT TO PRODUCE:\n{shape}\n\n"
+        f"CONTEXT:\n\"\"\"\n{context}\n\"\"\"\n\n"
+        'Respond with ONLY a JSON object: {"title": "...", "body": "...", '
+        '"recipient": "... or null", "gaps": ["..."], "confidence": "high"|"medium"|"low"}. '
+        "No prose outside the JSON, no code fences."
+    )
+
+
+def parse_agent_result(raw_text: str) -> dict:
+    """Parses the executor's JSON. On a parse failure the raw text is kept
+    as the body (rather than discarded) and confidence forced to "low" --
+    the user reviews everything before it takes effect anyway, so showing
+    a malformed-but-real answer beats showing nothing."""
+    import json
+
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
+
+    try:
+        data = json.loads(text)
+        confidence = (data.get("confidence") or "").strip().lower()
+        return {
+            "title": (data.get("title") or "").strip(),
+            "body": (data.get("body") or "").strip(),
+            "recipient": _denull(data.get("recipient")),
+            "gaps": [g for g in (data.get("gaps") or []) if isinstance(g, str) and g.strip()],
+            "confidence": confidence if confidence in ("high", "medium", "low") else "medium",
+        }
+    except (json.JSONDecodeError, AttributeError):
+        return {"title": "", "body": raw_text.strip(), "recipient": None,
+                "gaps": ["The model's response could not be parsed as structured output."],
+                "confidence": "low"}
+
+
+# --- Per-card targeted extraction -----------------------------------------
+# Backs the "add a card and its agent fills it" flow (see card_agents.py).
+# One focused pass over the transcript for ONE field, rather than re-running
+# the whole summarizer: re-summarizing would overwrite the user's own edits
+# (summary_edited), cost far more, and churn every other field just to
+# populate one card.
+#
+# The shapes below are copied verbatim from SUMMARY_JSON_INSTRUCTIONS above
+# -- deliberately, not abbreviated. The dashboard already knows how to draw
+# these exact structures, so an extraction that returns anything else would
+# render blank or crash the renderer.
+CARD_EXTRACTION_SPECS = {
+    "action_items": {
+        "key": "action_items",
+        "shape": '[{"text": "...", "owner": "name or null", "due_date": "YYYY-MM-DD or null", '
+                 '"comm_type": "email" or null, "comm_recipient": "name or null", '
+                 '"email_subject": "... or null", "email_body": "... or null"}]',
+        "what": "concrete things somebody committed to DO -- each with a real, "
+                "identifiable action. Not observations, not topics discussed.",
+    },
+    "follow_ups": {
+        "key": "follow_ups",
+        "shape": '[{"text": "an open question or pending decision, not yet a concrete action item", '
+                 '"owner": "name or null"}]',
+        "what": "open questions and undecided points -- things left hanging, NOT "
+                "things someone already committed to doing (those are action items).",
+    },
+    "stakeholders": {
+        "key": "stakeholders",
+        "shape": '[{"name": "...", "note": "their role or why they matter here, or null"}]',
+        "what": "people who matter to this conversation -- participants and people "
+                "discussed. Include someone only if the transcript says who they are "
+                "or why they come up.",
+    },
+    "organizations": {
+        "key": "organizations",
+        "shape": '[{"name": "the company\'s name, or null if it is discussed but never actually named", '
+                 '"role": "employer_of_speaker" or "subject" or "client" or "investor" or "other", '
+                 '"note": "what this organization is/does here, or null"}]',
+        "what": "companies and institutions that come up, with how each relates to "
+                "the conversation.",
+    },
+}
+
+
+def build_card_extraction_prompt(card_id: str, transcript: str, summary: dict = None) -> str:
+    """Extracts ONE field from a transcript, for a card the user just added.
+
+    The user adding an empty card is an explicit statement that they expect
+    something to be there -- the original summarize() pass either missed it
+    or judged it not worth listing. So this prompt leans slightly more
+    inclusive than the main summarizer, while still refusing to invent:
+    "look again, harder, at this one thing" rather than "find something at
+    any cost", because a card filled with fabrications is worse than an
+    honestly empty one."""
+    spec = CARD_EXTRACTION_SPECS[card_id]
+    context = ""
+    if summary and (summary.get("summary") or "").strip():
+        context = f"\nFor context, the overall summary of this conversation:\n\"\"\"\n{summary['summary']}\n\"\"\"\n"
+    return (
+        f"Extract ONLY the \"{spec['key']}\" from this transcript.\n\n"
+        f"What counts as {spec['key']}: {spec['what']}\n\n"
+        "This is a second, focused pass -- an earlier general summary of this "
+        "conversation found nothing here, or the user believes it missed "
+        "something. Re-read carefully for anything that genuinely qualifies, "
+        "including things stated indirectly or in passing.\n\n"
+        "Never invent. If the transcript genuinely contains none, return an "
+        "empty list -- an empty result is a correct and useful answer here, "
+        "and is far better than a plausible-sounding fabrication the user "
+        "would have to catch.\n"
+        + context +
+        f"\nTranscript:\n\"\"\"\n{transcript}\n\"\"\"\n\n"
+        f'Respond with ONLY this JSON object, nothing else: {{"{spec["key"]}": {spec["shape"]}}}'
+    )
+
+
+def parse_card_extraction(card_id: str, raw_text: str) -> list:
+    """Returns the extracted list, or [] on anything unexpected.
+
+    Degrades to empty rather than raising, matching parse_action_triage's
+    posture: this result gets merged into the stored summary, so a
+    malformed response must not be able to corrupt a recording's data. An
+    empty list simply leaves the card empty, which the UI already handles."""
+    import json
+
+    spec = CARD_EXTRACTION_SPECS.get(card_id)
+    if not spec:
+        return []
+
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
+
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, AttributeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    items = data.get(spec["key"])
+    if not isinstance(items, list):
+        return []
+    # Same _denull pass the main summary parser applies, so "null"/"unknown"
+    # string placeholders don't reach the UI as literal text.
+    cleaned = _denull(items)
+    return [it for it in cleaned if isinstance(it, dict) and any(
+        (it.get(k) or "") for k in ("text", "name"))]

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <title>Clicky Notes</title>
-  <link rel="stylesheet" href="/static/design.css">
+  <link rel="stylesheet" href="/static/design.css?v={{ asset_v }}">
   <style>
     /* Page-specific rules only -- shared tokens/reset/nav/buttons/badges
        now live in /static/design.css. Every class name below stays
@@ -20,6 +20,36 @@
     .info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; margin-top: 0.85rem; }
     .info-card { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0.85rem 1rem; background: var(--pre-bg); min-width: 0; }
     .info-card .section-label { margin-top: 0; }
+    /* Card add/remove. The × is deliberately faint until hover: it sits on
+       every card, and at full contrast a row of them reads as clutter
+       competing with the content the cards exist to show. */
+    .info-card { position: relative; }
+    .card-remove {
+      position: absolute; top: 0.35rem; right: 0.5rem; z-index: 1;
+      color: var(--muted2); opacity: 0.35; text-decoration: none;
+      font-size: 0.95rem; line-height: 1; cursor: pointer;
+    }
+    .info-card:hover .card-remove { opacity: 1; }
+    .card-remove:hover { color: var(--error, #c0392b); }
+    /* Inline in the audio row, next to Download -- adding a card is a
+       per-recording action, so it belongs with that recording's other
+       controls rather than stranded below the grid. */
+    .add-card-bar { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 0.35rem;
+                    margin-left: 0.5rem; font-size: 0.75rem; color: var(--muted2); }
+    /* Placeholder body for a card the user added that has nothing yet. */
+    .card-empty { font-style: italic; margin: 0.3rem 0 0; }
+    /* A draft rendered inside the action item it came from, rather than in
+       a separate Drafts section -- poller._build_email_drafts already
+       creates one draft per action item, so showing it detached made the
+       reader match them up by hand. */
+    .drafts-nested { margin: 0.25rem 0 0 1.4rem; padding-left: 0; }
+    .drafts-nested .draft-item { font-size: 0.8rem; }
+    .add-card-bar button {
+      font-size: 0.72rem; padding: 0.1rem 0.5rem; border-radius: 999px;
+      border: 1px dashed var(--border); background: none; color: var(--muted); cursor: pointer;
+    }
+    .add-card-bar button:hover { border-style: solid; border-color: var(--accent); color: var(--accent); }
+    .add-card-bar button:disabled { opacity: 0.6; cursor: default; }
     .info-card.transcript-card { grid-column: 1 / -1; }
     .recording {
       border: 1px solid var(--border); background: var(--card-bg); border-radius: var(--radius);
@@ -56,6 +86,89 @@
     .watch-form .watch-input { font-size: 0.8rem; padding: 0.15rem 0.4rem; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--fg); width: 180px; max-width: 100%; box-sizing: border-box; }
     .watch-form .watch-save, .watch-form .watch-clear { font-size: 0.75rem; padding: 0.15rem 0.5rem; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); color: var(--fg); cursor: pointer; }
     .watch-form .watch-save { border-color: var(--accent); color: var(--accent); }
+    /* Action-item agent. The AI-vs-human split is the point of the row, so
+       the chip carries the colour and the reason sits next to it in plain
+       text rather than in a title= tooltip -- "what do I still have to do
+       myself" has to be readable at a glance. */
+    .agent-row { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0.35rem; margin: 0.2rem 0 0 1.4rem; font-size: 0.75rem; }
+    .agent-chip { font-size: 0.68rem; padding: 0.05rem 0.4rem; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+    .agent-chip.agent-can { border-color: var(--accent); color: var(--accent); }
+    .agent-chip.agent-working { border-color: var(--warn); color: var(--warn); }
+    .agent-chip.agent-ready { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+    .agent-chip.agent-failed { border-color: var(--error, #c0392b); color: var(--error, #c0392b); }
+    .agent-chip.agent-done { border-color: var(--border); color: var(--muted2); }
+    .agent-reason { color: var(--muted2); min-width: 0; overflow-wrap: anywhere; }
+    .agent-assign { font-size: 0.72rem; padding: 0.1rem 0.5rem; border-radius: 4px; border: 1px solid var(--accent); background: var(--bg); color: var(--accent); cursor: pointer; }
+    .agent-assign:disabled { border-color: var(--border); color: var(--muted2); cursor: default; }
+    .agent-result { margin: 0.3rem 0 0.4rem 1.4rem; padding: 0.5rem 0.65rem; border: 1px solid var(--border); border-radius: var(--radius-sm, 4px); background: var(--bg); }
+    .agent-result .agent-row { margin-left: 0; }
+    .agent-title { font-weight: 600; font-size: 0.85rem; margin: 0.25rem 0; }
+    /* The produced text can be long; cap and scroll it for the same reason
+       the correspondence list is capped -- one result shouldn't push the
+       rest of the card off screen. pre-wrap because the model emits
+       markdown with real newlines that carry structure. */
+    .agent-body { white-space: pre-wrap; font-family: inherit; font-size: 0.8rem; line-height: 1.45;
+                  background: var(--pre-bg); padding: 0.5rem; border-radius: 4px; margin: 0.3rem 0;
+                  max-height: 260px; overflow-y: auto; }
+    .agent-gaps { font-size: 0.75rem; color: var(--warn); margin: 0.3rem 0; }
+    .agent-gaps ul { margin: 0.15rem 0 0 1.1rem; padding: 0; }
+    .agent-sources { font-size: 0.72rem; color: var(--muted2); margin-top: 0.2rem; }
+    .agent-actions { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.45rem; }
+    .agent-actions button { font-size: 0.75rem; padding: 0.15rem 0.6rem; border-radius: 4px; border: 1px solid var(--accent); background: var(--bg); color: var(--accent); cursor: pointer; }
+    .agent-actions button.secondary { border-color: var(--border); color: var(--muted); }
+    .agent-actions button:disabled { border-color: var(--border); color: var(--muted2); cursor: default; }
+    .agent-status { font-size: 0.75rem; color: var(--muted); }
+    /* Only ever rendered when saving a checkbox genuinely failed -- that
+       failure used to be swallowed silently, which looked like the app
+       forgetting the tick rather than a request erroring. */
+    .action-item-error { font-size: 0.72rem; color: var(--error, #c0392b); }
+    .watch-matches { list-style: none; margin: 0.2rem 0 0 1.4rem; padding: 0; display: flex; flex-direction: column; gap: 0.15rem; }
+    /* Correspondence is auto-populated (a fuzzy name search can pull back
+       a dozen+ real hits, e.g. every thread with one person), unlike the
+       action-item watch lists sharing this same .watch-matches class,
+       which stay small since the user adds them one at a time. Capped and
+       scrollable so one busy card doesn't push everything below it off
+       screen. */
+    .correspondence-matches { max-height: 220px; overflow-y: auto; padding-right: 0.3rem; }
+    .correspondence-collapse-toggle {
+      font-size: 0.7rem; font-weight: 400; color: var(--muted2); text-decoration: none;
+      cursor: pointer; margin-left: 0.4rem; display: inline-block; width: 0.9em; text-align: center;
+    }
+    .correspondence-collapse-toggle:hover { color: var(--fg); }
+    /* Collapsed hides everything below the header row (matches list, empty
+       state, manual-add form) -- the header itself (label + auto toggle +
+       this collapse arrow) stays visible so the card doesn't disappear
+       entirely and can still be re-expanded. */
+    .info-card.correspondence-collapsed > .watch-matches,
+    .info-card.correspondence-collapsed > p.providers,
+    .info-card.correspondence-collapsed > .watch-manual-form { display: none; }
+    /* Grid, not a single flex row: these cards live in a narrow info-card
+       column, and a flex row made the subject collapse to a one-word-per-line
+       sliver while the long sender ate the width (exactly the bug the
+       action-item checkbox hit earlier -- a flex child needs min-width: 0
+       or it refuses to shrink below its content). Subject gets its own full
+       row, sender sits underneath and truncates, delete pins top-right. */
+    .watch-match-card { font-size: 0.8rem; display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 0.4rem; align-items: start; padding: 0.15rem 0; }
+    .watch-match-card a:first-child { grid-column: 1; grid-row: 1; min-width: 0; color: var(--accent); text-decoration: none; overflow-wrap: anywhere; line-height: 1.3; }
+    .watch-match-card a:first-child:hover { text-decoration: underline; }
+    .watch-match-from { grid-column: 1; grid-row: 2; min-width: 0; color: var(--muted2); font-size: 0.72rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .watch-match-delete { grid-column: 2; grid-row: 1; color: var(--muted2); text-decoration: none; cursor: pointer; padding-left: 0.2rem; }
+    .correspondence-toggle { float: right; font-size: 0.7rem; font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--muted2); display: inline-flex; align-items: center; gap: 0.2rem; cursor: pointer; }
+    /* Same design.css `input { width: 100% }` trap as every other checkbox
+       added this session (.recording-select, .action-item-check, the
+       stakeholder/summary editors) -- explicit size required or it
+       stretches to fill the card. */
+    .correspondence-toggle input { width: 13px !important; height: 13px; margin: 0; }
+    .watch-match-delete:hover { color: var(--error, #c0392b); }
+    /* Manual-add form is styled/positioned like .watch-form on purpose --
+       same trap applies: design.css's global `input { width: 100% }`
+       needs an explicit override here too, or these inputs blow up to
+       fill the card (see .recording-select / .action-item-check's own
+       fix for the same bug earlier this session). */
+    .watch-manual-form { display: none; flex-wrap: wrap; align-items: center; gap: 0.3rem; margin: 0.2rem 0 0 1.4rem; }
+    .watch-manual-form.active { display: flex; }
+    .watch-manual-form input { font-size: 0.75rem; padding: 0.15rem 0.4rem; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--fg); width: 150px; max-width: 100%; box-sizing: border-box; }
+    .watch-manual-form .watch-manual-add { font-size: 0.72rem; padding: 0.15rem 0.5rem; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); color: var(--fg); cursor: pointer; }
     .contact-form { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; flex-basis: 100%; margin-top: 0.3rem; margin-left: 1.5rem; }
     .contact-form input { font-size: 0.8rem; padding: 0.15rem 0.4rem; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--fg); width: 160px; max-width: 100%; box-sizing: border-box; }
     .contact-form .contact-save { font-size: 0.75rem; padding: 0.15rem 0.5rem; border-radius: 4px; border: 1px solid var(--accent); color: var(--accent); background: var(--bg); cursor: pointer; }
@@ -211,6 +324,23 @@
     .recording-title { display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
     .recording-title h3 { margin: 0; }
     .recording-actions { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; flex-shrink: 0; }
+    /* Whole-card collapse -- last in .recording-actions so it sits at the
+       very top-right corner of the card, past Notion/Obsidian/Delete.
+       Sized well above the other 0.75rem action text per explicit
+       request ("bigger plus sign") -- this is the one control on the card
+       meant to be found at a glance, not read. */
+    .recording-collapse-toggle {
+      font-size: 1.4rem; line-height: 1; font-weight: 600; color: var(--muted2);
+      background: none; border: 1px solid var(--border); border-radius: 4px;
+      width: 1.6rem; height: 1.6rem; padding: 0; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+    }
+    .recording-collapse-toggle:hover { color: var(--fg); border-color: var(--accent); }
+    /* Collapsed hides everything below the header row (timestamp, audio
+       player, summary, every info-card) -- the header (checkbox, title,
+       Notion/Obsidian/Delete actions, this toggle) stays visible so the
+       card is still identifiable and can be re-expanded. */
+    .recording.collapsed .recording-body { display: none; }
     .recording-select { width: 16px; height: 16px; cursor: pointer; flex-shrink: 0; }
     .audio-row { display: flex; align-items: center; gap: 0.75rem; margin: 0.6rem 0 0.9rem; }
     .audio-row audio { flex: 1 1 auto; max-width: 420px; }
@@ -309,12 +439,34 @@
             {% if r.obsidian_url %}<a href="{{ r.obsidian_url }}" class="quick-open-link">Open in Obsidian</a>{% endif %}
             <button class="delete-btn" data-hash="{{ r.content_hash }}" data-name="{{ r.name }}">Delete</button>
             <button class="delete-device-btn danger" data-hash="{{ r.content_hash }}" data-name="{{ r.name }}">Delete from device</button>
+            {# data-hash is load-bearing, not decorative: the click handler
+               reads it to persist collapse state, and app.js re-renders
+               this whole card every 5s from that state -- without it the
+               state saves under "undefined" and the card springs back
+               open on the very next refresh. #}
+            <button type="button" class="recording-collapse-toggle" data-hash="{{ r.content_hash }}" title="Collapse">&minus;</button>
           </div>
         </div>
+        <div class="recording-body">
         <div class="timestamp">{{ r.created_at }}</div>
+        {# Which cards show, and which can be added, are both computed by
+           card_agents (the registry) rather than by this template -- app.js
+           applies the identical rules, so the first paint and the 5s
+           re-render can't disagree. #}
+        {% set vis = visible_cards(r) %}
         <div class="audio-row">
           <audio controls preload="none" src="/audio/{{ r.content_hash }}.wav"></audio>
           <a class="download-audio-btn" href="/audio/{{ r.content_hash }}.wav?download=1" download title="Download original recording">Download</a>
+          {% if r.status == "done" %}
+            {% set addable = addable_cards(r) %}
+            {% if addable %}
+              <span class="add-card-bar">Add:
+                {% for cid in addable %}
+                  <button type="button" class="card-add" data-card="{{ cid }}">+ {{ card_label(cid) }}</button>
+                {% endfor %}
+              </span>
+            {% endif %}
+          {% endif %}
         </div>
 
         {# Jarvis voice commands (kind=="command") no longer appear in this
@@ -345,7 +497,9 @@
           {% endif %}
           <div class="info-grid">
           {% if r.summary.action_items %}
-            <div class="info-card">
+            {% if "action_items" in vis %}
+            <div class="info-card" data-card="action_items">
+              <a href="javascript:void(0)" class="card-remove" data-card="action_items" title="Remove this card from this recording">&times;</a>
             <div class="section-label">Action items</div>
             <ul class="action-items" data-hash="{{ r.content_hash }}">
               {% for item in r.summary.action_items %}
@@ -357,10 +511,109 @@
                       {% if item.due_date %}<span class="due">(due {{ item.due_date }})</span>{% endif %}
                     </span>
                   </label>
-                  {% if item.watch_triggered %}
-                    <div class="watch-alert">📧 New mail matching &quot;{{ item.watch_query }}&quot;{% if item.watch_matches %} &mdash; {{ item.watch_matches[0].subject }}{% endif %}
+                  {# Agent block -- mirrors app.js's agentBlock() exactly.
+                     Both paths must render the same markup: this is what
+                     the user sees on first paint, app.js's version is what
+                     they see 5s later, and a mismatch reads as the UI
+                     changing on its own. #}
+                  {% if item.agent and item.agent.capable is defined %}
+                    {% if not item.agent.capable %}
+                      <div class="agent-row agent-human">
+                        <span class="agent-chip">🙋 needs you</span>
+                        {% if item.agent.reason %}<span class="agent-reason">{{ item.agent.reason }}</span>{% endif %}
+                      </div>
+                    {% elif item.agent.status in (None, "unassigned", "rejected") %}
+                      <div class="agent-row">
+                        <span class="agent-chip agent-can">🤖 agent can do this</span>
+                        <span class="agent-reason">{{ agent_action_label(item.agent.action) }}</span>
+                        <button type="button" class="agent-assign" data-index="{{ loop.index0 }}">Assign to agent</button>
+                        {% if item.agent.status == "rejected" %}<span class="agent-reason">(you rejected the last attempt)</span>{% endif %}
+                      </div>
+                    {% elif item.agent.status in ("queued", "running") %}
+                      <div class="agent-row">
+                        <span class="agent-chip agent-working">🤖 {{ "queued" if item.agent.status == "queued" else "working" }}&hellip;</span>
+                        <span class="agent-reason">{{ agent_action_label(item.agent.action) }}</span>
+                      </div>
+                    {% elif item.agent.status == "failed" %}
+                      <div class="agent-row">
+                        <span class="agent-chip agent-failed">⚠ agent failed</span>
+                        <span class="agent-reason">{{ item.agent.error or "unknown error" }}</span>
+                        <button type="button" class="agent-assign" data-index="{{ loop.index0 }}">Retry</button>
+                      </div>
+                    {% elif item.agent.status == "approved" %}
+                      <div class="agent-row"><span class="agent-chip agent-done">✓ agent result approved</span></div>
+                    {% elif item.agent.status == "awaiting_approval" %}
+                      <div class="agent-result" data-index="{{ loop.index0 }}">
+                        <div class="agent-row">
+                          <span class="agent-chip agent-ready">🤖 ready for your review</span>
+                          <span class="agent-reason">{{ agent_action_label(item.agent.action) }}{% if item.agent.result and item.agent.result.confidence %} &middot; {{ item.agent.result.confidence }} confidence{% endif %}</span>
+                        </div>
+                        {% if item.agent.result %}
+                          {% if item.agent.result.title %}<div class="agent-title">{{ item.agent.result.title }}</div>{% endif %}
+                          {% if item.agent.result.recipient %}<div class="agent-sources">To: {{ item.agent.result.recipient }}</div>{% endif %}
+                          <pre class="agent-body">{{ item.agent.result.body or "" }}</pre>
+                          {% if item.agent.result.gaps %}
+                            <div class="agent-gaps"><strong>Gaps the agent flagged:</strong>
+                              <ul>{% for g in item.agent.result.gaps %}<li>{{ g }}</li>{% endfor %}</ul>
+                            </div>
+                          {% endif %}
+                          {% if item.agent.result.sources_used %}
+                            <div class="agent-sources">Used: {{ item.agent.result.sources_used|join(", ") }}</div>
+                          {% endif %}
+                        {% endif %}
+                        <div class="agent-actions">
+                          <button type="button" class="agent-approve" data-index="{{ loop.index0 }}">Approve</button>
+                          <button type="button" class="agent-reject secondary" data-index="{{ loop.index0 }}">Reject</button>
+                          <span class="agent-status"></span>
+                        </div>
+                      </div>
+                    {% endif %}
+                  {% endif %}
+                  {# The email draft this action item produced, nested under
+                     it. poller._build_email_drafts ids each draft
+                     "email-item-{N}" against the item's 1-based position,
+                     so they can be shown together instead of the reader
+                     matching them up from a separate list. Mirrors app.js's
+                     renderDrafts(r, i). #}
+                  {# loop.index here is the action item's 1-based position,
+                     which is exactly the N in its draft's "email-item-N"
+                     id -- captured before the inner loop shadows `loop`. #}
+                  {% set ai_num = loop.index %}
+                  {% set my_drafts = [] %}
+                  {% for d in (r.drafts["items"] if r.drafts and r.drafts.get("items") else []) %}
+                    {% if d.id == "email-item-" ~ ai_num %}{% set _ = my_drafts.append(d) %}{% endif %}
+                  {% endfor %}
+                  {% if my_drafts %}
+                    <ul class="action-items drafts-list drafts-nested" data-hash="{{ r.content_hash }}">
+                      {% for d in my_drafts %}
+                        <li class="draft-item" data-draft-id="{{ d.id }}">
+                          <span class="draft-text">✉️ {{ d.subject or d.title or d.kind }}</span>
+                          {% if d.status == "pending" %}
+                            <span class="draft-actions">
+                              <button class="draft-approve-btn" data-draft-id="{{ d.id }}" data-kind="{{ d.kind }}">Approve</button>
+                              <button class="draft-dismiss-btn" data-draft-id="{{ d.id }}">Dismiss</button>
+                            </span>
+                          {% else %}
+                            <span class="badge {{ 'dest' if d.status == 'approved_sent' else 'failed' }}">{{ 'Sent' if d.status == 'approved_sent' else ('Dismissed' if d.status == 'dismissed' else 'Failed') }}</span>
+                          {% endif %}
+                        </li>
+                      {% endfor %}
+                    </ul>
+                  {% endif %}
+                  {% if item.watch_matches %}
+                    <div class="watch-alert">📧 {{ item.watch_matches|length }} email{{ "s" if item.watch_matches|length > 1 }} matching &quot;{{ item.watch_query or '' }}&quot;
                       <a href="javascript:void(0)" class="watch-toggle" data-index="{{ loop.index0 }}">change</a>
                     </div>
+                    <ul class="watch-matches">
+                      {% for m in item.watch_matches %}
+                        <li class="watch-match-card" data-match-id="{{ m.id }}">
+                          <a href="{{ m.link or '#' }}" target="_blank" rel="noopener">{{ m.subject or "(no subject)" }}</a>
+                          {% if m.from %}<span class="watch-match-from">{{ m.from }}</span>
+                          {% elif m.manual %}<span class="watch-match-from">manually added</span>{% endif %}
+                          <a href="javascript:void(0)" class="watch-match-delete" title="Remove this">&times;</a>
+                        </li>
+                      {% endfor %}
+                    </ul>
                   {% elif item.watch_query %}
                     <div class="watch-status">👁 watching for &quot;{{ item.watch_query }}&quot; <a href="javascript:void(0)" class="watch-toggle" data-index="{{ loop.index0 }}">change</a></div>
                   {% else %}
@@ -371,13 +624,21 @@
                     <button type="button" class="watch-save">Save</button>
                     <button type="button" class="watch-clear">Clear</button>
                   </span>
+                  <span class="watch-manual-form">
+                    <input type="url" class="watch-manual-link" placeholder="paste a link to the email">
+                    <input type="text" class="watch-manual-subject" placeholder="subject (optional)">
+                    <button type="button" class="watch-manual-add">+ add link</button>
+                  </span>
                 </li>
               {% endfor %}
             </ul>
             </div>
+            {% endif %}{# card: action_items #}
           {% endif %}
           {% if r.summary.follow_ups %}
-            <div class="info-card">
+            {% if "follow_ups" in vis %}
+            <div class="info-card" data-card="follow_ups">
+              <a href="javascript:void(0)" class="card-remove" data-card="follow_ups" title="Remove this card from this recording">&times;</a>
             <div class="section-label">Follow-ups</div>
             <ul class="action-items">
               {% for fu in r.summary.follow_ups %}
@@ -387,9 +648,12 @@
               {% endfor %}
             </ul>
             </div>
+            {% endif %}{# card: follow_ups #}
           {% endif %}
           {% if r.summary.stakeholders %}
-            <div class="info-card">
+            {% if "stakeholders" in vis %}
+            <div class="info-card" data-card="stakeholders">
+              <a href="javascript:void(0)" class="card-remove" data-card="stakeholders" title="Remove this card from this recording">&times;</a>
             <div class="section-label">Stakeholders</div>
             <ul class="action-items">
               {% for s in r.summary.stakeholders %}
@@ -413,9 +677,12 @@
               {% endfor %}
             </ul>
             </div>
+            {% endif %}{# card: stakeholders #}
           {% endif %}
           {% if r.summary.organizations %}
-            <div class="info-card">
+            {% if "organizations" in vis %}
+            <div class="info-card" data-card="organizations">
+              <a href="javascript:void(0)" class="card-remove" data-card="organizations" title="Remove this card from this recording">&times;</a>
             <div class="section-label">Organizations</div>
             <ul class="action-items">
               {% for o in r.summary.organizations %}
@@ -427,9 +694,40 @@
               {% endfor %}
             </ul>
             </div>
+            {% endif %}{# card: organizations #}
           {% endif %}
+          {% if "correspondence" in vis %}
+          <div class="info-card" data-card="correspondence">
+            <a href="javascript:void(0)" class="card-remove" data-card="correspondence" title="Remove this card from this recording">&times;</a>
+            <div class="section-label">Correspondence
+              <a href="javascript:void(0)" class="correspondence-collapse-toggle" title="Collapse">▾</a>
+              <label class="correspondence-toggle" title="Automatically search Mail.app for emails with this recording's speakers">
+                <input type="checkbox" class="correspondence-enabled-checkbox" {{ "checked" if r.correspondence_enabled != False }}> auto
+              </label>
+            </div>
+            {% if r.correspondence %}<p class="providers" style="margin:0.15rem 0 0.3rem;">Emails that carry this conversation</p>{% endif %}
+            <ul class="watch-matches correspondence-matches" data-hash="{{ r.content_hash }}">
+              {% for m in r.correspondence %}
+                <li class="watch-match-card" data-match-id="{{ m.id }}">
+                  <a href="{{ m.link or '#' }}" target="_blank" rel="noopener">{{ m.subject or "(no subject)" }}</a>
+                  {% if m.from %}<span class="watch-match-from">{{ m.from }}</span>
+                  {% elif m.manual %}<span class="watch-match-from">manually added</span>{% endif %}
+                  <a href="javascript:void(0)" class="watch-match-delete" title="Remove this">&times;</a>
+                </li>
+              {% endfor %}
+            </ul>
+            {% if not r.correspondence %}<p class="providers" style="margin: 0.3rem 0;">No matching emails found yet.</p>{% endif %}
+            <span class="watch-manual-form active" style="margin-left:0;">
+              <input type="url" class="watch-manual-link correspondence-manual-link" placeholder="paste a link to the email">
+              <input type="text" class="watch-manual-subject correspondence-manual-subject" placeholder="subject (optional)">
+              <button type="button" class="correspondence-manual-add">+ add link</button>
+            </span>
+          </div>
+          {% endif %}{# card: correspondence #}
           {% if r.summary.calendar_events %}
-            <div class="info-card">
+            {% if "action_items" in vis %}
+            <div class="info-card" data-card="calendar_events">
+              <a href="javascript:void(0)" class="card-remove" data-card="calendar_events" title="Remove this card from this recording">&times;</a>
             <div class="section-label">Calendar events</div>
             <ul class="action-items">
               {% for ev in r.summary.calendar_events %}
@@ -440,11 +738,14 @@
               {% endfor %}
             </ul>
             </div>
+            {% endif %}{# calendar events (inside Action items) #}
           {% endif %}
           {% if r.segments %}
             {% set speaker_ids = r.segments | map(attribute='speaker_id') | unique | list %}
             {% if speaker_ids | length > 0 %}
-              <div class="info-card">
+              {% if "speakers" in vis %}
+              <div class="info-card" data-card="speakers">
+                <a href="javascript:void(0)" class="card-remove" data-card="speakers" title="Remove this card from this recording">&times;</a>
               <div class="section-label">Speakers
                 <a class="fix-names" href="javascript:void(0)" title="Re-check the summary, action items, follow-ups and stakeholders against these confirmed names, and fix any misspelled or leftover references">fix names everywhere</a>
               </div>
@@ -493,9 +794,12 @@
                 {% endfor %}
               </ul>
               </div>
+              {% endif %}{# card: speakers #}
             {% endif %}
           {% endif %}
-            <div class="info-card transcript-card">
+            {% if "transcript" in vis %}
+            <div class="info-card transcript-card" data-card="transcript">
+              <a href="javascript:void(0)" class="card-remove" data-card="transcript" title="Remove this card from this recording">&times;</a>
               <details>
                 <summary>Full transcript</summary>
                 {% if r.merged_segments %}
@@ -517,6 +821,21 @@
                 {% if r.obsidian_synced %}<span class="badge dest">Obsidian</span>{% endif %}
               </div>
             </div>
+            {% endif %}{# card: transcript #}
+            {# Cards the user added that have nothing yet. Each per-card
+               block above renders only when its field has content, so these
+               fill the gap -- without them, adding an empty card would look
+               like the click did nothing. Mirrors app.js's emptyCard(). #}
+            {% for cid in empty_cards(r) %}
+              <div class="info-card" data-card="{{ cid }}">
+                <a href="javascript:void(0)" class="card-remove" data-card="{{ cid }}" title="Remove this card from this recording">&times;</a>
+                <div class="section-label">{{ card_label(cid) }}</div>
+                <p class="providers card-empty">
+                  {%- if cid in r.card_refresh %}Looking through this conversation&hellip;
+                  {%- else %}Nothing found for this conversation.{% endif %}
+                </p>
+              </div>
+            {% endfor %}
           </div>
         {% elif r.status == "failed" %}
           <p class="error-text">{{ r.error }}</p>
@@ -524,6 +843,7 @@
         {% else %}
           <p class="providers">Audio synced, waiting to be transcribed and summarized&hellip;</p>
         {% endif %}
+        </div>
       </div>
     {% endfor %}
   </div>
@@ -547,6 +867,10 @@
        #recordings, not here -- app.js replaces #recordings' innerHTML
        every refresh() cycle, so per-element listeners attached at initial
        page load would silently stop working the first time it refreshes. -->
-  <script src="/static/app.js"></script>
+  {# The card registry, handed to app.js so cards are defined in exactly one
+     place (card_agents.py). Embedded rather than fetched so it's available
+     synchronously at first paint -- a fetch would race the first render. #}
+  <script id="card-registry" type="application/json">{{ card_registry_json|safe }}</script>
+  <script src="/static/app.js?v={{ asset_v }}"></script>
 </body>
 </html>
