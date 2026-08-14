@@ -111,6 +111,42 @@ static Preferences s_prefs;
 static String s_ssid;
 static String s_password;
 
+// --- saved networks (multi-network roaming) ------------------------------
+// Originally this stored exactly ONE ssid/password pair, so saving a new
+// network silently overwrote the previous one and the device would only
+// ever try the most recent network -- carry it between home and an office
+// and it could never reconnect at the one you weren't standing in last.
+//
+// Now it keeps a small list and, when more than one is saved, picks the
+// strongest network that's ACTUALLY IN RANGE (see startNetworkSelection).
+// The legacy "ssid"/"password" keys are still written and still hold the
+// most-recently-saved network: they're the migration source for devices
+// upgrading from the single-pair format, and the fallback whenever a scan
+// fails or finds none of the saved networks, so worst-case behaviour is
+// exactly what it was before this existed.
+//
+// 8 is generous for the realistic case (home / office / phone hotspot) and
+// bounded so the NVS namespace and the /wifi/saved JSON both stay small.
+static const int MAX_SAVED_NETWORKS = 8;
+
+struct SavedNetwork {
+    String ssid;
+    String password;
+};
+static SavedNetwork s_saved[MAX_SAVED_NETWORKS];
+static int s_savedCount = 0;
+
+// Candidates for the current connect cycle, strongest first, filled by the
+// scan. Lets a failed attempt fall through to the next known network in
+// range instead of retrying the same dead one forever.
+static int s_candidates[MAX_SAVED_NETWORKS];
+static int s_candidateCount = 0;
+static int s_candidateIndex = 0;
+
+// Defined further down (next to the scan JSON that also uses it) -- declared
+// here because wifi_sync_saved_networks_json() sits above that definition.
+static String jsonEscape(const String &s);
+
 static bool isWavFile(const char *name) {
     size_t len = strlen(name);
     return len > 4 && strcasecmp(name + len - 4, ".wav") == 0;
@@ -424,6 +460,24 @@ static void handleWifiStatus() {
     s_server.send(200, "application/json", wifi_sync_status_json());
 }
 
+static void handleWifiSaved() {
+    noteHttpActivity();
+    s_server.send(200, "application/json", wifi_sync_saved_networks_json());
+}
+
+static void handleWifiForget() {
+    noteHttpActivity();
+    if (!s_server.hasArg("ssid") || s_server.arg("ssid").isEmpty()) {
+        s_server.send(400, "text/plain", "missing ssid");
+        return;
+    }
+    if (!wifi_sync_forget_network(s_server.arg("ssid").c_str())) {
+        s_server.send(404, "text/plain", "not a saved network");
+        return;
+    }
+    s_server.send(200, "application/json", wifi_sync_saved_networks_json());
+}
+
 // Firmware auto-update -- see FW_VERSION's own docstring. The paired
 // pipeline app compares this against its own bundled firmware version and
 // only pushes a new image via POST /ota when this is older.
@@ -716,7 +770,7 @@ static const char *wifiStatusName(wl_status_t status) {
 // never work" -- it might just mean the router was mid-reboot, or the user
 // is about to fix a typo'd password from the dashboard. Keeps retrying
 // indefinitely with a backoff between attempts instead of giving up.
-enum class WifiState { OFF, IDLE, CONNECTING, CONNECTED, BACKOFF };
+enum class WifiState { OFF, IDLE, SELECTING, CONNECTING, CONNECTED, BACKOFF };
 static WifiState s_state = WifiState::OFF;
 static uint32_t s_stateChangedMs = 0;
 static const uint32_t CONNECT_TIMEOUT_MS = 20000; // per-attempt ceiling
@@ -734,6 +788,85 @@ static const uint32_t CONNECT_TIMEOUT_MS = 20000; // per-attempt ceiling
 // eventually reconnects on its own" against "BLE stays reliably reachable
 // most of the time" when there's no valid network configured yet.
 static const uint32_t BACKOFF_MS = 30000;          // pause between attempts (radio fully off)
+
+// How long to wait for the selection scan before giving up and just using
+// the most-recently-saved network. A scan is normally 2-4s; this is the
+// ceiling, not the expected cost.
+static const uint32_t SELECT_SCAN_TIMEOUT_MS = 8000;
+
+static void beginConnectAttempt();
+
+// Starts a scan to decide WHICH saved network to join.
+//
+// Only worth doing with more than one saved network: with zero or one there
+// is nothing to choose between, and skipping the scan keeps the common
+// single-network case exactly as fast and as cheap on the radio as it was
+// before roaming existed. Returns false if the caller should just connect
+// directly.
+static bool startNetworkSelection() {
+    if (s_savedCount < 2) return false;
+    s_candidateCount = 0;
+    s_candidateIndex = 0;
+    // Async so this doesn't block the sync task; the SELECTING state below
+    // polls scanComplete(). Same call wifi_sync_start_scan() uses for the
+    // settings dropdown.
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_STA);
+    WiFi.scanNetworks(/*async=*/true);
+    s_state = WifiState::SELECTING;
+    s_stateChangedMs = millis();
+    Serial.printf("wifi_sync: %d saved networks -- scanning to pick the one in range\n", s_savedCount);
+    return true;
+}
+
+// Turns a finished scan into an ordered candidate list: every saved network
+// that's actually on the air right now, strongest signal first.
+static void buildCandidatesFromScan(int found) {
+    s_candidateCount = 0;
+    s_candidateIndex = 0;
+    int bestRssi[MAX_SAVED_NETWORKS];
+    for (int i = 0; i < s_savedCount; i++) bestRssi[i] = -32768;
+
+    for (int i = 0; i < found; i++) {
+        String ssid = WiFi.SSID(i);
+        if (ssid.isEmpty()) continue;
+        for (int j = 0; j < s_savedCount; j++) {
+            // Mesh/extender setups broadcast the same SSID from several
+            // APs -- keep the strongest sighting of each saved network.
+            if (s_saved[j].ssid == ssid && WiFi.RSSI(i) > bestRssi[j]) bestRssi[j] = WiFi.RSSI(i);
+        }
+    }
+    // Simple selection sort over at most 8 entries -- not worth anything
+    // cleverer, and it keeps the "strongest first" ordering obvious.
+    bool used[MAX_SAVED_NETWORKS] = {false};
+    for (;;) {
+        int best = -1;
+        for (int j = 0; j < s_savedCount; j++) {
+            if (used[j] || bestRssi[j] == -32768) continue;
+            if (best < 0 || bestRssi[j] > bestRssi[best]) best = j;
+        }
+        if (best < 0) break;
+        used[best] = true;
+        s_candidates[s_candidateCount++] = best;
+    }
+
+    if (s_candidateCount == 0) {
+        Serial.println("wifi_sync: none of the saved networks are in range -- trying the most recent one anyway");
+        return;
+    }
+    Serial.printf("wifi_sync: %d saved network(s) in range, strongest is \"%s\" (%d dBm)\n",
+                  s_candidateCount, s_saved[s_candidates[0]].ssid.c_str(), bestRssi[s_candidates[0]]);
+}
+
+// Points s_ssid/s_password at the next candidate. False when the list is
+// exhausted, so the caller can fall back to the legacy pair.
+static bool useNextCandidate() {
+    if (s_candidateIndex >= s_candidateCount) return false;
+    const SavedNetwork &n = s_saved[s_candidates[s_candidateIndex++]];
+    s_ssid = n.ssid;
+    s_password = n.password;
+    return true;
+}
 
 static void beginConnectAttempt() {
     Serial.printf("wifi_sync: connecting to SSID \"%s\"...\n", s_ssid.c_str());
@@ -789,6 +922,73 @@ static void ensureNvsReady() {
     }
 }
 
+// NVS keys are capped at 15 chars; "ssid0".."pw7" are comfortably inside it.
+static String savedSsidKey(int i) { return String("ssid") + i; }
+static String savedPwKey(int i) { return String("pw") + i; }
+
+// Reads the saved-network list. Called with the "wifi" namespace already
+// open read-only by loadCredentials, so it doesn't begin/end itself.
+static void loadSavedList() {
+    s_savedCount = 0;
+    int n = s_prefs.getInt("n", -1);
+    if (n < 0) {
+        // Pre-list firmware: no "n" key exists yet. The legacy single pair
+        // (read by the caller) becomes entry 0 -- migration happens on the
+        // next save, so a device that never reconfigures WiFi is untouched.
+        return;
+    }
+    if (n > MAX_SAVED_NETWORKS) n = MAX_SAVED_NETWORKS;
+    for (int i = 0; i < n; i++) {
+        String ssid = s_prefs.getString(savedSsidKey(i).c_str(), "");
+        if (ssid.isEmpty()) continue; // tolerate a hole rather than truncating
+        s_saved[s_savedCount].ssid = ssid;
+        s_saved[s_savedCount].password = s_prefs.getString(savedPwKey(i).c_str(), "");
+        s_savedCount++;
+    }
+}
+
+// Writes the in-memory list back. Opens its own read-write handle.
+static void persistSavedList() {
+    if (!s_prefs.begin("wifi", /*readOnly=*/false)) {
+        Serial.println("wifi_sync: could not open NVS to save network list");
+        return;
+    }
+    for (int i = 0; i < s_savedCount; i++) {
+        s_prefs.putString(savedSsidKey(i).c_str(), s_saved[i].ssid);
+        s_prefs.putString(savedPwKey(i).c_str(), s_saved[i].password);
+    }
+    // Clear any trailing entries left by a longer previous list, so a
+    // forgotten network can't reappear via a stale key if the count grows
+    // again later.
+    for (int i = s_savedCount; i < MAX_SAVED_NETWORKS; i++) {
+        s_prefs.remove(savedSsidKey(i).c_str());
+        s_prefs.remove(savedPwKey(i).c_str());
+    }
+    s_prefs.putInt("n", s_savedCount);
+    s_prefs.end();
+}
+
+// Inserts (or updates) a network at the front -- most recently used first,
+// which is also the order the fallback path prefers.
+static void rememberNetwork(const String &ssid, const String &password) {
+    if (ssid.isEmpty()) return;
+    int existing = -1;
+    for (int i = 0; i < s_savedCount; i++) {
+        if (s_saved[i].ssid == ssid) { existing = i; break; }
+    }
+    if (existing >= 0) {
+        // Same network, possibly a corrected password -- move to front.
+        for (int i = existing; i > 0; i--) s_saved[i] = s_saved[i - 1];
+    } else {
+        if (s_savedCount < MAX_SAVED_NETWORKS) s_savedCount++;
+        // Full: the oldest (last) entry falls off the end.
+        for (int i = s_savedCount - 1; i > 0; i--) s_saved[i] = s_saved[i - 1];
+    }
+    s_saved[0].ssid = ssid;
+    s_saved[0].password = password;
+    persistSavedList();
+}
+
 static void loadCredentials() {
     // On a fresh device the "wifi" NVS namespace doesn't exist yet (nothing
     // has ever been written to it), and begin(readOnly=true) fails with
@@ -804,27 +1004,88 @@ static void loadCredentials() {
     }
     s_ssid = s_prefs.getString("ssid", "");
     s_password = s_prefs.getString("password", "");
+    loadSavedList();
     s_prefs.end();
     if (s_ssid.isEmpty()) {
         // Namespace existed but nothing saved yet -- same fallback.
         s_ssid = WIFI_SSID;
         s_password = WIFI_PASSWORD;
     }
+    // Migration: a device upgrading from the single-pair format has a
+    // legacy ssid but no list yet. Seed the list from it so its one known
+    // network participates in selection instead of being invisible to it.
+    if (s_savedCount == 0 && !s_ssid.isEmpty()) {
+        s_saved[0].ssid = s_ssid;
+        s_saved[0].password = s_password;
+        s_savedCount = 1;
+        persistSavedList();
+        Serial.printf("wifi_sync: migrated existing network \"%s\" into the saved list\n", s_ssid.c_str());
+    }
+    Serial.printf("wifi_sync: %d saved network(s)\n", s_savedCount);
 }
 
 void wifi_sync_set_credentials(const char *ssid, const char *password) {
     s_prefs.begin("wifi", /*readOnly=*/false);
+    // Still written: these remain the "most recently saved" pair, used as
+    // the fallback when a scan finds none of the saved networks, and read
+    // by any older code path that hasn't learned about the list.
     s_prefs.putString("ssid", ssid);
     s_prefs.putString("password", password);
     s_prefs.end();
     s_ssid = ssid;
     s_password = password;
-    Serial.printf("wifi_sync: new credentials saved for SSID \"%s\", reconnecting\n", ssid);
+    // Adding a network no longer forgets the previous one.
+    rememberNetwork(String(ssid), String(password));
+    Serial.printf("wifi_sync: new credentials saved for SSID \"%s\" (%d saved), reconnecting\n",
+                  ssid, s_savedCount);
     // Route through the session API so the timeout bookkeeping starts fresh
     // -- a provisioning session ends the same way a sync session does
     // (/synced or the inactivity fallback), rather than staying on forever.
     s_state = WifiState::IDLE; // force radio_on to actually (re)connect with the new creds
     wifi_sync_radio_on("credentials changed");
+}
+
+bool wifi_sync_forget_network(const char *ssid) {
+    int found = -1;
+    for (int i = 0; i < s_savedCount; i++) {
+        if (s_saved[i].ssid == ssid) { found = i; break; }
+    }
+    if (found < 0) return false;
+    for (int i = found; i < s_savedCount - 1; i++) s_saved[i] = s_saved[i + 1];
+    s_savedCount--;
+    persistSavedList();
+    Serial.printf("wifi_sync: forgot network \"%s\" (%d left)\n", ssid, s_savedCount);
+    // If the forgotten one was the active/most-recent network, promote the
+    // next saved one so the legacy fallback pair doesn't keep pointing at
+    // something the user just deleted.
+    if (s_ssid == ssid) {
+        if (s_savedCount > 0) {
+            s_ssid = s_saved[0].ssid;
+            s_password = s_saved[0].password;
+        } else {
+            s_ssid = "";
+            s_password = "";
+        }
+        if (s_prefs.begin("wifi", /*readOnly=*/false)) {
+            s_prefs.putString("ssid", s_ssid);
+            s_prefs.putString("password", s_password);
+            s_prefs.end();
+        }
+    }
+    return true;
+}
+
+String wifi_sync_saved_networks_json() {
+    String json = "{\"networks\":[";
+    for (int i = 0; i < s_savedCount; i++) {
+        if (i) json += ",";
+        // Passwords are deliberately never included -- this feeds a UI list,
+        // and there is no reason to hand them back out over HTTP/BLE.
+        json += "{\"ssid\":\"" + jsonEscape(s_saved[i].ssid) + "\"";
+        json += ",\"current\":" + String(s_saved[i].ssid == s_ssid ? "true" : "false") + "}";
+    }
+    json += "]}";
+    return json;
 }
 
 String wifi_sync_status_json() {
@@ -965,6 +1226,8 @@ void wifi_sync_init() {
     s_server.on("/wifi/connect", HTTP_POST, handleWifiConnect);
     s_server.on("/wifi/scan", HTTP_POST, handleWifiScanStart);
     s_server.on("/wifi/scan", HTTP_GET, handleWifiScanStatus);
+    s_server.on("/wifi/saved", HTTP_GET, handleWifiSaved);
+    s_server.on("/wifi/forget", HTTP_POST, handleWifiForget);
     s_server.on("/version", HTTP_GET, handleVersion);
     s_server.on("/device/info", HTTP_GET, handleDeviceInfo);
     s_server.on("/device/name", HTTP_POST, handleSetDeviceName);
@@ -1026,7 +1289,14 @@ void wifi_sync_radio_on(const char *why, bool presenceConfirmed) {
         return;
     }
     Serial.printf("wifi_sync: radio on (%s)\n", why ? why : "");
-    beginConnectAttempt();
+    // With several saved networks, decide which one is actually in range
+    // before committing to a 20s connect attempt against whichever happened
+    // to be saved most recently -- that blind attempt is precisely what made
+    // the device unable to reconnect after moving between locations. With
+    // 0 or 1 saved networks this returns false and nothing changes.
+    if (!startNetworkSelection()) {
+        beginConnectAttempt();
+    }
     if (s_wifiTaskHandle) xTaskNotifyGive(s_wifiTaskHandle); // unblock wifiTask
 }
 
@@ -1078,6 +1348,27 @@ void wifi_sync_tick() {
 
         case WifiState::IDLE:
             break; // nothing configured -- wait for wifi_sync_set_credentials()
+
+        case WifiState::SELECTING: {
+            int found = WiFi.scanComplete();
+            if (found == WIFI_SCAN_RUNNING && millis() - s_stateChangedMs < SELECT_SCAN_TIMEOUT_MS) {
+                break; // still scanning
+            }
+            if (found >= 0) {
+                buildCandidatesFromScan(found);
+                WiFi.scanDelete(); // free the driver's result buffer
+            } else {
+                // Failed or timed out. Not fatal: fall through with an empty
+                // candidate list and let the legacy most-recent pair carry
+                // the attempt, which is exactly the pre-roaming behaviour.
+                Serial.printf("wifi_sync: selection scan %s -- falling back to the most recent network\n",
+                              found == WIFI_SCAN_RUNNING ? "timed out" : "failed");
+                s_candidateCount = 0;
+            }
+            useNextCandidate(); // no-op when nothing was in range; s_ssid keeps its fallback value
+            beginConnectAttempt();
+            break;
+        }
 
         case WifiState::CONNECTING: {
             wl_status_t status = WiFi.status();
@@ -1138,7 +1429,16 @@ void wifi_sync_tick() {
 
         case WifiState::BACKOFF:
             if (millis() - s_stateChangedMs > BACKOFF_MS) {
-                beginConnectAttempt();
+                // Another saved network was in range on the last scan --
+                // try that one now rather than retrying the one that just
+                // failed. Only once the whole candidate list is exhausted
+                // do we re-scan, which also picks up networks that have
+                // come into range since.
+                if (useNextCandidate()) {
+                    beginConnectAttempt();
+                } else if (!startNetworkSelection()) {
+                    beginConnectAttempt();
+                }
             }
             break;
     }

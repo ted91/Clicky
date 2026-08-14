@@ -103,7 +103,19 @@ void wifi_sync_set_task_handle(TaskHandle_t handle);
 // ble_sync.cpp's SETWIFI command handler -- BLE is the reliable
 // configuration channel since it works even when the device has never
 // joined any network.
+//
+// Saving a network ADDS it to the saved list (up to 8) rather than
+// replacing the previous one: with more than one saved, the device scans
+// and joins whichever is actually in range, so carrying it between home and
+// an office works without reconfiguring at each end.
 void wifi_sync_set_credentials(const char *ssid, const char *password);
+
+// Removes a saved network. Returns false if that SSID wasn't saved.
+bool wifi_sync_forget_network(const char *ssid);
+
+// {"networks":[{"ssid":"...","current":bool}]} -- passwords are never
+// included. Feeds the saved-networks list in the app's WiFi settings.
+String wifi_sync_saved_networks_json();
 
 // JSON status blob for the BLE WIFI_STATUS characteristic / HTTP
 // /wifi/status: {"configured":bool,"connected":bool,"ssid":"...","ip":"..."}

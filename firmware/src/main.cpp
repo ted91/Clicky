@@ -519,6 +519,27 @@ static void sleepWatchTask(void *arg) {
                         !voice_agent_is_active() &&
                         !wifi_sync_radio_is_on() &&
                         !ble_sync_is_connected() &&
+                        // An UNPAIRED device must stay awake and discoverable.
+                        // Sleep pauses BLE advertising (ble_sync_pause_
+                        // advertising_for_sleep below) and the TIMER-wake path
+                        // only reopens the window when something is PENDING --
+                        // so an unpaired device with an empty SD card slept
+                        // itself into permanent invisibility. Combined with
+                        // having no WiFi credentials to connect with (the
+                        // state a reformatted NVS leaves behind), that made
+                        // the device unreachable by every transport at once,
+                        // with no recovery except a power cycle and a 120s
+                        // race against the pairing window.
+                        //
+                        // The comment on setup()'s pairing-mode entry already
+                        // ASSUMED this invariant ("a device that's still
+                        // unpaired never reaches battery-saving sleep
+                        // anyway") -- it just was not actually enforced
+                        // anywhere. This enforces it. Being unpaired is a
+                        // transient setup state, not steady state, so the
+                        // battery cost is bounded by how long the user takes
+                        // to configure it.
+                        ble_sync_is_paired() &&
                         !power_mgr_external_power_override_active() &&
                         !power_mgr_usb_host_attached() &&
                         !power_mgr_boot_grace_period_active() &&

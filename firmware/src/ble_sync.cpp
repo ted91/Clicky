@@ -477,7 +477,28 @@ static void resumeIdleAdvertising() {
     bool haveSomethingToSync = cachedHasPendingRecordings();
     bool wifiAlreadyCarryingIt = wifi_sync_is_connected() && wifi_sync_http_proven_reachable();
 
-    if (s_paired && (withinPostBootWindow || (haveSomethingToSync && !wifiAlreadyCarryingIt))) {
+    // An UNPAIRED device must never stop advertising. Live-confirmed
+    // deadlock: an OTA push reformatted NVS, which cleared both the WiFi
+    // credentials and the "paired" flag. s_paired then came up false (see
+    // ble_sync_init's hasStoredPairedFlag fallback), setup() opened the
+    // 120s pairing window, and when that expired this function -- gated on
+    // s_paired -- called stopAdvertising(). From that moment the device was
+    // unreachable by BOTH transports: no WiFi (no credentials to connect
+    // with) and no BLE (advertising off), with the only escape being a
+    // power cycle and a 2-minute race to reconfigure it.
+    //
+    // The battery argument for staying silent does not apply here: it rests
+    // on "an idle device with nothing pending shouldn't announce itself to
+    // nobody", but an unpaired device has no laptop to sync WITH, so being
+    // discoverable is the only useful thing it can do. Slow interval keeps
+    // that cheap.
+    if (!s_paired) {
+        applyAdvertisingInterval(SLOW_ADV_MIN, SLOW_ADV_MAX);
+        NimBLEDevice::startAdvertising();
+        return;
+    }
+
+    if (withinPostBootWindow || (haveSomethingToSync && !wifiAlreadyCarryingIt)) {
         applyAdvertisingInterval(SLOW_ADV_MIN, SLOW_ADV_MAX);
         NimBLEDevice::startAdvertising();
     } else {
