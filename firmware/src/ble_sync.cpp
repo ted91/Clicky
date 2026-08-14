@@ -371,7 +371,14 @@ static Preferences s_pairPrefs;
 static bool s_paired = false;
 static bool s_pairingActive = false;
 static uint32_t s_pairingStartedMs = 0;
-static const uint32_t PAIRING_TIMEOUT_MS = 120000;
+// 5 minutes, or until a central actually connects -- whichever comes first
+// (onConnect clears s_pairingActive, so a successful pair ends the window
+// immediately rather than leaving the radio advertising fast for the
+// remainder). Raised from 2 minutes: the window is now something the user
+// deliberately opens with the pairing button, so it has to survive walking
+// to the laptop, opening Settings and finding the scan -- 2 minutes was
+// sized for a window that opened automatically at boot.
+static const uint32_t PAIRING_TIMEOUT_MS = 300000;
 
 // Fast (general-discoverable) interval while actively pairing: the whole
 // point is to be found quickly. Slow interval once paired: BLE's own spec
@@ -545,6 +552,8 @@ void ble_sync_forget_and_repair() {
 bool ble_sync_pairing_timed_out() {
     return s_pairingActive && (millis() - s_pairingStartedMs > PAIRING_TIMEOUT_MS);
 }
+
+bool ble_sync_is_pairing() { return s_pairingActive; }
 
 void ble_sync_pause_advertising_for_sleep() {
     NimBLEDevice::stopAdvertising();

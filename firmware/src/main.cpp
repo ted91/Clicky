@@ -21,13 +21,21 @@
 // board's own power circuit before firmware is even running -- nothing to
 // do here for that.
 //
-// BOOT button: cancel, dismiss, and reboot.
-//   single click, memo recording live -> cancels it, audio discarded
-//                                        entirely (SD file deleted / PSRAM
-//                                        never offered, see recorder_cancel())
+// BOOT button: PAIRING button, plus cancel/dismiss/reboot.
+//   single click, idle                 -> opens a pairing window: fast BLE
+//                                         advertising for 5 minutes, or
+//                                         until a laptop connects
+//   single click, already pairing      -> closes that window early
+//   single click, memo recording live  -> cancels it, audio discarded
+//                                         entirely (SD file deleted / PSRAM
+//                                         never offered, recorder_cancel())
 //   single click, notification showing -> dismisses it
-//   single click, idle                 -> nothing
 //   LONG PRESS, idle                   -> reboots the device
+//
+// Pairing needs a button because advertising is otherwise suppressed for a
+// paired device that's on WiFi and reachable (resumeIdleAdvertising in
+// ble_sync.cpp) -- right for battery, but it leaves a NEW laptop with
+// nothing to find and no way to ask for it.
 //
 // The long press is the recovery gesture: a device with no WiFi credentials
 // and quiet BLE is unreachable by every transport, and without this the only
@@ -35,10 +43,9 @@
 // means waiting for the battery to die. It reboots only; nothing is erased.
 //
 // BOOT was the Jarvis button (single click started a voice-command capture).
-// That is switched off -- see the commented-out block in bootButtonTask for
-// why and how to bring it back. Status cycling was dropped from both buttons
-// earlier (custom statuses are Settings-dashboard-only now), so idle BOOT
-// currently has no short-press action at all.
+// That entry point is gone from hardware -- see bootButtonTask's idle branch
+// for why. Status cycling was dropped from both buttons earlier (custom
+// statuses are Settings-dashboard-only now).
 
 enum class AppState { IDLE, RECORDING, SYNCING };
 
@@ -256,39 +263,39 @@ static void bootButtonTask(void *arg) {
                 // A showing notification claims the click: dismiss it.
                 Serial.println("main: BOOT click -> dismiss notification");
                 face_dismiss_notification();
+            } else if (s_state == AppState::IDLE && ble_sync_is_pairing()) {
+                // Already advertising -- a second press closes the window
+                // early rather than making the user wait out the full five
+                // minutes of fast advertising they no longer need.
+                Serial.println("main: BOOT click -> cancelling pairing window");
+                ble_sync_stop_pairing();
+                face_clear_status();
+            } else if (s_state == AppState::IDLE) {
+                // BOOT is the PAIRING button. One press opens a 5-minute
+                // fast-advertising window; it closes early the moment a
+                // central connects (ble_sync's onConnect clears the pairing
+                // state and persists the paired flag).
+                //
+                // This is what makes the device introducable to a laptop on
+                // demand. Advertising is otherwise suppressed for a paired
+                // device that's on WiFi and reachable (resumeIdleAdvertising
+                // in ble_sync.cpp) -- correct for battery, but it left a
+                // NEW laptop with nothing to find and no way to ask.
+                //
+                // Replaces the Jarvis capture that used to live on this
+                // click. That entry point is gone from hardware: the live
+                // Deepgram Voice Agent path reproduced a hardware hang on
+                // its first real test and was never root-caused with a
+                // serial monitor attached (voice_agent.cpp's top comment).
+                // The rest of Jarvis is untouched and still works --
+                // voice_agent.cpp, jarvis.py, the /jarvis dashboard page,
+                // the finish/cancel branches above, drawJarvis(). With no
+                // way to START a capture, s_jarvisActive is never true, so
+                // those branches are unreachable rather than broken.
+                Serial.println("main: BOOT click -> pairing mode (5 min, or until paired)");
+                face_show_pairing_setup();
+                ble_sync_start_pairing();
             }
-            // JARVIS DISABLED ON HARDWARE (deliberate, temporary).
-            //
-            // A BOOT click in IDLE used to start a Jarvis voice-command
-            // capture. That entry point is switched off: the live Deepgram
-            // Voice Agent path reproduced a hardware hang on its first real
-            // test and has never been root-caused with a serial monitor
-            // attached (see voice_agent.cpp's top comment), and the
-            // record-to-SD fallback produces command recordings that need
-            // the Mac to interpret them anyway.
-            //
-            // Left as commented-out code rather than deleted because the
-            // whole supporting cast is still present and working -- the
-            // finish/cancel branches above, s_jarvisActive/s_jarvisLive, the
-            // drawJarvis() face scene, voice_agent.cpp, jarvis.py, the
-            // dashboard's /jarvis page. Re-enabling is uncommenting this
-            // block; deleting it would mean rebuilding all of that from the
-            // history. With no way to START a capture, s_jarvisActive is
-            // never true, so those other branches are simply unreachable
-            // rather than broken.
-            //
-            // else if (s_state == AppState::IDLE) {
-            //     s_state = AppState::RECORDING;
-            //     s_jarvisActive = true;
-            //     power_mgr_set_profile(PowerProfile::MEDIUM_160, "jarvis capture");
-            //     if (wifi_sync_http_proven_reachable() && voice_agent_live_enabled()) {
-            //         s_jarvisLive = true;
-            //         voice_agent_start_command();
-            //     } else {
-            //         s_jarvisLive = false;
-            //         recorder_start(true);
-            //     }
-            // }
             Serial.printf("timing: BOOT click handled in %lums (wifiOnAtClick=%d wifiXferAtClick=%d)\n",
                           (unsigned long)(millis() - tClick), wifiOnAtClick, wifiXferAtClick);
         }
@@ -403,9 +410,19 @@ static void syncWatchTask(void *arg) {
 
 static void faceTask(void *arg) {
     for (;;) {
-        if (face_current_status() == Status::PAIRING && ble_sync_pairing_timed_out()) {
-            Serial.println("main: pairing window timed out, back to normal");
-            ble_sync_stop_pairing();
+        // Drop the pairing screen once the window is over, HOWEVER it ended.
+        //
+        // This used to test pairing_timed_out() alone, which only covers the
+        // window expiring. The other ending -- a central connects and pairing
+        // SUCCEEDS -- clears s_pairingActive inside ble_sync's onConnect, at
+        // which point timed_out() is false forever and this never fired: the
+        // first-time setup screen stayed on the display permanently after a
+        // successful pair, and e-paper holds its last image, so it survived
+        // sleep and reboots too. Asking "is the window still open" handles
+        // both endings.
+        if (face_current_status() == Status::PAIRING && !ble_sync_is_pairing()) {
+            Serial.println("main: pairing window closed (paired or timed out), back to normal");
+            ble_sync_stop_pairing(); // no-op if it already ended itself
             face_clear_status();
         }
         face_update(s_state == AppState::RECORDING, s_jarvisActive);

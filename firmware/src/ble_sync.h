@@ -76,10 +76,18 @@ void ble_sync_forget_and_repair();
 // advertising state.
 void ble_sync_reconcile_advertising();
 
-// True once a fast-pairing window's ~120s timeout has elapsed without a
-// connection -- main.cpp polls this to know when to drop Status::PAIRING
-// back to NONE on its own (independent of BOOT-button activity).
+// True once a fast-pairing window's 5-minute timeout has elapsed without a
+// connection.
 bool ble_sync_pairing_timed_out();
+
+// True while a pairing window is open. main.cpp polls THIS (not
+// pairing_timed_out) to decide when to drop Status::PAIRING back to NONE,
+// because a window can close two ways: it times out, OR a central connects
+// and pairing succeeds. Only the first sets pairing_timed_out -- a
+// successful pair clears s_pairingActive, at which point timed_out is false
+// forever and the setup screen stayed on the e-paper permanently. Asking
+// "is the window still open" covers both endings.
+bool ble_sync_is_pairing();
 
 // Explicit pause/resume around light sleep (main.cpp's sleepWatchTask) --
 // same underlying stopAdvertising()/resumeIdleAdvertising() pair
