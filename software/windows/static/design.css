@@ -119,3 +119,35 @@ button.danger:hover, .danger:hover { background: var(--error); color: #fff; }
 .badge.dest { background: var(--accent); color: #fff; opacity: 0.85; }
 
 .empty { color: var(--muted2); }
+
+/* BLE pairing widget -- rendered by static/ble_pair.js into whatever
+   container mounts it (the Bluetooth card in Settings, the standalone /pair
+   page). Lives here rather than in either template because there is exactly
+   one widget and it must look the same wherever it appears. */
+.blep-status { font-size: 0.85rem; }
+.blep-headline { font-weight: 600; }
+.blep-elapsed { color: var(--muted2); }
+.blep-why { color: var(--muted); font-size: 0.78rem; line-height: 1.5; margin-top: 0.4rem; }
+.blep-list { margin-top: 0.6rem; }
+.blep-device {
+  display: flex; align-items: flex-start; gap: 0.5rem;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 0.5rem 0.7rem; margin-bottom: 0.4rem; cursor: pointer; font-size: 0.85rem;
+}
+.blep-device:hover { border-color: var(--accent); }
+/* design.css's global `input { width: 100% }` would otherwise stretch this
+   radio across the whole row -- the same trap every other checkbox in this
+   app has had to override explicitly. */
+.blep-device input { width: 14px !important; height: 14px; margin: 0.15rem 0 0 0; flex: none; cursor: pointer; }
+.blep-device > span { min-width: 0; }
+.blep-addr { display: block; color: var(--muted2); font-size: 0.72rem; overflow-wrap: anywhere; }
+.blep-current { color: var(--accent); font-size: 0.72rem; }
+.blep-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.blep-actions button { margin-top: 0.7rem; padding: 0.35rem 0.8rem; font-size: 0.8rem; }
+.blep-result { font-size: 0.8rem; color: var(--accent); margin-top: 0.4rem; }
+.blep-spinner {
+  display: inline-block; width: 9px; height: 9px; margin-right: 0.35rem;
+  border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%;
+  animation: blep-spin 0.8s linear infinite; vertical-align: -1px;
+}
+@keyframes blep-spin { to { transform: rotate(360deg); } }

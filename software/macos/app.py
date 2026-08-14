@@ -138,7 +138,7 @@ def _asset_fingerprint() -> str:
     # Bare relative paths, matching the StaticFiles/Jinja2Templates mounts
     # above -- main_packaged.py chdir()s to sys._MEIPASS before importing
     # this module, so these resolve in both dev and packaged runs.
-    for name in ("static/app.js", "static/design.css"):
+    for name in ("static/app.js", "static/design.css", "static/ble_pair.js"):
         try:
             with open(name, "rb") as f:
                 h.update(f.read())
@@ -942,15 +942,78 @@ async def pair_form(request: Request, next: str = "/"):
                       "Bluetooth permission to this app. Check System Settings → Privacy & Security → "
                       "Bluetooth, then reload this page.")
         else:
-            error = (f"Bluetooth scan saw {total_seen} other device(s) nearby, but none advertising as "
-                      "\"EpaperTranscriber*\" — make sure the device is powered on, in range, and running "
-                      "firmware with BLE sync enabled, then reload this page.")
+            # Deliberately NOT "your device is missing" any more. A powered-on,
+            # in-range device is invisible to any given scan ~97% of the time
+            # (see pair_scan's docstring for the duty-cycle arithmetic), so
+            # the old wording accused the hardware of a fault that was really
+            # a too-short look. The page keeps scanning from here.
+            error = None
     except Exception as e:
         devices, error = [], str(e)
     return templates.TemplateResponse(
         request, "pair.html",
         {"devices": devices, "error": error, "current_address": config.PAIRED_BLE_ADDRESS, "next": next},
     )
+
+
+@app.get("/pair/scan")
+def pair_scan(request: Request):
+    """One BLE scan, as JSON, so /pair can keep looking instead of taking a
+    single 10-second glance.
+
+    That single glance was the whole bug behind "Bluetooth scan saw 35 other
+    device(s) nearby, but none advertising as EpaperTranscriber*" on a device
+    that was demonstrably powered on and had just recorded. The firmware
+    light-sleeps ~5s after going idle and PAUSES advertising while asleep
+    (main.cpp's ble_sync_pause_advertising_for_sleep call); it then wakes on a
+    timer every 5 min (pending recordings) or 10 min (nothing pending) and
+    holds the advertising window open for just 8 seconds
+    (main.cpp's vTaskDelay(8000) on the TIMER-wake path). That is roughly a 3%
+    duty cycle -- so a lone 10s scan misses far more often than it hits, and
+    the page then blamed the device. The pipeline's own logs show exactly
+    this: EpaperTranscriber-6D0D present at 12:22:59 and 12:29:10, absent in
+    every scan between.
+
+    The device is not the thing that needs fixing here; the looking is. The
+    client polls this until it hits or the user gives up.
+    """
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    if config.SYNC_TRANSPORT != "ble":
+        return JSONResponse({"devices": [], "total_seen": 0,
+                             "error": "Pairing only applies when Sync Transport is set to BLE."})
+    import ble_device_client
+    try:
+        devices, total_seen = ble_device_client.discover_devices_with_diagnostics()
+        return JSONResponse({"devices": devices, "total_seen": total_seen, "error": None})
+    except Exception as e:
+        return JSONResponse({"devices": [], "total_seen": 0, "error": str(e)})
+
+
+@app.post("/pair/select")
+async def pair_select(request: Request):
+    """Pairs, and returns JSON instead of redirecting.
+
+    The form-post sibling below navigates away, which is the whole reason the
+    Bluetooth card in Settings used to punt to a separate page: pairing meant
+    leaving. This lets the card scan, pair and confirm in place. Kept as a
+    separate route rather than content-negotiating on POST /pair so the
+    no-JavaScript form path keeps its plain redirect semantics.
+    """
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "expected a JSON body"}, status_code=400)
+    address = (body or {}).get("address", "").strip()
+    if not address:
+        return JSONResponse({"error": "no address given"}, status_code=400)
+    settings.update(paired_ble_address=address)
+    config.reload_settings()
+    return JSONResponse({"ok": True, "address": address})
 
 
 @app.post("/pair")
@@ -961,6 +1024,18 @@ def pair_submit(request: Request, address: str = Form(...), next: str = Form("/"
     settings.update(paired_ble_address=address)
     config.reload_settings()
     return RedirectResponse(next, status_code=303)
+
+
+@app.post("/pair/forget")
+def pair_forget_json(request: Request):
+    """JSON sibling of /settings/ble/forget, so the Bluetooth card can unpair
+    in place rather than round-tripping through a redirect."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    settings.delete("paired_ble_address")
+    config.reload_settings()
+    return JSONResponse({"ok": True})
 
 
 @app.post("/settings/ble/forget")
@@ -1180,6 +1255,48 @@ def api_wifi_scan(request: Request):
             return {"networks": device_client.scan_wifi_networks()}
         import ble_device_client
         return {"networks": ble_device_client.scan_wifi_networks()}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=503)
+
+
+@app.get("/api/wifi-saved")
+def api_wifi_saved(request: Request):
+    """The device's saved-network list.
+
+    WiFi-only: reading it needs the device's HTTP server, and there's no BLE
+    characteristic for it. That's an acceptable limit because the list is
+    informational -- the roaming itself is entirely on-device and needs
+    nothing from here. The UI just hides the section when this 503s.
+    """
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    if not poller.wifi_base_url_if_reachable():
+        return JSONResponse({"error": "device not reachable over WiFi"}, status_code=503)
+    try:
+        import device_client
+        return {"networks": device_client.get_saved_wifi_networks()}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=503)
+
+
+@app.post("/api/wifi-forget")
+async def api_wifi_forget(request: Request):
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "expected a JSON body"}, status_code=400)
+    ssid = (body or {}).get("ssid", "").strip()
+    if not ssid:
+        return JSONResponse({"error": "no ssid given"}, status_code=400)
+    if not poller.wifi_base_url_if_reachable():
+        return JSONResponse({"error": "device not reachable over WiFi"}, status_code=503)
+    try:
+        import device_client
+        return {"networks": device_client.forget_wifi_network(ssid)}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=503)
 

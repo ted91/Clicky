@@ -123,6 +123,29 @@ def get_wifi_status() -> dict:
     return resp.json()
 
 
+def get_saved_wifi_networks() -> list:
+    """The networks the device will roam between, most-recent first.
+
+    The device stores up to 8 and joins whichever is actually in range (see
+    wifi_sync.cpp's startNetworkSelection), so this is a list, not the single
+    "current" network. Passwords are never returned by the device.
+    """
+    resp = requests.get(f"{config.DEVICE_BASE_URL}/wifi/saved", timeout=TIMEOUT_SECONDS)
+    resp.raise_for_status()
+    return resp.json().get("networks", [])
+
+
+def forget_wifi_network(ssid: str) -> list:
+    """Drops one saved network. Returns the remaining list."""
+    resp = requests.post(
+        f"{config.DEVICE_BASE_URL}/wifi/forget",
+        data={"ssid": ssid},
+        timeout=TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    return resp.json().get("networks", [])
+
+
 def scan_wifi_networks() -> list:
     import time
     resp = requests.post(f"{config.DEVICE_BASE_URL}/wifi/scan", timeout=TIMEOUT_SECONDS)

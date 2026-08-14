@@ -39,10 +39,16 @@ DATA_CHAR_UUID = "e9a10003-1000-4000-8000-00805f9b34fb"
 WIFI_STATUS_CHAR_UUID = "e9a10004-1000-4000-8000-00805f9b34fb"
 WIFI_SCAN_CHAR_UUID = "e9a10005-1000-4000-8000-00805f9b34fb"
 
-# How long to poll after kicking off a scan before giving up -- the
-# firmware's WiFi.scanNetworks(async) typically finishes in 2-4s; this just
-# needs to comfortably exceed that, not match it exactly.
-WIFI_SCAN_POLL_TIMEOUT_SECONDS = 10
+# How long to poll after kicking off a scan before giving up. The firmware's
+# WiFi.scanNetworks(async) finishes in 2-4s on an idle radio -- but this scan
+# is requested OVER BLE, so a BLE connection is by definition active while it
+# runs, and the ESP32-S3 time-division-multiplexes one radio between the two
+# (the coexistence constraint documented at length around BACKOFF_MS in
+# wifi_sync.cpp). A full-channel scan sharing the radio with an active BLE
+# link routinely overruns the idle-radio figure, and the old 10s ceiling then
+# reported "No networks found nearby" for a scan that simply hadn't finished
+# -- indistinguishable, to the user, from a device that can't see any WiFi.
+WIFI_SCAN_POLL_TIMEOUT_SECONDS = 30
 WIFI_SCAN_POLL_INTERVAL_SECONDS = 0.5
 
 # Transfer uses notify() (see ble_sync.cpp), not indicate() -- indicate()
@@ -94,6 +100,15 @@ _loop_lock = threading.Lock()
 _client = None  # persistent bleak.BleakClient, reused across calls
 _client_lock = None  # asyncio.Lock, created inside the loop thread
 
+# Serialises BleakScanner.discover() calls. Everything here runs on ONE
+# shared loop, but run_coroutine_threadsafe schedules concurrently -- so the
+# poller's periodic sync scan and the /pair page's scan could previously
+# overlap on CoreBluetooth's single scanner. That was survivable while /pair
+# did exactly one 10s scan; it is not once /pair polls continuously for
+# minutes (see pair_scan in app.py), which is most of the time the poller is
+# also trying to scan.
+_scan_lock = None  # asyncio.Lock, created inside the loop thread
+
 # name -> bytes already received from a stalled transfer, so the next
 # attempt can resume instead of restarting from zero (see
 # _download_recording_async and ble_sync.cpp's GET <name> <offset>).
@@ -116,13 +131,25 @@ def _run_coro(coro, timeout: float = CALL_TIMEOUT_SECONDS):
     return future.result(timeout=timeout)
 
 
+async def _scan_all():
+    """One raw scan, serialised against every other scan in the process.
+    Returns bleak's own BLEDevice objects so callers can hand a match
+    straight to BleakClient() without paying for a second scan."""
+    global _scan_lock
+    from bleak import BleakScanner
+    if _scan_lock is None:
+        _scan_lock = asyncio.Lock()  # safe: only ever reached on the loop thread
+    async with _scan_lock:
+        devices = await BleakScanner.discover(timeout=config.BLE_SCAN_TIMEOUT_SECONDS)
+    log.info("BLE scan saw %d device(s) total: %s", len(devices), [d.name for d in devices if d.name])
+    return devices
+
+
 async def _discover_raw():
     """Returns actual BLEDevice objects (bleak's own type) matching the
     prefix — internal use, so callers can hand them straight to
     BleakClient() without a second scan."""
-    from bleak import BleakScanner
-    devices = await BleakScanner.discover(timeout=config.BLE_SCAN_TIMEOUT_SECONDS)
-    log.info("BLE scan saw %d device(s) total: %s", len(devices), [d.name for d in devices if d.name])
+    devices = await _scan_all()
     return [d for d in devices if d.name and d.name.startswith(DEVICE_NAME_PREFIX)]
 
 
@@ -132,8 +159,7 @@ async def _discover_devices_async():
 
 
 async def _discover_devices_with_diagnostics_async():
-    from bleak import BleakScanner
-    devices = await BleakScanner.discover(timeout=config.BLE_SCAN_TIMEOUT_SECONDS)
+    devices = await _scan_all()
     matches = [d for d in devices if d.name and d.name.startswith(DEVICE_NAME_PREFIX)]
     return [{"name": d.name, "address": d.address} for d in matches], len(devices)
 

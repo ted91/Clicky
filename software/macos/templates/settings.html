@@ -4,6 +4,9 @@
   <meta charset="utf-8">
   <title>Settings — Clicky Notes</title>
   <link rel="stylesheet" href="/static/design.css?v={{ asset_v }}">
+  <!-- Defines initBlePairing(), used by the Bluetooth card below. Not
+       deferred: the inline script at the bottom of this page calls it. -->
+  <script src="/static/ble_pair.js?v={{ asset_v }}"></script>
   <style>
     /* Page-specific rules only -- shared tokens/reset/nav/buttons/badges/
        forms now live in /static/design.css.
@@ -134,6 +137,16 @@
               <button type="button" class="secondary" id="use-mac-btn" onclick="useMacNetwork()">Use my Mac's network</button>
               <span class="step" id="scan-status"></span>
             </div>
+            <!-- Saved networks: the device keeps up to 8 and joins whichever
+                 is in range, so adding one here does not replace the last.
+                 Hidden entirely when the device isn't reachable over WiFi
+                 (the list can only be read over HTTP) -- the roaming works
+                 regardless, this is just visibility into it. -->
+            <div id="wifi-saved-wrap" style="display:none;margin-top:0.9rem;">
+              <div class="section-label" style="margin-bottom:0.3rem;">Saved networks</div>
+              <div id="wifi-saved-list"></div>
+              <p class="step">The device joins whichever of these is in range.</p>
+            </div>
             <form method="post" action="/settings/wifi/connect">
               <label for="ssid">Network name (SSID)</label>
               <input type="text" id="ssid" name="ssid" list="wifi-networks" autocomplete="off" required>
@@ -144,20 +157,25 @@
             </form>
           </div>
 
-          <!-- Bluetooth -->
+          <!-- Bluetooth -- scanning, pairing and unpairing all happen in this
+               card. It used to link out to /pair, which meant leaving Settings
+               to do one of the slowest things in the app (scanning can take
+               minutes, see static/ble_pair.js) and then coming back. -->
           <div class="card" data-panel="bluetooth">
             <h2>Bluetooth</h2>
             <p class="desc">Works even if the device can't join WiFi.</p>
-            {% if current.paired_ble_address %}
-              <div class="ble-current">Paired: {{ current.paired_ble_address }}</div>
-              <form method="post" action="/settings/ble/forget" style="display:inline;">
-                <input type="hidden" name="next" value="/settings">
-                <button type="submit" class="secondary">Forget this device</button>
-              </form>
-            {% else %}
-              <p class="step">Not paired -- optional if only one device is in range.</p>
-            {% endif %}
-            <a href="/pair?next=/settings"><button type="button" class="secondary">Scan &amp; pair a BLE device</button></a>
+            <div id="ble-paired-state">
+              {% if current.paired_ble_address %}
+                <div class="ble-current">Paired: <span id="ble-paired-address">{{ current.paired_ble_address }}</span></div>
+                <button type="button" class="secondary" id="ble-forget-btn">Forget this device</button>
+              {% else %}
+                <p class="step" id="ble-not-paired">Not paired -- optional if only one device is in range.</p>
+              {% endif %}
+            </div>
+            <!-- Rendered by initBlePairing(); the scan does not start until
+                 the user asks, so merely opening Settings doesn't tie up the
+                 Bluetooth radio the sync poller is also using. -->
+            <div id="ble-pair-widget" style="margin-top:0.8rem;"></div>
           </div>
 
           <!-- Notion -->
@@ -732,6 +750,112 @@
         }
       });
     }
+
+    // --- Saved WiFi networks -------------------------------------------
+    // The device roams between these on its own; this is read-only visibility
+    // plus a Forget button. Requires the device on WiFi (see /api/wifi-saved),
+    // so the whole block stays hidden when it isn't reachable rather than
+    // showing an error for something the user can't act on.
+    (function () {
+      const wrap = document.getElementById("wifi-saved-wrap");
+      const list = document.getElementById("wifi-saved-list");
+      if (!wrap || !list) return;
+
+      function esc(s) {
+        return String(s).replace(/[&<>"']/g, c =>
+          ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+      }
+
+      function render(networks) {
+        if (!networks || !networks.length) { wrap.style.display = "none"; return; }
+        wrap.style.display = "";
+        list.innerHTML = "";
+        networks.forEach(n => {
+          const row = document.createElement("div");
+          row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:0.5rem;font-size:0.85rem;padding:0.25rem 0;";
+          row.innerHTML =
+            "<span>" + esc(n.ssid) +
+            (n.current ? ' <span class="blep-current">current</span>' : "") + "</span>";
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "secondary";
+          btn.textContent = "Forget";
+          btn.style.cssText = "margin-top:0;padding:0.15rem 0.55rem;font-size:0.75rem;";
+          btn.addEventListener("click", async () => {
+            btn.disabled = true;
+            try {
+              const res = await fetch("/api/wifi-forget", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ ssid: n.ssid }),
+              });
+              const data = await res.json();
+              if (!res.ok || data.error) throw new Error(data.error || "failed");
+              render(data.networks);
+            } catch (e) {
+              btn.disabled = false;
+              alert("Could not forget that network: " + e.message);
+            }
+          });
+          row.appendChild(btn);
+          list.appendChild(row);
+        });
+      }
+
+      fetch("/api/wifi-saved")
+        .then(r => r.ok ? r.json() : null)
+        .then(d => { if (d && !d.error) render(d.networks); })
+        .catch(() => {}); // device offline -- section simply stays hidden
+    })();
+
+    // --- Bluetooth card: scan, pair and unpair without leaving Settings ---
+    // The widget itself lives in /static/ble_pair.js so the standalone /pair
+    // page runs the exact same code.
+    (function () {
+      const mount = document.getElementById("ble-pair-widget");
+      if (!mount || typeof initBlePairing !== "function") return;
+      const pairedState = document.getElementById("ble-paired-state");
+      const currentAddress = {{ (current.paired_ble_address or "") | tojson }};
+
+      function renderPaired(address) {
+        pairedState.innerHTML =
+          '<div class="ble-current">Paired: <span id="ble-paired-address"></span></div>' +
+          '<button type="button" class="secondary" id="ble-forget-btn">Forget this device</button>';
+        pairedState.querySelector("#ble-paired-address").textContent = address;
+        wireForget();
+      }
+
+      function renderUnpaired() {
+        pairedState.innerHTML =
+          '<p class="step" id="ble-not-paired">Not paired -- optional if only one device is in range.</p>';
+      }
+
+      function wireForget() {
+        const btn = document.getElementById("ble-forget-btn");
+        if (!btn) return;
+        btn.addEventListener("click", async () => {
+          btn.disabled = true;
+          try {
+            const res = await fetch("/pair/forget", { method: "POST" });
+            const data = await res.json();
+            if (!res.ok || data.error) throw new Error(data.error || "failed");
+            renderUnpaired();
+          } catch (e) {
+            btn.disabled = false;
+            alert("Could not unpair: " + e.message);
+          }
+        });
+      }
+
+      wireForget();
+      // autoStart false: opening Settings shouldn't seize the Bluetooth radio
+      // that the sync poller is also scanning with -- the user asks for it.
+      initBlePairing(mount, {
+        currentAddress: currentAddress,
+        autoStart: false,
+        onPaired: (address) => { renderPaired(address); },
+      });
+    })();
   </script>
 </body>
 </html>

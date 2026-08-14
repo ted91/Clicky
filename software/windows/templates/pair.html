@@ -4,37 +4,35 @@
   <meta charset="utf-8">
   <title>Pair device — Clicky Notes</title>
   <link rel="stylesheet" href="/static/design.css?v={{ asset_v }}">
+  <script src="/static/ble_pair.js?v={{ asset_v }}"></script>
   <style>
     body { max-width: 480px; margin: 3rem auto; padding: 0 1rem; }
-    .device { display: block; border: 1px solid var(--border); background: var(--card-bg); border-radius: var(--radius); padding: 0.9rem 1rem; margin-bottom: 0.75rem; cursor: pointer; }
-    .device:hover { border-color: var(--accent); }
-    .device input { margin-right: 0.6rem; }
-    .device .addr { color: var(--muted); font-size: 0.8rem; }
-    .current { color: var(--accent); font-size: 0.8rem; }
+    .pair-panel { border: 1px solid var(--border); background: var(--card-bg); border-radius: var(--radius); padding: 1rem 1.2rem; }
     p a { color: var(--muted); font-size: 0.85rem; }
   </style>
 </head>
 <body>
   <h1>Pair a device</h1>
-  <p class="hint">Scanning for nearby devices advertising as "EpaperTranscriber*". Power the device on and reload this page if nothing shows up.</p>
 
   {% if error %}<div class="error">{{ error }}</div>{% endif %}
 
-  {% if devices %}
-    <form method="post" action="/pair">
-      <input type="hidden" name="next" value="{{ next or '/' }}">
-      {% for d in devices %}
-        <label class="device">
-          <input type="radio" name="address" value="{{ d.address }}" {{ "checked" if d.address == current_address else "" }} required>
-          {{ d.name }}
-          {% if d.address == current_address %}<span class="current">(currently paired)</span>{% endif %}
-          <div class="addr">{{ d.address }}</div>
-        </label>
-      {% endfor %}
-      <button type="submit">Pair selected device</button>
-    </form>
-  {% endif %}
+  <!-- Same widget the Settings Bluetooth card mounts (static/ble_pair.js).
+       Pairing normally happens inline in Settings now; this page remains for
+       deep links and for anyone who lands here directly. -->
+  <div class="pair-panel" id="ble-pair-widget"></div>
 
   <p><a href="{{ next or '/' }}">&larr; Back</a></p>
+
+  <script>
+    initBlePairing(document.getElementById("ble-pair-widget"), {
+      currentAddress: {{ (current_address or "") | tojson }},
+      // Server already ran one scan rendering this page -- hand those over so
+      // an awake device is offered immediately rather than rescanned for.
+      initialDevices: {{ devices | tojson }},
+      // Unlike the Settings card, arriving HERE is an explicit request to
+      // pair, so scanning starts on its own.
+      autoStart: true,
+    });
+  </script>
 </body>
 </html>
