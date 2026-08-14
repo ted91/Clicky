@@ -381,17 +381,26 @@ static void drawStatus(Status status) {
 // almost the whole panel for actual instructions -- a returning, already-
 // paired user never sees this at all, so it doesn't need to match the
 // idle smiley's playful aesthetic, just be readable at a glance.
-// A BOOT long-press on an ALREADY-paired device is a different gesture --
-// ble_sync_forget_and_repair() (main.cpp), which re-enters this same
-// pairing state deliberately, as the one user-reachable way to make a
-// paired device discoverable to a new laptop again.
+// Shown two ways now: automatically at boot on a never-paired device, and
+// on demand whenever the user presses the PAIR button (main.cpp's
+// bootButtonTask). The wording has to work for both, so it describes what
+// is happening ("visible for 5 minutes") rather than assuming first-run.
 static void drawPairingSetup() {
-    drawTextCentered("SETUP", 8, 2);
+    drawTextCentered("PAIRING", 8, 2);
+    // Every line here was wrong after the button and Settings changes:
+    //   - "HOLD THIS BUTTON TO SKIP" -- a long press now REBOOTS the device
+    //     (main.cpp), so following the instruction did something quite
+    //     different from what it promised.
+    //   - "SETTINGS - DEVICE - SCAN AND PAIR BLE" -- pairing moved into the
+    //     Bluetooth card and no longer opens a separate page.
+    // On-device text has no other source of truth and nobody re-reads it, so
+    // it goes stale silently; it is worth updating in the same change that
+    // moves the thing it describes.
     drawTextWrapped(
-        "1. OPEN THE CLICKY APP ON YOUR COMPUTER. "
-        "2. GO TO SETTINGS - DEVICE - SCAN AND PAIR BLE. "
-        "3. ENTER YOUR WIFI NETWORK NAME AND PASSWORD THERE TOO. "
-        "HOLD THIS BUTTON TO SKIP.",
+        "1. OPEN CLICKY ON YOUR COMPUTER. "
+        "2. SETTINGS - BLUETOOTH - SCAN FOR A DEVICE. "
+        "3. ADD YOUR WIFI THERE TOO. "
+        "VISIBLE 5 MIN. PRESS AGAIN TO STOP.",
         36, 1, 10, EPD_WIDTH - 8);
 }
 
@@ -445,20 +454,30 @@ static void drawTextAt(int x, int y, const char *text, int scale) {
 }
 
 // BOOT-button-function legend — labels what BOOT currently does, since it's
-// multi-function depending on state (see main.cpp's bootButtonTask):
-// starts/finishes a Jarvis capture when idle/Jarvis-recording, cancels a
-// live memo recording instead (started by PWR), or dismisses a pending
-// notification. PWR's own "Record"/"Stop"/"Cancel" legend lives in the
-// bottom indicator strip instead (see drawIndicatorStrip).
+// multi-function depending on state (see main.cpp's bootButtonTask): opens a
+// pairing window when idle, cancels a live memo recording (started by PWR),
+// or dismisses a pending notification. PWR's own "Record"/"Stop"/"Cancel"
+// legend lives in the bottom indicator strip instead (see
+// drawIndicatorStrip).
 static const int STATUS_LEGEND_LABEL_Y = 148;
 
 static void drawButtonLabels(bool recording, bool jarvisActive, bool notificationActive) {
     // Recording takes priority over a pending notification here too (same
     // precedence as face_update()'s own scene selection).
+    //
+    // The idle label is PAIR, not JARVIS -- BOOT stopped starting voice
+    // captures and became the pairing button (main.cpp's bootButtonTask).
+    // This legend is the only place the button's purpose is stated ON THE
+    // DEVICE, so leaving it stale meant the hardware advertised a feature
+    // that no longer exists and hid the one that replaced it.
+    //
+    // The jarvisActive branch is kept: it is unreachable while Jarvis has no
+    // hardware entry point, and is exactly what needs to be here again if
+    // that is switched back on.
     const char *statusLabel = jarvisActive ? "STOP"
                              : recording ? "CANCEL"
                              : notificationActive ? "CLEAR"
-                             : "JARVIS";
+                             : "PAIR";
     int statusWidth = (int)strlen(statusLabel) * 6 - 1; // (5+1)*scale1 - 1
     drawTextAt(EPD_WIDTH - 4 - statusWidth, STATUS_LEGEND_LABEL_Y, statusLabel, 1);
 }
