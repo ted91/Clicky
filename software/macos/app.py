@@ -1078,6 +1078,7 @@ def settings_audio(
     request: Request,
     filter_background_conversations: str = Form(""),
     classify_context_fit: str = Form(""),
+    discard_silent_recordings: str = Form(""),
 ):
     """Toggles audio_analysis.py's volume-based background-conversation
     filtering, and separately backlog #10's content-based chunk
@@ -1093,6 +1094,7 @@ def settings_audio(
     settings.update(
         filter_background_conversations=bool(filter_background_conversations),
         classify_context_fit=bool(classify_context_fit),
+        discard_silent_recordings=bool(discard_silent_recordings),
     )
     return RedirectResponse("/settings?panel=providers", status_code=303)
 

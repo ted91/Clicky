@@ -436,6 +436,52 @@ async def sync_once():
         import adpcm
         wav_bytes = adpcm.maybe_decode(wav_bytes)
 
+        # Blank audio never reaches the pipeline. A recording started by
+        # accident (pocket press, mic failure, stopped before anyone spoke)
+        # otherwise costs a transcription API call, a summarization call, a
+        # dashboard card and a Notion/Obsidian page, all to say nothing --
+        # and sits on the SD card forever, since SD recordings are never
+        # normally deleted.
+        #
+        # Deliberately AFTER the download: "blank" can only be known by
+        # measuring the audio, and the device has no VAD. The saving is the
+        # processing and the card space, not the transfer.
+        #
+        # Fail-safe throughout: is_effectively_silent returns False if it
+        # can't measure the file, the threshold is set at dead-air level
+        # rather than quiet-speech level, and the decision uses the LOUDEST
+        # window rather than the average (a long recording containing a few
+        # seconds of real speech must survive). A delete here is
+        # irreversible, so every ambiguity resolves toward keeping it.
+        if settings.get_all().get("discard_silent_recordings", True):
+            import audio_analysis
+            silent, peak_db = audio_analysis.is_effectively_silent(wav_bytes)
+            if silent:
+                log.info("discarding %s -- no audio in it (loudest moment %.1f dBFS, below the %.1f dBFS floor)",
+                         name, peak_db if peak_db is not None else -120.0,
+                         audio_analysis.SILENCE_THRESHOLD_DB)
+                try:
+                    if name == RAM_RECORDING_NAME:
+                        await asyncio.to_thread(transport.delete_recording, name)
+                    else:
+                        # force=true -- the routine sync-confirm delete
+                        # deliberately refuses to touch SD files, so this is
+                        # the same explicit path the dashboard's "delete from
+                        # device" uses.
+                        delete_from_sd = getattr(transport, "delete_recording_from_sd", None)
+                        if delete_from_sd:
+                            await asyncio.to_thread(delete_from_sd, name)
+                    log.info("deleted blank recording %s from the device", name)
+                except Exception as e:
+                    # Not fatal, and not marked as known either: if the
+                    # delete failed the device keeps offering it, and the
+                    # next cycle re-measures and retries. Re-running this on
+                    # the same bytes is idempotent.
+                    log.warning("could not delete blank %s from the device (will retry next cycle): %s", name, e)
+                import analytics
+                analytics.track_event("blank_recording_discarded")
+                continue
+
         content_hash = hashlib.md5(wav_bytes).hexdigest()
         # RAM recordings skip the pre-download is_known_by_size gate above,
         # so a post-download check is needed here instead -- but by actual

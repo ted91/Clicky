@@ -61,6 +61,73 @@ def _rms_db(samples, sample_width: int) -> float:
     return 20 * math.log10(rms / max_amplitude)
 
 
+# A recording whose LOUDEST moment never reaches this is dead air -- a
+# recording that started by accident, a mic that failed, a button pressed in
+# a pocket. Real room tone on a live mic sits comfortably above it, and
+# speech is 30-40 dB above that again, so this is deliberately nowhere near
+# "quiet speech": it is the floor for "nothing was captured at all".
+#
+# Erring low on purpose. Being wrong in the "keep it" direction costs a few
+# MB of SD card and one useless dashboard card; being wrong in the "delete
+# it" direction destroys a recording irrecoverably, since discard_if_silent
+# deletes from the card as well (see poller). The asymmetry is the whole
+# reason this is -60 and not a friendlier-looking -45.
+SILENCE_THRESHOLD_DB = -60.0
+
+# Loudness is measured over short windows and the PEAK window decides,
+# NOT the whole-file average. Averaging is the obvious implementation and
+# it is wrong in the one case that matters most: a 30-minute recording
+# holding ten seconds of real speech averages out to near-silence and would
+# be deleted. Peak-of-windows means any single second of real audio anywhere
+# in the file saves the whole recording.
+SILENCE_WINDOW_SECONDS = 1.0
+
+
+def peak_window_db(wav_bytes: bytes) -> float:
+    """dBFS of the loudest ~1s window. -120.0 for digital silence.
+
+    Raises on unreadable/unsupported audio rather than guessing -- callers
+    deciding whether to DELETE something must treat "couldn't measure it" as
+    "keep it", which a raised exception makes explicit and a sentinel value
+    would quietly blur.
+    """
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        sample_width = wf.getsampwidth()
+        n_channels = wf.getnchannels()
+        framerate = wf.getframerate() or 1
+        n_frames = wf.getnframes()
+        if not n_frames:
+            return -120.0
+        window_frames = max(1, int(framerate * SILENCE_WINDOW_SECONDS))
+        peak = -120.0
+        remaining = n_frames
+        while remaining > 0:
+            chunk = wf.readframes(min(window_frames, remaining))
+            if not chunk:
+                break
+            remaining -= min(window_frames, remaining)
+            samples = _first_channel_samples(chunk, sample_width, n_channels)
+            level = _rms_db(samples, sample_width)
+            if level > peak:
+                peak = level
+        return peak
+
+
+def is_effectively_silent(wav_bytes: bytes, threshold_db: float = SILENCE_THRESHOLD_DB):
+    """(is_silent, peak_db) -- True only when NO window reached threshold_db.
+
+    Fails safe: any unreadable/odd audio returns (False, ...) so the caller
+    keeps it. This decides whether a recording gets deleted off the SD card,
+    so "I don't know" must never mean "delete".
+    """
+    try:
+        peak = peak_window_db(wav_bytes)
+    except Exception as e:
+        log.warning("could not measure loudness (keeping the recording): %s", e)
+        return False, None
+    return peak < threshold_db, peak
+
+
 def _channel_samples(frame_bytes: bytes, sample_width: int, n_channels: int, channel_index: int):
     """De-interleaves to a specific channel's samples -- unlike
     _first_channel_samples, this doesn't assume both channels are the same

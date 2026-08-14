@@ -525,6 +525,17 @@
                        style="width:auto;display:inline-block;vertical-align:middle;">
                 Classify chunks by conversational fit
               </label>
+              <label>
+                <input type="checkbox" name="discard_silent_recordings" value="true"
+                       {{ "checked" if current.get("discard_silent_recordings", True) }}
+                       style="width:auto;display:inline-block;vertical-align:middle;">
+                Discard blank recordings
+              </label>
+              <p class="step">A recording with no audio in it (accidental
+                press, mic failure) is dropped instead of transcribed, and
+                deleted from the device's SD card. Uses the loudest moment,
+                not the average, so a long quiet recording containing real
+                speech is always kept.</p>
               <button type="submit">Save</button>
             </form>
           </div>
