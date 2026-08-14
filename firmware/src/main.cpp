@@ -16,25 +16,29 @@
 #include "esp_ota_ops.h"
 
 // PWR button: single click toggles memo recording on/off (same click sound
-// on both start and stop, see recorder.cpp's playClick()). While a Jarvis
-// voice command is being captured (BOOT was pressed first), PWR instead
-// CANCELS that Jarvis capture -- the two buttons are independent, symmetric
-// capture controls, and each one cancels the other's in-progress capture
-// rather than being ignored.
+// on both start and stop, see recorder.cpp's playClick()).
 // Holding PWR for ~3s to power the board on/off is handled entirely by the
 // board's own power circuit before firmware is even running -- nothing to
 // do here for that.
 //
-// BOOT button: dedicated Jarvis button, symmetric with PWR/Record. Single
-// click with nothing in progress starts a Jarvis voice-command capture
-// (drawJarvis() scene); single click again finishes it, same
-// start/stop-on-same-button behavior as PWR/Record. While a memo recording
-// is live instead (PWR was pressed first), BOOT cancels that memo -- the
-// audio is discarded entirely (SD file deleted / PSRAM never offered, see
-// recorder_cancel()), with a descending tone instead of the save click.
-// Status cycling has been dropped from both buttons entirely (custom
-// statuses are now Settings-dashboard-only, not physically cycled) -- BOOT
-// no longer has an idle-state fallback action beyond starting Jarvis.
+// BOOT button: cancel, dismiss, and reboot.
+//   single click, memo recording live -> cancels it, audio discarded
+//                                        entirely (SD file deleted / PSRAM
+//                                        never offered, see recorder_cancel())
+//   single click, notification showing -> dismisses it
+//   single click, idle                 -> nothing
+//   LONG PRESS, idle                   -> reboots the device
+//
+// The long press is the recovery gesture: a device with no WiFi credentials
+// and quiet BLE is unreachable by every transport, and without this the only
+// way out is cutting power -- which on a sealed unit with an internal LiPo
+// means waiting for the battery to die. It reboots only; nothing is erased.
+//
+// BOOT was the Jarvis button (single click started a voice-command capture).
+// That is switched off -- see the commented-out block in bootButtonTask for
+// why and how to bring it back. Status cycling was dropped from both buttons
+// earlier (custom statuses are Settings-dashboard-only now), so idle BOOT
+// currently has no short-press action at all.
 
 enum class AppState { IDLE, RECORDING, SYNCING };
 
@@ -252,54 +256,75 @@ static void bootButtonTask(void *arg) {
                 // A showing notification claims the click: dismiss it.
                 Serial.println("main: BOOT click -> dismiss notification");
                 face_dismiss_notification();
-            } else if (s_state == AppState::IDLE) {
-                s_state = AppState::RECORDING;
-                s_jarvisActive = true;
-                // Reverted from LOW_80 -- live-confirmed on real hardware
-                // (post-flash) that dropping to 80MHz made both buttons feel
-                // sluggish on battery, Jarvis noticeably worse (it does more
-                // work per capture: live-mode reachability/connection setup
-                // and, on the fallback path, more state juggling than a
-                // plain memo). 160MHz as the battery-conscious middle
-                // ground -- see recorder's identical comment above.
-                power_mgr_set_profile(PowerProfile::MEDIUM_160, "jarvis capture");
-                // Live Deepgram Voice Agent when reachable (see
-                // voice_agent.cpp -- answers questions immediately,
-                // independent of the Mac) -- else today's record-to-SD/RAM
-                // path, picked up and executed later by poller.py once the
-                // Mac is reachable.
-                // voice_agent_live_enabled() is off by default and reproduced
-                // a real hardware hang on its first live test -- see
-                // voice_agent.cpp's top comment. Do not remove this gate
-                // until that's root-caused and fixed with a serial monitor
-                // attached.
-                if (wifi_sync_http_proven_reachable() && voice_agent_live_enabled()) {
-                    Serial.println("main: BOOT click -> start Jarvis capture (live Deepgram Voice Agent)");
-                    s_jarvisLive = true;
-                    voice_agent_start_command();
-                } else {
-                    Serial.println("main: BOOT click -> start Jarvis capture (recording, no live connection)");
-                    s_jarvisLive = false;
-                    recorder_start(true);
-                }
             }
+            // JARVIS DISABLED ON HARDWARE (deliberate, temporary).
+            //
+            // A BOOT click in IDLE used to start a Jarvis voice-command
+            // capture. That entry point is switched off: the live Deepgram
+            // Voice Agent path reproduced a hardware hang on its first real
+            // test and has never been root-caused with a serial monitor
+            // attached (see voice_agent.cpp's top comment), and the
+            // record-to-SD fallback produces command recordings that need
+            // the Mac to interpret them anyway.
+            //
+            // Left as commented-out code rather than deleted because the
+            // whole supporting cast is still present and working -- the
+            // finish/cancel branches above, s_jarvisActive/s_jarvisLive, the
+            // drawJarvis() face scene, voice_agent.cpp, jarvis.py, the
+            // dashboard's /jarvis page. Re-enabling is uncommenting this
+            // block; deleting it would mean rebuilding all of that from the
+            // history. With no way to START a capture, s_jarvisActive is
+            // never true, so those other branches are simply unreachable
+            // rather than broken.
+            //
+            // else if (s_state == AppState::IDLE) {
+            //     s_state = AppState::RECORDING;
+            //     s_jarvisActive = true;
+            //     power_mgr_set_profile(PowerProfile::MEDIUM_160, "jarvis capture");
+            //     if (wifi_sync_http_proven_reachable() && voice_agent_live_enabled()) {
+            //         s_jarvisLive = true;
+            //         voice_agent_start_command();
+            //     } else {
+            //         s_jarvisLive = false;
+            //         recorder_start(true);
+            //     }
+            // }
             Serial.printf("timing: BOOT click handled in %lums (wifiOnAtClick=%d wifiXferAtClick=%d)\n",
                           (unsigned long)(millis() - tClick), wifiOnAtClick, wifiXferAtClick);
         }
-        // BOOT long-press: the only user-reachable way to make a paired
-        // device discoverable to a NEW laptop again. Live-confirmed bug --
-        // once a device is paired, on WiFi, and has served one HTTP
-        // request, BLE advertising is permanently suppressed
-        // (resumeIdleAdvertising() in ble_sync.cpp) with no way to
-        // re-arm it: `paired` is a sticky NVS flag that never clears
-        // itself, and ble_sync_start_pairing() otherwise only ever fires
-        // once, at boot, for a device that's never been paired at all. A
-        // second laptop's BLE scan saw the device nowhere, with no
-        // recovery path short of erasing NVS by hand. Gated on IDLE so a
-        // long BOOT hold mid-recording/capture can't hijack the gesture.
+        // BOOT long-press: reboot the device.
+        //
+        // This is the recovery gesture. A device can end up unreachable by
+        // every transport at once -- no WiFi credentials to connect with and
+        // BLE quiet -- and until now the only way out was physically cutting
+        // power, which on a sealed unit with an internal LiPo means waiting
+        // for the battery to die. A long press on a button that is otherwise
+        // unused (Jarvis being off) is a far better escape hatch.
+        //
+        // Reboot, NOT a factory reset: it clears no credentials, no pairing,
+        // no recordings. Nothing is lost by pressing it, which is what makes
+        // it safe to reach for when something looks wrong.
+        //
+        // This replaces the previous forget-pairing-and-re-advertise gesture,
+        // and subsumes what that was for. Its purpose was making a paired
+        // device discoverable to a NEW laptop again; a reboot now does that
+        // on its own, because every boot opens the post-boot discovery window
+        // (POST_BOOT_DISCOVERY_MS in ble_sync.cpp) during which the device
+        // advertises regardless of pairing or WiFi state. Rebooting gets the
+        // same result without throwing away a working pairing.
+        //
+        // Gated on IDLE so a long hold mid-recording can't reboot the device
+        // out from under a capture that hasn't been written to the card yet.
         if (get_bit_button(bits, 1) && s_state == AppState::IDLE) {
-            Serial.println("main: BOOT long-press -> forgetting pairing, re-entering pairing mode");
-            ble_sync_forget_and_repair();
+            Serial.println("main: BOOT long-press -> restarting");
+            Serial.flush(); // the restart cuts USB CDC mid-buffer otherwise
+            // Deliberately NOT drawing anything first. face_show_sleeping_screen()
+            // is the only "device is going away" scene and it says Sleeping,
+            // which would be wrong here and would stay wrong -- e-paper holds
+            // its last image unpowered, so a misleading frame would sit on
+            // the display for the whole reboot. setup() redraws the real face
+            // a second later anyway.
+            ESP.restart();
         }
     }
 }
