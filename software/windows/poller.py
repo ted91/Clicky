@@ -14,6 +14,7 @@ Runs as an asyncio task started from app.py's lifespan handler.
 import asyncio
 import hashlib
 import logging
+import os
 import time
 from datetime import datetime, timezone
 
@@ -485,6 +486,30 @@ def _apply_context_fit_to_segments(segments, merged_verdicts):
     return result
 
 
+def _fmt_offset(seconds) -> str:
+    s = int(seconds or 0)
+    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
+
+
+def _timestamped_transcript(segments, speaker_names: dict, screenshots: list) -> str:
+    """"[m:ss] Speaker: text" lines in time order, with each meeting screenshot inserted where it was
+    taken and the live English translation under translated lines -- see live_recorder.take_screenshot."""
+    events = []
+    for seg in segments:
+        sid = seg.get("speaker_id")
+        name = speaker_names.get(sid) or (f"Speaker {sid}" if sid is not None else "Speaker")
+        line = f"[{_fmt_offset(seg.get('start'))}] {name}: {(seg.get('text') or '').strip()}"
+        if seg.get("translation"):
+            line += f"\n    (English: {seg['translation'].strip()})"
+        events.append((float(seg.get("start") or 0), 0, line))
+    for shot in screenshots:
+        events.append((float(shot.get("t") or 0), 1,
+                       f"[{_fmt_offset(shot.get('t'))}] [Screenshot of the meeting window "
+                       f"\"{shot.get('window', '')}\" taken here: {os.path.basename(shot.get('file', ''))}]"))
+    events.sort(key=lambda e: (e[0], e[1]))
+    return "\n".join(e[2] for e in events)
+
+
 def _enforce_journal_rule(summary: dict, segments, pre_classified_conversation: bool = False):
     """Journaling means the recording's owner talking to themself -- by
     definition that requires exactly one speaker. The LLM's "journal" vs
@@ -830,6 +855,11 @@ async def process_once():
                         log.warning("context-fit classification failed (non-fatal, all chunks treated as fitting): %s", e)
 
             formatted = format_transcript_with_speakers(transcript, segments, record.get("speaker_names") or None)
+            if segments and (record.get("prefilled_transcription") or record.get("screenshots")):
+                # Live recordings: give the summarizer timestamps, the meeting screenshots at the moment
+                # they were taken, and any live translation -- the full context of the conversation.
+                formatted = _timestamped_transcript(segments, record.get("speaker_names") or {},
+                                                    record.get("screenshots") or [])
 
             # Jarvis voice commands (cmd_*.wav, see recorder.cpp) skip the
             # memo pipeline entirely -- routed here, right before the

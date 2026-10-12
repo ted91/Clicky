@@ -258,6 +258,7 @@
              title="Starts recording when a Teams / Zoom / Meet call is detected and stops when it ends. Let participants know you're recording.">
         <input type="checkbox" id="live-auto" style="width:auto; margin:0;"> Record calls automatically
       </label>
+      <button type="button" id="live-shot" hidden title="Screenshot the meeting window into this recording (or double-tap Shift)">📸 Screenshot</button>
       <button type="button" id="live-toggle">Start recording</button>
     </div>
     <div id="live-lines" hidden style="margin-top:0.6rem; max-height:16rem; overflow-y:auto; font-size:0.9rem; line-height:1.4;"></div>
@@ -266,6 +267,11 @@
     (function () {
       const lines = document.getElementById("live-lines"), btn = document.getElementById("live-toggle");
       const auto = document.getElementById("live-auto");
+      const shotBtn = document.getElementById("live-shot");
+      shotBtn.addEventListener("click", async () => {
+        shotBtn.disabled = true;
+        try { await fetch("/live/screenshot", {method: "POST"}); } finally { shotBtn.disabled = false; poll(); }
+      });
       auto.addEventListener("change", async () => {
         const body = new URLSearchParams({enabled: auto.checked ? "1" : ""});
         try { await fetch("/live/auto-record", {method: "POST", body}); } finally { auto.blur(); }
@@ -280,6 +286,8 @@
           const r = await fetch("/api/live"); if (!r.ok) return;
           const s = await r.json();
           btn.textContent = s.recording ? "Stop recording" : "Start recording";
+          shotBtn.hidden = !s.recording;
+          shotBtn.textContent = "📸 Screenshot" + (s.screenshots ? ` (${s.screenshots})` : "");
           if (document.activeElement !== auto) auto.checked = !!s.auto_record;
           dot.style.background = s.recording ? "#dc1e1e" : "#999";
           if (!s.recording) {
@@ -294,7 +302,7 @@
              s.mic_state === "muted" ? " — ⚠ your microphone is muted: unmute it to record your voice" : "");
           const en = t => t ? `<div style="opacity:0.75; margin:0 0 0.3rem 1rem;">EN: ${esc(t)}</div>` : "";
           let html = (s.segments || []).slice(-40).map(g =>
-            `<div><strong>${esc(label(g.speaker_id))}:</strong> ${esc(g.text)}</div>${en(g.translation)}`).join("");
+            `<div><span style="opacity:0.6;">[${mmss(g.start)}]</span> <strong>${esc(label(g.speaker_id))}:</strong> ${esc(g.text)}</div>${en(g.translation)}`).join("");
           for (const [src, txt] of Object.entries(s.drafts || {})) {
             if (txt) html += `<div style="opacity:0.6; font-style:italic;"><strong>${esc(label(src))}:</strong> ${esc(txt)}</div>` +
                              `<div style="opacity:0.5; font-style:italic;">${en((s.draft_translations || {})[src])}</div>`;
@@ -527,13 +535,27 @@
             {% if r.merged_segments %}
               <div class="transcript" data-hash="{{ r.content_hash }}">
                 {% for seg in r.merged_segments %}
-                  <p class="{{ 'background-line' if seg.loudness_class == 'background' or seg.context_fit == 'noise' }}">{% if seg.loudness_class == 'background' %}<span class="background-tag" title="Classified as a quieter, more distant conversation -- excluded from the summary">background</span>{% elif seg.context_fit == 'noise' %}<span class="background-tag" title="AI-classified: doesn't connect to anything around it -- excluded from the summary">noise</span>{% endif %}{% if seg.context_fit == 'different_topic' %}<span class="topic-tag" title="AI-classified: a real but separate thread -- kept, but not blended into the main summary">different topic</span>{% endif %}<span class="speaker rename-speaker" data-speaker-id="{{ seg.speaker_id }}" title="Click to rename">{{ r.get('speaker_names', {}).get(seg.speaker_id) or ("Speaker " ~ seg.speaker_id) }}:</span> {{ seg.text }}</p>
+                  <p class="{{ 'background-line' if seg.loudness_class == 'background' or seg.context_fit == 'noise' }}">{% if r.prefilled_transcription %}<span class="providers">[{{ '%d:%02d' % ((seg.start or 0)|int // 60, (seg.start or 0)|int % 60) }}]</span> {% endif %}{% if seg.loudness_class == 'background' %}<span class="background-tag" title="Classified as a quieter, more distant conversation -- excluded from the summary">background</span>{% elif seg.context_fit == 'noise' %}<span class="background-tag" title="AI-classified: doesn't connect to anything around it -- excluded from the summary">noise</span>{% endif %}{% if seg.context_fit == 'different_topic' %}<span class="topic-tag" title="AI-classified: a real but separate thread -- kept, but not blended into the main summary">different topic</span>{% endif %}<span class="speaker rename-speaker" data-speaker-id="{{ seg.speaker_id }}" title="Click to rename">{{ r.get('speaker_names', {}).get(seg.speaker_id) or ("Speaker " ~ seg.speaker_id) }}:</span> {{ seg.text }}</p>
                 {% endfor %}
               </div>
             {% else %}
               <pre class="transcript">{{ r.transcript }}</pre>
             {% endif %}
           </details>
+          {% if r.screenshots %}
+            <details>
+              <summary>Meeting screenshots ({{ r.screenshots | length }})</summary>
+              <div style="display:flex; flex-wrap:wrap; gap:0.6rem; margin-top:0.4rem;">
+                {% for s in r.screenshots %}
+                  <a href="/screenshots/{{ r.content_hash }}/{{ loop.index0 }}" target="_blank" style="text-decoration:none;">
+                    <img src="/screenshots/{{ r.content_hash }}/{{ loop.index0 }}" loading="lazy" alt="Screenshot at {{ '%d:%02d' % ((s.t|int) // 60, (s.t|int) % 60) }}"
+                         style="width:220px; max-width:100%; border:1px solid #ccc; border-radius:4px; display:block;">
+                    <span class="providers">[{{ '%d:%02d' % ((s.t|int) // 60, (s.t|int) % 60) }}] {{ (s.time or '')[11:19] }}</span>
+                  </a>
+                {% endfor %}
+              </div>
+            </details>
+          {% endif %}
           {% set translated = (r.segments or []) | selectattr('translation') | list %}
           {% if translated %}
             <details>

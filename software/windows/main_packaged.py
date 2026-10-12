@@ -352,6 +352,11 @@ def _run_tray() -> bool:
             icon.icon, icon.title = image, IDLE_TOOLTIP
             bar.hide(after_s=subtitle_bar.HIDE_AFTER_STOP_S)
             _notify(info, "Recording discarded" if event == "discarded" else "Recording problem")
+        elif event == "screenshot":
+            _beep("start")
+            _notify(f"Saved with the recording at {info}.", "Meeting screenshot")
+        elif event == "screenshot_failed":
+            _notify(info, "No screenshot taken")
         elif event == "warning":
             _notify(info, "Unmute your microphone")
         elif event == "info":
@@ -370,6 +375,9 @@ def _run_tray() -> bool:
         pystray.MenuItem("Open Clicky dashboard", _open_dashboard, default=True),
         pystray.MenuItem(lambda item: "Stop recording" if controller.recording else "Start recording (or double-tap Caps Lock)",
                          lambda *_: threading.Thread(target=controller.toggle, daemon=True).start()),
+        pystray.MenuItem("Take meeting screenshot (or double-tap Shift)",
+                         lambda *_: threading.Thread(target=controller.take_screenshot, daemon=True).start(),
+                         enabled=lambda item: controller.recording),
         pystray.MenuItem("Show subtitle bar while recording",
                          lambda *_: (settings.update(subtitle_bar=not settings.get_all().get("subtitle_bar", True)),
                                      bar.show() if controller.recording and settings.get_all().get("subtitle_bar", True)
@@ -383,11 +391,13 @@ def _run_tray() -> bool:
 
     # Always running; it checks the "capslock_record_hotkey" setting itself, so Settings can switch it live.
     watcher = live_recorder.CapsLockDoubleTapWatcher(controller.toggle)
+    shot_watcher = live_recorder.ShiftDoubleTapWatcher(controller.take_screenshot, controller)
 
     def _on_ready(icon):
         icon.visible = True
         if watcher:
             watcher.start()
+        shot_watcher.start()
         live_recorder.CallWatcher(controller).start()   # does nothing unless "auto_record_calls" is on
         live_transcriber.preload_in_background()
         live_translator.preload_in_background()

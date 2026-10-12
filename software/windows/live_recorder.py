@@ -17,6 +17,7 @@ import ctypes
 import hashlib
 import io
 import logging
+import os
 import threading
 import time
 import wave
@@ -30,6 +31,13 @@ RATE = 16000                 # what the device sends and what storage.add_pendin
 _GAP_TOLERANCE = RATE // 10  # loopback delivers nothing while the PC is silent; re-sync after >100 ms gaps
 _MIN_SECONDS = 1.0           # shorter than this is almost certainly an accidental start/stop
 VK_CAPITAL = 0x14
+VK_SHIFT = 0x10
+
+
+def fmt_offset(seconds: float) -> str:
+    """Recording time offset as m:ss (or h:mm:ss) -- how transcript lines and screenshots are stamped."""
+    s = int(seconds)
+    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
 
 # Each capture source is one transcript speaker.
 MIC, COMPUTER = "you", "others"
@@ -42,6 +50,7 @@ class _Source:
     def __init__(self, p, pa, source_id: str, info: dict, t0: float, on_audio=None):
         import soxr
         self.source_id, self._pa, self._t0, self._on_audio = source_id, pa, t0, on_audio
+        self.device_name = info.get("name", "")
         self.rate = int(info["defaultSampleRate"])
         self.channels = max(1, int(info["maxInputChannels"]))
         self._resampler = soxr.ResampleStream(self.rate, RATE, 1, dtype="float32")
@@ -138,6 +147,7 @@ class LiveRecorder:
     def __init__(self):
         self._p = None
         self._sources = []
+        self._retired = []       # mic sources replaced mid-recording (switch_mic); still mixed into the WAV
         self.transcriber = None
         self.started_at = None
         self.started_monotonic = None
@@ -146,6 +156,56 @@ class LiveRecorder:
     @property
     def recording(self) -> bool:
         return self._p is not None
+
+    def find_live_mic(self, probe_s: float = 1.5):
+        """Another input device that's actually delivering audio (not exact zeros), loudest first --
+        or None. For when the recorded mic is a dongle whose headset is off, a disabled mic, etc."""
+        import pyaudiowpatch as pa
+        if not self.recording:
+            return None
+        current = next((s for s in self._sources if s.source_id == MIC), None)
+        wasapi = self._p.get_host_api_info_by_type(pa.paWASAPI)["index"]
+        peaks, streams = {}, []
+        for i in range(self._p.get_device_count()):
+            d = self._p.get_device_info_by_index(i)
+            if (d["hostApi"] != wasapi or d.get("isLoopbackDevice") or d["maxInputChannels"] <= 0
+                    or (current and d["name"] == current.device_name)):
+                continue
+
+            def cb(data, n, ti, st, name=d["name"]):
+                x = np.frombuffer(data, dtype=np.float32)
+                if x.size:
+                    peaks[name] = max(peaks.get(name, 0.0), float(np.abs(x).max()))
+                return (None, pa.paContinue)
+            try:
+                streams.append((d, self._p.open(format=pa.paFloat32, channels=max(1, int(d["maxInputChannels"])),
+                                                rate=int(d["defaultSampleRate"]), input=True, input_device_index=d["index"],
+                                                frames_per_buffer=1024, stream_callback=cb)))
+            except Exception:
+                continue
+        time.sleep(probe_s)
+        for _, s in streams:
+            try:
+                s.close()
+            except Exception:
+                pass
+        alive = sorted((d for d, _ in streams if peaks.get(d["name"], 0.0) > 0.0),
+                       key=lambda d: -peaks[d["name"]])
+        return alive[0] if alive else None
+
+    def switch_mic(self, info: dict):
+        """Swap the microphone source for another device mid-recording; the shared wall-clock timeline
+        keeps it in sync with the rest of the recording (already-recorded audio stays)."""
+        import pyaudiowpatch as pa
+        old = next((s for s in self._sources if s.source_id == MIC), None)
+        feed = self.transcriber.feed if self.transcriber else None
+        new = _Source(self._p, pa, MIC, info, self.started_monotonic, feed)
+        if old:
+            old.close()
+            self._retired.append(old)            # its audio so far still goes into the WAV
+            self._sources.remove(old)
+        self._sources.insert(0, new)
+        log.info("switched microphone: %s -> %s", old.device_name if old else None, new.device_name)
 
     def take_mic_peak(self):
         """Loudest microphone sample since the previous call (None without a mic source)."""
@@ -187,7 +247,7 @@ class LiveRecorder:
                 sources.append(_Source(p, pa, COMPUTER, _pick_loopback(p, output_device), t0, feed))
             except Exception as e:
                 log.warning("computer-audio capture unavailable, recording microphone only: %s", e)
-        self._p, self._sources = p, sources
+        self._p, self._sources, self._retired = p, sources, []
         self.started_at, self.started_monotonic = datetime.now(), t0
         self.sources_description = " + ".join(SOURCE_LABELS[s.source_id] for s in sources)
         log.info("live recording started (%s, live transcription %s)", self.sources_description,
@@ -201,7 +261,8 @@ class LiveRecorder:
         for s in self._sources:
             s.close()
         self._p.terminate()
-        sources, self._p, self._sources = self._sources, None, []
+        sources, self._p, self._sources = self._sources + self._retired, None, []
+        self._retired = []
         segments = self.transcriber.finish() if self.transcriber else None
 
         length = max((s.length for s in sources), default=0)
@@ -223,20 +284,22 @@ class LiveRecorder:
         return buf.getvalue(), segments
 
 
-def ingest(wav_bytes: bytes, started_at: datetime, segments=None) -> str:
+def ingest(wav_bytes: bytes, started_at: datetime, segments=None, screenshots=None) -> str:
     """Adds a finished live recording to the normal pipeline. With live segments, the transcript is
-    stored as-is (poller.process_once skips batch transcription for it). Returns the recording's name."""
+    stored as-is (poller.process_once skips batch transcription for it). screenshots: [{t, time, file,
+    window}] taken during the recording (t = seconds from its start, same clock as segment start/end).
+    Returns the recording's name."""
     import settings
     import storage
     name = f"live_{started_at:%Y-%m-%d_%H-%M-%S}.wav"
-    extra = None
+    extra = {"screenshots": list(screenshots or [])}
     if segments:
         owner = (settings.get_all().get("owner_name") or "").strip() or "You"
-        extra = {
+        extra.update({
             "prefilled_transcription": {"text": " ".join(s["text"] for s in segments),
                                         "segments": segments, "stt_provider": "parakeet-live"},
             "speaker_names": {MIC: owner, COMPUTER: "Others"},
-        }
+        })
     storage.add_pending(name, len(wav_bytes), hashlib.md5(wav_bytes).hexdigest(), wav_bytes, extra=extra)
     return name
 
@@ -253,6 +316,7 @@ class Controller:
         self.auto_started = False  # this recording was started by CallWatcher (so it also ends it)
         self.mic_state = ""      # checking / live / muted / muted_in_call -- kept current by _monitor_mic()
         self.call = ""           # the running call, when one was detected while the mic was muted
+        self.screenshots = []    # [{t, time, file, window}] for the current recording (take_screenshot)
 
     def add_listener(self, fn):
         self._listeners.append(fn)
@@ -288,22 +352,70 @@ class Controller:
                 self._fire("failed", str(e))
                 return
             self.auto_started = auto
+            self.screenshots = []
         self.mic_state, self.call = "checking", ""
         self._fire("started", (f"{reason} - " if reason else "") + self.recorder.sources_description +
                    (", transcribing live" if self.recorder.transcriber else ""))
         threading.Thread(target=self._monitor_mic, args=(self.recorder.started_monotonic,), daemon=True).start()
+
+    def take_screenshot(self, *_):
+        """Screenshot of the running meeting's window, stamped with the recording's time offset (the same
+        clock as the transcript's segment times) and the wall-clock time. Only while recording a call on
+        this computer."""
+        import meeting_screenshot
+        import paths
+        if not self.recording:
+            self._fire("screenshot_failed", "Start a recording first (double-tap Caps Lock).")
+            return
+        rec = self.recorder
+        t = time.monotonic() - rec.started_monotonic
+        wall = datetime.now()
+        try:
+            img, title = meeting_screenshot.capture_meeting()
+        except Exception as e:
+            self._fire("screenshot_failed", str(e))
+            return
+        stamp = f"{int(t) // 3600:02d}-{int(t) % 3600 // 60:02d}-{int(t) % 60:02d}"
+        folder = os.path.join(paths.APP_DATA_DIR, "screenshots", f"live_{rec.started_at:%Y-%m-%d_%H-%M-%S}")
+        path = meeting_screenshot.save(img, folder, f"live_{rec.started_at:%Y-%m-%d_%H-%M-%S}__t{stamp}__{wall:%H-%M-%S}.png")
+        self.screenshots.append({"t": round(t, 1), "time": wall.isoformat(timespec="seconds"), "file": path,
+                                 "window": title})
+        self._fire("screenshot", fmt_offset(t))
 
     def _monitor_mic(self, started, first_check_s: float = 3.0, every_s: float = 2.0):
         """A muted mic delivers exact digital zeros, so there's simply nothing of the user in the recording.
         During a call that's fine (the meeting audio is still recorded) -- no warning. With no call running
         (an in-person conversation) the user is asked to unmute; Clicky never unmutes anything itself."""
         import meeting_detector
-        warned = False
+        # WASAPI needs COM in every thread that opens audio devices; without it the live-mic probe below
+        # opens streams that never deliver audio, so a silent mic was never swapped for a working one.
+        try:
+            ctypes.windll.ole32.CoInitializeEx(None, 0)
+        except Exception:
+            pass
+        warned, tried_switch = False, False
         time.sleep(first_check_s)
         while self.recorder.recording and self.recorder.started_monotonic == started:
             peak = self.recorder.take_mic_peak()
             if peak is None:                        # no microphone source at all
                 return
+            if peak == 0.0 and not tried_switch:
+                # Exact zeros can also mean the wrong device (a headset dongle with the headset off, a
+                # disabled mic) while the user talks into another one -- switch to a live mic first.
+                tried_switch = True
+                try:
+                    current = next((s.device_name for s in self.recorder._sources if s.source_id == MIC), "")
+                    live = self.recorder.find_live_mic()
+                    if live and self.recorder.recording and self.recorder.started_monotonic == started:
+                        self.recorder.switch_mic(live)
+                        self.mic_state = "live"
+                        self._fire("info", f'"{current}" isn\'t sending any sound, so Clicky switched to '
+                                           f'"{live["name"]}". Pick your microphone in Settings -> Live Subtitles '
+                                           "to make this permanent.")
+                        time.sleep(every_s)
+                        continue
+                except Exception as e:
+                    log.warning("microphone fallback failed: %s", e)
             if peak == 0.0:
                 try:
                     self.call = meeting_detector.current_call()
@@ -335,11 +447,12 @@ class Controller:
         if wav_bytes is None:
             self._fire("discarded", "That was under a second, so nothing was saved.")
             return
-        threading.Thread(target=self._save, args=(wav_bytes, started_at, segments), daemon=True).start()
+        threading.Thread(target=self._save, args=(wav_bytes, started_at, segments, list(self.screenshots)),
+                         daemon=True).start()
 
-    def _save(self, wav_bytes, started_at, segments):
+    def _save(self, wav_bytes, started_at, segments, screenshots):
         try:
-            self.last_saved = ingest(wav_bytes, started_at, segments)
+            self.last_saved = ingest(wav_bytes, started_at, segments, screenshots)
             self._fire("saved", self.last_saved)
         except Exception as e:
             self._fire("failed", f"Couldn't save the recording: {e}")
@@ -348,7 +461,7 @@ class Controller:
         """For the dashboard's live panel (app.py /api/live)."""
         import settings
         rec = self.recorder
-        out = {"recording": rec.recording, "last_saved": self.last_saved,
+        out = {"recording": rec.recording, "last_saved": self.last_saved, "screenshots": len(self.screenshots),
                "auto_record": bool(settings.get_all().get("auto_record_calls", False)),
                "auto_started": rec.recording and self.auto_started}
         if rec.recording:
@@ -418,16 +531,18 @@ class CallWatcher(threading.Thread):
                 we_started = handled_this_call = False
 
 
-class CapsLockDoubleTapWatcher(threading.Thread):
-    """Calls on_double_tap() when Caps Lock is tapped twice quickly (second press within
-    `window_s` of the first, both short taps). Two taps toggle Caps Lock twice, so it ends up where it
-    started -- nothing to restore. Polls GetAsyncKeyState for this one key only (no keyboard hook).
-    A press held longer than `max_tap_s` doesn't count, so holding Caps Lock stays ordinary."""
+class KeyDoubleTapWatcher(threading.Thread):
+    """Calls on_double_tap() when `vk` is tapped twice quickly (second press within `window_s` of the
+    first, both short taps), if the `setting_key` switch is on and `condition()` (if given) is true.
+    Polls GetAsyncKeyState for this one key only (no keyboard hook). A press held longer than
+    `max_tap_s` doesn't count, so holding the key stays ordinary. For Caps Lock, two taps toggle it twice,
+    so it ends up where it started -- nothing to restore."""
 
-    def __init__(self, on_double_tap, window_s: float = 0.4, max_tap_s: float = 0.35,
+    def __init__(self, on_double_tap, vk: int = VK_CAPITAL, setting_key: str = "capslock_record_hotkey",
+                 condition=None, window_s: float = 0.4, max_tap_s: float = 0.35,
                  cooldown_s: float = 0.8, poll_seconds: float = 0.015):
-        super().__init__(daemon=True, name="capslock-doubletap")
-        self._on_double_tap = on_double_tap
+        super().__init__(daemon=True, name=f"doubletap-{vk:#x}")
+        self._on_double_tap, self._vk, self._setting_key, self._condition = on_double_tap, vk, setting_key, condition
         self._window, self._max_tap, self._cooldown, self._poll = window_s, max_tap_s, cooldown_s, poll_seconds
         self._stop_event = threading.Event()
 
@@ -436,15 +551,15 @@ class CapsLockDoubleTapWatcher(threading.Thread):
 
     def run(self):
         user32 = ctypes.windll.user32
-        user32.GetAsyncKeyState(VK_CAPITAL)            # clear the "pressed since last call" bit
+        user32.GetAsyncKeyState(self._vk)              # clear the "pressed since last call" bit
         was_down, down_at, last_tap, quiet_until = False, 0.0, None, 0.0
         enabled, enabled_checked = True, 0.0
         while not self._stop_event.wait(self._poll):
             now = time.monotonic()
             if now - enabled_checked > 1.0:            # the Settings switch applies without a restart
                 import settings
-                enabled, enabled_checked = settings.get_all().get("capslock_record_hotkey", True), now
-            state = user32.GetAsyncKeyState(VK_CAPITAL)
+                enabled, enabled_checked = settings.get_all().get(self._setting_key, True), now
+            state = user32.GetAsyncKeyState(self._vk)
             if not enabled:
                 was_down, last_tap = False, None
                 continue
@@ -469,6 +584,21 @@ class CapsLockDoubleTapWatcher(threading.Thread):
 
     def _safe_fire(self):
         try:
-            self._on_double_tap()
+            if self._condition is None or self._condition():
+                self._on_double_tap()
         except Exception:
-            log.exception("Caps Lock double-tap action failed")
+            log.exception("double-tap action failed")
+
+
+def CapsLockDoubleTapWatcher(on_double_tap):
+    """Double-tap Caps Lock: start / stop a live recording."""
+    return KeyDoubleTapWatcher(on_double_tap, VK_CAPITAL, "capslock_record_hotkey")
+
+
+def ShiftDoubleTapWatcher(on_double_tap, ctl):
+    """Double-tap Shift: screenshot the meeting -- only while recording AND a call runs on this computer,
+    so Shift keeps working normally the rest of the time (a single Shift press is every capital letter)."""
+    def during_call_recording():
+        import meeting_detector
+        return ctl.recording and bool(meeting_detector.current_call())
+    return KeyDoubleTapWatcher(on_double_tap, VK_SHIFT, "shift_screenshot_hotkey", condition=during_call_recording)

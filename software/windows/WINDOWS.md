@@ -47,6 +47,14 @@ transcript, so it isn't transcribed a second time. See `live_recorder.py`
 / `live_transcriber.py`. Recording other people needs their consent --
 tell them before you start.
 
+While recording a call on this computer, **double-tap Shift** (or use the
+tray / dashboard) to screenshot the meeting window. Screenshots are stamped
+with the recording time (same clock as the transcript) and the wall-clock
+time, shown on the recording's card, embedded in the Obsidian note at that
+moment, and placed in the timestamped transcript the summarizer reads.
+If the recorded microphone sends only silence (e.g. a headset dongle with
+the headset off), Clicky switches to a microphone that is delivering audio.
+
 Live transcription needs the models once (~650 MB) in
 `%USERPROFILE%\.clicky-pipeline\models`: run `python live_transcriber.py`
 (or set `live_models_dir` in settings.json to an existing Live Subtitles

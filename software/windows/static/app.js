@@ -31,6 +31,13 @@ function deleteButton(r) {
     `<button class="delete-device-btn danger" data-hash="${escapeHtml(r.content_hash)}" data-name="${escapeHtml(r.name)}">Delete from device</button>`;
 }
 
+function fmtOffset(seconds) {
+  const s = Math.floor(seconds || 0);
+  return s >= 3600
+    ? `${Math.floor(s / 3600)}:${String(Math.floor(s % 3600 / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`
+    : `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
 function checkbox(r) {
   return `<input type="checkbox" class="recording-select" data-hash="${escapeHtml(r.content_hash)}">`;
 }
@@ -121,9 +128,22 @@ function renderRecording(r) {
     ? `<div class="transcript" data-hash="${escapeHtml(r.content_hash)}">${mergedSegments.map(seg => {
         const isBackground = seg.loudness_class === "background";
         const tag = isBackground ? `<span class="background-tag" title="Classified as a quieter, more distant conversation -- excluded from the summary">background</span>` : "";
-        return `<p class="${isBackground ? "background-line" : ""}">${tag}<span class="speaker rename-speaker" data-speaker-id="${escapeHtml(seg.speaker_id)}" title="Click to rename">${escapeHtml(speakerNames[seg.speaker_id] || `Speaker ${seg.speaker_id}`)}:</span> ${escapeHtml(seg.text)}</p>`;
+        const ts = r.prefilled_transcription ? `<span class="providers">[${fmtOffset(seg.start)}]</span> ` : "";
+        return `<p class="${isBackground ? "background-line" : ""}">${ts}${tag}<span class="speaker rename-speaker" data-speaker-id="${escapeHtml(seg.speaker_id)}" title="Click to rename">${escapeHtml(speakerNames[seg.speaker_id] || `Speaker ${seg.speaker_id}`)}:</span> ${escapeHtml(seg.text)}</p>`;
       }).join("")}</div>`
     : `<pre class="transcript">${escapeHtml(r.transcript)}</pre>`;
+
+  const shots = r.screenshots || [];
+  const screenshotsHtml = shots.length
+    ? `<details><summary>Meeting screenshots (${shots.length})</summary>
+         <div style="display:flex; flex-wrap:wrap; gap:0.6rem; margin-top:0.4rem;">${shots.map((s, i) => {
+           const url = `/screenshots/${encodeURIComponent(r.content_hash)}/${i}`;
+           return `<a href="${url}" target="_blank" style="text-decoration:none;">
+             <img src="${url}" loading="lazy" alt="Screenshot at ${fmtOffset(s.t)}" style="width:220px; max-width:100%; border:1px solid #ccc; border-radius:4px; display:block;">
+             <span class="providers">[${fmtOffset(s.t)}] ${escapeHtml((s.time || "").slice(11, 19))}</span></a>`;
+         }).join("")}</div>
+       </details>`
+    : "";
 
   // Live recordings translated while recording (subtitle bar) keep the English per line.
   const translated = (r.segments || []).filter(seg => seg.translation);
@@ -224,6 +244,7 @@ function renderRecording(r) {
                 <summary>Full transcript</summary>
                 ${transcriptHtml}
               </details>
+              ${screenshotsHtml}
               ${translationHtml}
               <div class="providers">stt=${escapeHtml(r.stt_provider)} · llm=${escapeHtml(r.llm_provider)} ${destBadges}</div>
             </div>

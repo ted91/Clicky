@@ -205,6 +205,7 @@ def save_live_settings(request: Request,
                        subtitle_lines: int = Form(3), live_mic_device: str = Form(""),
                        live_output_device: str = Form(""), live_mode: str = Form("both"),
                        auto_record_calls: str = Form(""), capslock_record_hotkey: str = Form(""),
+                       shift_screenshot_hotkey: str = Form(""),
                        live_transcription: str = Form(""), start_with_windows: str = Form("")):
     """Settings -> Live subtitles (live recording, subtitle bar, translation, devices)."""
     redirect = _gate(request)
@@ -218,6 +219,7 @@ def save_live_settings(request: Request,
         subtitle_lines=max(1, min(5, subtitle_lines)), live_mic_device=live_mic_device,
         live_output_device=live_output_device, live_record_computer_audio=live_mode != "mic_only",
         auto_record_calls=on(auto_record_calls), capslock_record_hotkey=on(capslock_record_hotkey),
+        shift_screenshot_hotkey=on(shift_screenshot_hotkey),
         live_transcription=on(live_transcription),
     )
     error = None
@@ -228,6 +230,29 @@ def save_live_settings(request: Request,
     except Exception as e:
         error = f"Couldn't change 'Start with Windows': {e}"
     return templates.TemplateResponse(request, "settings.html", _settings_context("live", saved=error is None, setup_error=error))
+
+
+@app.post("/live/screenshot")
+async def live_screenshot(request: Request):
+    """Dashboard button: screenshot the meeting window into the current recording (same as Shift x2)."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    import live_recorder
+    await asyncio.to_thread(live_recorder.controller.take_screenshot)
+    return JSONResponse(live_recorder.controller.status())
+
+
+@app.get("/screenshots/{content_hash}/{index}")
+def get_screenshot(request: Request, content_hash: str, index: int):
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    rec = storage.get_recording(content_hash)
+    shots = (rec or {}).get("screenshots") or []
+    if not 0 <= index < len(shots) or not os.path.exists(shots[index].get("file", "")):
+        return Response(status_code=404)
+    return FileResponse(shots[index]["file"], media_type="image/png")
 
 
 @app.post("/live/auto-record")

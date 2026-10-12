@@ -215,7 +215,9 @@ def _format_markdown(record: dict) -> str:
 
     lines += ["## Transcript", ""]
     segments = record.get("segments")
-    if segments:
+    if segments and (record.get("prefilled_transcription") or record.get("_obsidian_embeds")):
+        lines += _timestamped_lines(record, segments)
+    elif segments:
         for seg in segments:
             lines.append(f"**Speaker {seg.get('speaker_id', '?')}:** {seg.get('text', '').strip()}")
             lines.append("")
@@ -223,6 +225,50 @@ def _format_markdown(record: dict) -> str:
         lines.append(record.get("transcript") or "")
 
     return "\n".join(lines)
+
+
+def _fmt_offset(seconds) -> str:
+    s = int(seconds or 0)
+    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
+
+
+def _timestamped_lines(record: dict, segments: list) -> list:
+    """Live recordings: "[m:ss] Name: text" in time order, the English translation under translated lines,
+    and each meeting screenshot embedded where it was taken (see push_recording's _obsidian_embeds)."""
+    names = record.get("speaker_names") or {}
+    events = []
+    for seg in segments:
+        sid = seg.get("speaker_id")
+        block = [f"**[{_fmt_offset(seg.get('start'))}] {names.get(sid) or f'Speaker {sid}'}:** {(seg.get('text') or '').strip()}"]
+        if seg.get("translation"):
+            block.append(f"*English:* {seg['translation'].strip()}")
+        events.append((float(seg.get("start") or 0), 0, block))
+    for t, embed_name in record.get("_obsidian_embeds") or []:
+        events.append((float(t), 1, [f"**[{_fmt_offset(t)}] Screenshot:**", f"![[{embed_name}]]"]))
+    out = []
+    for _, _, block in sorted(events, key=lambda e: (e[0], e[1])):
+        out += block + [""]
+    return out
+
+
+def _copy_screenshots(record: dict, vault_path: str) -> list:
+    """Copies the recording's meeting screenshots into <vault>/Clicky attachments -> [(t, file name)]."""
+    import shutil
+    shots = record.get("screenshots") or []
+    if not shots:
+        return []
+    folder = os.path.join(vault_path, "Clicky attachments")
+    os.makedirs(folder, exist_ok=True)
+    out = []
+    for shot in shots:
+        src = shot.get("file", "")
+        if not os.path.exists(src):
+            continue
+        dst = os.path.join(folder, os.path.basename(src))
+        if not os.path.exists(dst):
+            shutil.copy2(src, dst)
+        out.append((shot.get("t") or 0, os.path.basename(src)))
+    return out
 
 
 def _insight_frontmatter(record: dict) -> dict:
@@ -265,7 +311,8 @@ def push_recording(record: dict) -> str:
         "generate_social_media": False,
     }
     frontmatter.update(_insight_frontmatter(record))
-    body = _format_markdown(record)
+    embeds = _copy_screenshots(record, vault_path)
+    body = _format_markdown(dict(record, _obsidian_embeds=embeds) if embeds else record)
     _write_note(vault_path, filename, frontmatter, body)
     log.info("wrote %s to Obsidian vault", filename)
 
