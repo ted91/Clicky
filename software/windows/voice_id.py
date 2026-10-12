@@ -102,9 +102,13 @@ def _load_model():
     with _model_lock:
         if _model is None:
             from speechbrain.inference.speaker import EncoderClassifier
+            from speechbrain.utils.fetching import LocalStrategy
             _model = EncoderClassifier.from_hparams(
                 source=MODEL_SOURCE,
                 savedir=os.path.join(paths.APP_DATA_DIR, "voice_id_model"),
+                # speechbrain's default symlinks the cached model files, which Windows only allows with
+                # admin rights or Developer Mode (WinError 1314) -- copy them instead.
+                local_strategy=LocalStrategy.COPY,
             )
         return _model
 

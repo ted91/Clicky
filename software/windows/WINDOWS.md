@@ -35,6 +35,26 @@ folder (a "onedir" build — Windows has no equivalent to macOS's single
 `.app` bundle). Copy/zip the whole `dist\Clicky\` folder to distribute it;
 `Clicky.exe` alone won't run without the rest of the folder next to it.
 
+## Live recording (Caps Lock)
+
+Hold **Caps Lock for ~1 second** (or use the tray menu, or the dashboard's
+"Start recording" button) to start recording; hold it again to stop. It
+records the microphone ("you") and the computer's audio ("others" -- the
+far side of a Teams/Zoom/Meet call) and transcribes both **live** with
+Parakeet-TDT 0.6B v3 (same engine as Live Subtitles), shown on the
+dashboard while you speak. The saved recording keeps the audio and that
+transcript, so it isn't transcribed a second time. See `live_recorder.py`
+/ `live_transcriber.py`. Recording other people needs their consent --
+tell them before you start.
+
+Live transcription needs the models once (~650 MB) in
+`%USERPROFILE%\.clicky-pipeline\models`: run `python live_transcriber.py`
+(or set `live_models_dir` in settings.json to an existing Live Subtitles
+`models` folder). Without them, recording still works and the selected
+transcription provider runs after you stop. Settings keys (settings.json,
+all default on): `live_transcription`, `live_record_computer_audio`,
+`capslock_record_hotkey`.
+
 ## Installing / running
 
 **Recommended: per-user MSI.** After the PyInstaller build, run

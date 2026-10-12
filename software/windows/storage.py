@@ -164,7 +164,7 @@ def is_known_content_hash(content_hash: str) -> bool:
     return any(r.get("content_hash") == content_hash for r in records)
 
 
-def add_pending(name: str, size: int, content_hash: str, wav_bytes: bytes) -> dict:
+def add_pending(name: str, size: int, content_hash: str, wav_bytes: bytes, extra: dict = None) -> dict:
     """Call as soon as audio is downloaded from the device — makes it show
     up on the dashboard immediately, before any transcription is attempted.
 
@@ -232,7 +232,12 @@ def add_pending(name: str, size: int, content_hash: str, wav_bytes: bytes) -> di
         "merged_wav_paths": [],  # extra wav_paths absorbed in (this record's own wav_path stays first), for playback continuity
         "pre_merge_transcript": None,  # this record's transcript exactly as it was before the most recent merge, so unmerge_recording() can restore it exactly
         "merge_checked": False,  # set True once poller.merge_continuations_once() has made its one decision for this record -- same one-shot-then-flag idempotency as the *_synced fields, so a "not a continuation" verdict isn't re-asked (and re-billed) every poll cycle
+        # {"text", "segments", "stt_provider"} when the audio was already transcribed while recording
+        # (live_recorder.ingest) -- poller.process_once uses it instead of calling the STT provider.
+        "prefilled_transcription": None,
     }
+    if extra:
+        record.update(extra)
     with _lock:
         records = _load()
         records.append(record)

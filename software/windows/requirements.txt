@@ -9,6 +9,12 @@ itsdangerous          # needed by starlette's SessionMiddleware (login sessions)
 pyyaml                # obsidian_sync.py's frontmatter read/write (was an implicit transitive dep before -- declared explicitly now)
 pystray                # Windows system-tray icon (main_packaged.py)
 Pillow                 # image loading for the tray icon
+PyAudioWPatch          # live recording: microphone + computer audio (WASAPI loopback), see live_recorder.py
+soxr                   # live recording: streaming resample to 16 kHz
+sherpa-onnx            # live transcription while recording: Parakeet-TDT + Silero VAD (live_transcriber.py); models downloaded separately
+ctranslate2            # live translation to English (live_translator.py, opus-mt models)
+sentencepiece          # tokenizer for the opus-mt translation models
+av<16                  # decodes uploaded MP3/M4A/MP4/... files (audio_utils.to_device_wav); <16 because faster-whisper 1.2.x passes an av.open() option PyAV 16 removed
 
 # Local speaker-voiceprint recognition (voice_id.py) -- a real, deliberate
 # exception to this file's "avoid heavy deps" pattern below (see
@@ -32,7 +38,7 @@ sentence-transformers
 # mistralai            # STT_PROVIDER=mistral or LLM_PROVIDER=mistral
 # openai               # STT_PROVIDER=openai or LLM_PROVIDER=openai
 # anthropic            # LLM_PROVIDER=anthropic
-# faster-whisper "av<16"   # STT_PROVIDER=local -- faster-whisper 1.2.x passes an av.open() option PyAV 16+ removed
+# faster-whisper       # STT_PROVIDER=local (relies on the av<16 pin above)
 # ollama               # LLM_PROVIDER=local
 # bleak                # SYNC_TRANSPORT=ble
 # pyobjc-framework-CoreBluetooth   # SYNC_TRANSPORT=ble, macOS only -- optional L2CAP CoC fast path (ble_l2cap_client.py); safe to skip, falls back to bleak/GATT automatically

@@ -27,7 +27,7 @@ import notifications
 import settings
 import status
 import storage
-from providers import get_transcriber, get_summarizer, get_completer
+from providers import get_transcriber, get_summarizer, get_completer, llm_enabled
 from providers.base import format_transcript_with_speakers
 
 log = logging.getLogger("poller")
@@ -782,9 +782,15 @@ async def process_once():
 
         status.update(sync_in_progress=True)
         try:
-            stt_name, transcribe = get_transcriber()
             llm_name, summarize = get_summarizer()
-            transcription = await asyncio.to_thread(transcribe, wav_bytes)
+            prefilled = record.get("prefilled_transcription") or {}
+            if prefilled.get("text"):
+                # Transcribed live while recording (live_recorder.py) -- no second STT pass.
+                stt_name = prefilled.get("stt_provider", "live")
+                transcription = {"text": prefilled["text"], "segments": prefilled.get("segments")}
+            else:
+                stt_name, transcribe = get_transcriber()
+                transcription = await asyncio.to_thread(transcribe, wav_bytes)
             transcript, segments = transcription["text"], transcription.get("segments")
             insights = transcription.get("deepgram_insights")  # None for non-Deepgram providers
 
@@ -808,7 +814,7 @@ async def process_once():
             # recording (not per chunk) -- see build_context_fit_prompt's
             # docstring. Skipped for a single-chunk transcript: nothing
             # to judge a chunk "against" with no neighbors.
-            if segments and settings.get_all().get("classify_context_fit", True):
+            if segments and llm_enabled() and settings.get_all().get("classify_context_fit", True):
                 from providers.base import (
                     build_context_fit_prompt, parse_context_fit_verdicts, merge_consecutive_segments,
                 )
@@ -823,13 +829,18 @@ async def process_once():
                     except Exception as e:
                         log.warning("context-fit classification failed (non-fatal, all chunks treated as fitting): %s", e)
 
-            formatted = format_transcript_with_speakers(transcript, segments)
+            formatted = format_transcript_with_speakers(transcript, segments, record.get("speaker_names") or None)
 
             # Jarvis voice commands (cmd_*.wav, see recorder.cpp) skip the
             # memo pipeline entirely -- routed here, right before the
             # type-classification call below, so a command never pays for
             # two wasted memo-pipeline LLM calls (type classification +
             # summarize) before being dispatched.
+            if record.get("kind") == "command" and not llm_enabled():
+                storage.mark_failed(content_hash, "Jarvis voice commands need a summarization (LLM) provider -- "
+                                                  "choose one in Settings -> Providers.")
+                continue
+
             if record.get("kind") == "command":
                 # Voice commands never go through the memo pipeline's own
                 # voice-ID block below (this branch `continue`s before
@@ -914,14 +925,25 @@ async def process_once():
             from providers.base import build_recording_type_prompt
             from providers import get_completer
             _, complete = get_completer()
-            type_verdict = await asyncio.to_thread(complete, build_recording_type_prompt(formatted))
-            pre_classified_conversation = type_verdict.strip().upper() == "CONVERSATION"
+            pre_classified_conversation = False
+            # The transcript is already done at this point -- a summarization failure (provider not
+            # installed, bad API key, network) must not throw it away. Keep the recording, mark it
+            # done with a transcript-only summary, and say why on the dashboard.
+            try:
+                if llm_enabled():
+                    type_verdict = await asyncio.to_thread(complete, build_recording_type_prompt(formatted))
+                    pre_classified_conversation = type_verdict.strip().upper() == "CONVERSATION"
 
-            # Pass insights/meeting through -- each provider's summarize()
-            # forwards them to build_summary_prompt() so entity/topic/intent/
-            # sentiment context and calendar attendee names enrich the LLM's
-            # output without a separate API call.
-            summary = await asyncio.to_thread(summarize, formatted, insights, record.get("meeting"))
+                # Pass insights/meeting through -- each provider's summarize()
+                # forwards them to build_summary_prompt() so entity/topic/intent/
+                # sentiment context and calendar attendee names enrich the LLM's
+                # output without a separate API call.
+                summary = await asyncio.to_thread(summarize, formatted, insights, record.get("meeting"))
+            except Exception as e:
+                log.warning("summarization failed for %s, keeping the transcript only: %s", record["name"], e)
+                from providers import transcript_only_summary
+                summary = transcript_only_summary(formatted)
+                summary["summary_error"] = str(e)
             _enforce_journal_rule(summary, segments, pre_classified_conversation)
             _add_speakers_as_stakeholders(summary)
 
@@ -1075,7 +1097,7 @@ async def merge_continuations_once():
     dedicated classifier was chosen over rag_index embedding similarity.
     """
     saved = settings.get_all()
-    if not saved.get("merge_continuations_enabled", True):
+    if not saved.get("merge_continuations_enabled", True) or not llm_enabled():
         return
     gap_minutes = saved.get("merge_gap_minutes", conversation_merge.DEFAULT_MERGE_GAP_MINUTES)
 

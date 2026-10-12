@@ -28,9 +28,18 @@ def transcribe(wav_bytes: bytes) -> dict:
     return {"text": text, "segments": None}  # faster-whisper doesn't diarize
 
 
+def _ollama_client():
+    try:
+        import ollama
+    except ImportError:
+        raise RuntimeError("Local summarization needs Ollama, which isn't installed. Install it from "
+                           "ollama.com (and `pip install ollama`), or pick another summarization "
+                           "provider (or None) in Settings -> Providers.")
+    return ollama.Client(host=config.OLLAMA_BASE_URL)
+
+
 def summarize(transcript: str, deepgram_insights: dict = None, meeting: dict = None) -> dict:
-    import ollama
-    client = ollama.Client(host=config.OLLAMA_BASE_URL)
+    client = _ollama_client()
     resp = client.chat(
         model=config.OLLAMA_MODEL,
         messages=[{"role": "user", "content": build_summary_prompt(transcript, deepgram_insights, meeting)}],
@@ -42,8 +51,7 @@ def complete(prompt: str) -> str:
     """Plain text completion for non-transcript prompts (e.g. the person-
     knowledge merge, see notion_sync.push_people) -- same client/model as
     summarize(), no JSON-schema expectations on the output."""
-    import ollama
-    client = ollama.Client(host=config.OLLAMA_BASE_URL)
+    client = _ollama_client()
     resp = client.chat(
         model=config.OLLAMA_MODEL,
         messages=[{"role": "user", "content": prompt}],

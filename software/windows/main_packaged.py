@@ -39,6 +39,36 @@ else:
 if getattr(sys, "frozen", False):
     os.chdir(sys._MEIPASS)
 
+
+def _preload_current_msvcp140():
+    """bleak's WinRT backend (the `winrt` package) ships an old MSVCP140.dll (14.29). If it's the first
+    copy loaded, every later native library in the process gets it too, and libraries built with a
+    newer MSVC (onnxruntime for Parakeet, ctranslate2 for faster-whisper) crash inside it with
+    0xc0000005. Loading the system's copy first (when it's >= 14.40) makes everyone share that one;
+    MSVCP140 is backward compatible, so the WinRT code is fine with it."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+    from ctypes import wintypes
+    path = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "msvcp140.dll")
+    try:
+        ver = ctypes.WinDLL("version")
+        size = ver.GetFileVersionInfoSizeW(path, None)
+        if not size:
+            return
+        buf = ctypes.create_string_buffer(size)
+        ver.GetFileVersionInfoW(path, 0, size, buf)
+        ptr, length = ctypes.c_void_p(), wintypes.UINT()
+        ver.VerQueryValueW(buf, "\\", ctypes.byref(ptr), ctypes.byref(length))
+        ms = ctypes.cast(ptr, ctypes.POINTER(wintypes.DWORD * 4)).contents[2]   # VS_FIXEDFILEINFO.dwFileVersionMS
+        if (ms >> 16, ms & 0xFFFF) >= (14, 40):
+            ctypes.WinDLL(path)
+    except Exception:
+        pass
+
+
+_preload_current_msvcp140()
+
 import paths
 
 # With no console (pythonw.exe, or the PyInstaller console=False exe) sys.stdout/stderr are None, and
@@ -248,36 +278,121 @@ def _tray_icon_image():
     return Image.open(os.path.join(here, "clicky_icon.ico"))
 
 
+def _recording_icon_image(base):
+    """The normal icon with a red dot in the corner, shown while a live recording is running."""
+    from PIL import ImageDraw
+    img = base.convert("RGBA").resize((64, 64))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse((34, 34, 62, 62), fill=(220, 30, 30, 255), outline=(255, 255, 255, 255), width=3)
+    return img
+
+
+def _beep(kind: str):
+    try:
+        import winsound
+        winsound.MessageBeep(winsound.MB_OK if kind == "start" else winsound.MB_ICONASTERISK)
+    except Exception:
+        pass
+
+
+IDLE_TOOLTIP = "Clicky is running - click to open the dashboard. Hold Caps Lock 1 s to record."
+RECORDING_TOOLTIP = "Clicky is RECORDING - hold Caps Lock 1 s (or right-click) to stop"
+
+
 def _run_tray() -> bool:
     """Shows the Clicky system-tray icon (left-click / double-click opens the
-    dashboard; right-click offers Open / Quit) and a one-time "Clicky is
-    running" notification, so a user can tell the app is up even though it
-    has no window of its own. Blocks until Quit is chosen. Returns False if
-    the tray couldn't be created (missing pystray/Pillow, no shell), so the
-    caller can fall back to running headless rather than dying."""
+    dashboard; right-click offers Open / Start-Stop recording / Quit) and a
+    one-time "Clicky is running" notification, so a user can tell the app is
+    up even though it has no window of its own. Also owns live recording
+    (live_recorder.py): the tray menu item and the Caps Lock hold both toggle
+    it, with a red-dot icon, a sound and a notification on every start/stop.
+    Blocks until Quit is chosen. Returns False if the tray couldn't be
+    created (missing pystray/Pillow, no shell), so the caller can fall back
+    to running headless rather than dying."""
     try:
         import pystray
         image = _tray_icon_image()
+        recording_image = _recording_icon_image(image)
     except Exception:
         return False
 
+    import live_recorder
+    import live_transcriber
+    import live_translator
+    import subtitle_bar
+    controller = live_recorder.controller
+    icon = None
+
+    bar = subtitle_bar.SubtitleBar(status_fn=controller.status, on_stop=controller.stop,
+                                   on_open_dashboard=_open_dashboard)
+    bar.start()
+    live_transcriber.add_update_listener(bar.on_update)
+
+    def _notify(message, title):
+        try:
+            icon.notify(message, title)
+        except Exception:
+            pass
+
+    def _on_recording_event(event, info):
+        if event == "started":
+            icon.icon, icon.title = recording_image, RECORDING_TOOLTIP
+            bar.show()
+            _beep("start")
+            _notify(f"Recording {info}. Hold Caps Lock 1 s again to stop. "
+                    "Let everyone in the conversation know you're recording.", "Clicky is recording")
+        elif event == "stopping":
+            icon.icon, icon.title = image, "Clicky - saving the recording..."
+            _beep("stop")
+        elif event == "saved":
+            icon.title = IDLE_TOOLTIP
+            bar.hide(after_s=subtitle_bar.HIDE_AFTER_STOP_S)
+            _notify(f"{info} is on the dashboard (audio + transcript).", "Recording saved")
+        elif event in ("discarded", "failed"):
+            icon.icon, icon.title = image, IDLE_TOOLTIP
+            bar.hide(after_s=subtitle_bar.HIDE_AFTER_STOP_S)
+            _notify(info, "Recording discarded" if event == "discarded" else "Recording problem")
+        elif event == "warning":
+            _notify(info, "Unmute your microphone")
+        elif event == "info":
+            _notify(info, "Microphone is live")
+        icon.update_menu()
+
+    controller.add_listener(_on_recording_event)
+
     def _quit(icon, _item):
+        if controller.recording:
+            controller.stop()
+            time.sleep(1.5)   # let the save thread write the recording before the process exits
         icon.stop()
 
     menu = pystray.Menu(
         pystray.MenuItem("Open Clicky dashboard", _open_dashboard, default=True),
+        pystray.MenuItem(lambda item: "Stop recording" if controller.recording else "Start recording (or hold Caps Lock 1 s)",
+                         lambda *_: threading.Thread(target=controller.toggle, daemon=True).start()),
+        pystray.MenuItem("Show subtitle bar while recording",
+                         lambda *_: (settings.update(subtitle_bar=not settings.get_all().get("subtitle_bar", True)),
+                                     bar.show() if controller.recording and settings.get_all().get("subtitle_bar", True)
+                                     else bar.hide()),
+                         checked=lambda item: settings.get_all().get("subtitle_bar", True)),
         pystray.MenuItem(f"Running at {_dashboard_url()}", None, enabled=False),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit Clicky", _quit),
     )
-    icon = pystray.Icon("Clicky", image, "Clicky is running - click to open the dashboard", menu)
+    icon = pystray.Icon("Clicky", image, IDLE_TOOLTIP, menu)
+
+    # Always running; it checks the "capslock_record_hotkey" setting itself, so Settings can switch it live.
+    watcher = live_recorder.CapsLockHoldWatcher(controller.toggle)
 
     def _on_ready(icon):
         icon.visible = True
-        try:
-            icon.notify("Click the Clicky icon in the system tray to open the dashboard.", "Clicky is running")
-        except Exception:
-            pass
+        if watcher:
+            watcher.start()
+        live_recorder.CallWatcher(controller).start()   # does nothing unless "auto_record_calls" is on
+        live_transcriber.preload_in_background()
+        live_translator.preload_in_background()
+        _notify("Click the Clicky icon in the system tray to open the dashboard. "
+                "Hold Caps Lock for 1 second to start or stop recording a conversation.", "Clicky is running")
 
     try:
         icon.run(_on_ready)

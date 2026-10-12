@@ -37,6 +37,15 @@
 # sideloadable .msix (Start Menu entry, clean uninstall, no Store account
 # needed).
 
+# sherpa-onnx (live transcription, live_transcriber.py) ships native onnxruntime libraries that
+# static analysis doesn't pick up on its own.
+from PyInstaller.utils.hooks import collect_all
+_sherpa_datas, _sherpa_binaries, _sherpa_hidden = collect_all('sherpa_onnx')
+# ctranslate2 (live translation, live_translator.py) ships native libraries the same way.
+for _pkg in ('ctranslate2',):
+    _d, _b, _h = collect_all(_pkg)
+    _sherpa_datas, _sherpa_binaries, _sherpa_hidden = _sherpa_datas + _d, _sherpa_binaries + _b, _sherpa_hidden + _h
+
 a = Analysis(
     ['main_packaged.py'],
     pathex=[],
@@ -44,7 +53,7 @@ a = Analysis(
     # suppression on recorded audio (see noise_reduction.py and
     # THIRD_PARTY_NOTICES.md) -- landed at the bundle root to match that
     # module's frozen-mode lookup of sys._MEIPASS/rnnoise.dll.
-    binaries=[('rnnoise.dll', '.')],
+    binaries=[('rnnoise.dll', '.')] + _sherpa_binaries,
     datas=[
         ('templates', 'templates'),
         ('static', 'static'),
@@ -56,7 +65,7 @@ a = Analysis(
         ('.env', '.'),
         # Tray icon image, loaded at runtime by main_packaged.py's _run_tray().
         ('clicky_icon.ico', '.'),
-    ],
+    ] + _sherpa_datas,
     hiddenimports=[
         # Same reasoning as clicky.spec's list -- these are imported
         # dynamically inside functions, not at module top-level, so
@@ -68,6 +77,9 @@ a = Analysis(
         'pystray',  # system-tray icon (main_packaged.py); picks its Windows backend dynamically
         'pystray._win32',
         'PIL.Image',
+        'av',  # audio_utils.to_device_wav (file uploads); imported lazily inside the function
+        'pyaudiowpatch',  # live_recorder.py -- imported lazily when a recording starts
+        'soxr',
         'yaml',  # obsidian_sync.py's frontmatter read/write
         # voice_id.py's speaker-embedding model -- torch/speechbrain's own
         # dynamic import patterns are extensive; this list is a starting
@@ -81,7 +93,7 @@ a = Analysis(
         'uvicorn.protocols.http.auto',
         'uvicorn.protocols.websockets.auto',
         'uvicorn.lifespan.on',
-    ],
+    ] + _sherpa_hidden,
     hookspath=[],
     runtime_hooks=[],
     excludes=[],

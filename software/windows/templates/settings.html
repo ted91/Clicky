@@ -124,6 +124,10 @@
       <div class="sidebar-item" data-panel="conversation-merge">
         <span class="icon">🔗</span> Conversation Merging
       </div>
+      <div class="sidebar-item" data-panel="live">
+        <span class="icon">💬</span> Live Subtitles
+        <span class="status-dot {{ 'connected' if current.get('subtitle_bar', True) and live_models_ok }}"></span>
+      </div>
 
       <div class="sidebar-group-label">Integrations</div>
       <div class="sidebar-item" data-panel="notion">
@@ -432,6 +436,7 @@
               <option value="mistral" {{ "selected" if current.stt_provider == "mistral" }}>Mistral (Voxtral)</option>
               <option value="openai" {{ "selected" if current.stt_provider == "openai" }}>OpenAI (Whisper)</option>
               <option value="deepgram" {{ "selected" if current.stt_provider == "deepgram" }}>Deepgram (Nova-3, higher accuracy)</option>
+              <option value="parakeet" {{ "selected" if current.stt_provider == "parakeet" }}>On-board Parakeet (free, offline, most accurate local option)</option>
               <option value="local" {{ "selected" if current.stt_provider == "local" }}>Local (faster-whisper, free)</option>
             </select>
 
@@ -441,6 +446,7 @@
               <option value="openai" {{ "selected" if current.llm_provider == "openai" }}>OpenAI</option>
               <option value="anthropic" {{ "selected" if current.llm_provider == "anthropic" }}>Anthropic (Claude)</option>
               <option value="local" {{ "selected" if current.llm_provider == "local" }}>Local (Ollama, free)</option>
+              <option value="none" {{ "selected" if current.llm_provider == "none" }}>None (transcription only, no API key)</option>
             </select>
 
             <div id="mistral-key" class="key-field">
@@ -710,6 +716,65 @@
             <input type="text" id="obsidian_vault_path" name="obsidian_vault_path" value="{{ current.obsidian_vault_path or '' }}" placeholder="/Users/you/Documents/MyVault">
           </fieldset>
           <button type="submit" class="full-width">Save Obsidian settings</button>
+        </form>
+      </div>
+
+      <!-- Live subtitles: live recording + subtitle bar + translation (live_recorder / subtitle_bar / live_translator) -->
+      <div class="panel" data-panel="live">
+        <h2>Live Subtitles</h2>
+        <p class="desc">
+          Live recording (hold Caps Lock for 1 second, the tray menu, or the dashboard) transcribes on this laptop
+          with Parakeet while you talk, shows it in an always-on-top subtitle bar, and can translate it to English.
+          The saved recording keeps the audio, the transcript and the translation. Right-click the subtitle bar
+          for quick changes; drag it to move it. Tell people before you record them.
+        </p>
+        {% if not live_models_ok %}
+          <p class="error">The live transcription model isn't installed yet — run <code>python live_transcriber.py</code>
+          once (≈650 MB download). Recording still works without it; the transcript is then made after you stop.</p>
+        {% endif %}
+        <form method="post" action="/settings/live">
+          <fieldset>
+            <legend>Recording</legend>
+            <label><input type="checkbox" name="capslock_record_hotkey" value="true" {{ "checked" if current.get('capslock_record_hotkey', True) }} style="width:auto;display:inline-block;vertical-align:middle;"> Hold Caps Lock for 1 second to start / stop recording</label>
+            <label><input type="checkbox" name="auto_record_calls" value="true" {{ "checked" if current.get('auto_record_calls', False) }} style="width:auto;display:inline-block;vertical-align:middle;"> Record Teams / Zoom / Meet calls automatically</label>
+            <label><input type="checkbox" name="live_transcription" value="true" {{ "checked" if current.get('live_transcription', True) }} style="width:auto;display:inline-block;vertical-align:middle;"> Transcribe live while recording</label>
+            <label for="live_mode">What to record</label>
+            <select id="live_mode" name="live_mode">
+              <option value="both" {{ "selected" if current.get('live_record_computer_audio', True) }}>My microphone + computer audio (calls)</option>
+              <option value="mic_only" {{ "selected" if not current.get('live_record_computer_audio', True) }}>Conversation mode: microphone only (people in the room)</option>
+            </select>
+            <label for="live_mic_device">Microphone</label>
+            <select id="live_mic_device" name="live_mic_device">
+              <option value="">Windows default</option>
+              {% for name in live_devices.mics %}<option value="{{ name }}" {{ "selected" if current.get('live_mic_device') == name }}>{{ name }}</option>{% endfor %}
+            </select>
+            <label for="live_output_device">Computer audio (what you hear)</label>
+            <select id="live_output_device" name="live_output_device">
+              <option value="">Windows default</option>
+              {% for name in live_devices.outputs %}<option value="{{ name }}" {{ "selected" if current.get('live_output_device') == name }}>{{ name }}</option>{% endfor %}
+            </select>
+          </fieldset>
+          <fieldset>
+            <legend>Subtitle bar &amp; translation</legend>
+            <label><input type="checkbox" name="subtitle_bar" value="true" {{ "checked" if current.get('subtitle_bar', True) }} style="width:auto;display:inline-block;vertical-align:middle;"> Show the subtitle bar while recording</label>
+            <label for="subtitle_translate_from">Translate to English from</label>
+            <select id="subtitle_translate_from" name="subtitle_translate_from">
+              <option value="">Off — show what's said, untranslated</option>
+              {% for code, name in live_languages %}<option value="{{ code }}" {{ "selected" if current.get('subtitle_translate_from') == code }}>{{ name }}</option>{% endfor %}
+            </select>
+            <label><input type="checkbox" name="subtitle_show_original" value="true" {{ "checked" if current.get('subtitle_show_original', False) }} style="width:auto;display:inline-block;vertical-align:middle;"> Also show the original text under the translation</label>
+            <label><input type="checkbox" name="subtitle_translate_own_mic" value="true" {{ "checked" if current.get('subtitle_translate_own_mic', True) }} style="width:auto;display:inline-block;vertical-align:middle;"> Translate my own microphone too</label>
+            <label><input type="checkbox" name="subtitle_show_source" value="true" {{ "checked" if current.get('subtitle_show_source', True) }} style="width:auto;display:inline-block;vertical-align:middle;"> Label my lines with "You:"</label>
+            <label for="subtitle_font_size">Subtitle size</label>
+            <input type="number" id="subtitle_font_size" name="subtitle_font_size" min="12" max="72" value="{{ current.get('subtitle_font_size', 24) }}">
+            <label for="subtitle_lines">Lines shown</label>
+            <input type="number" id="subtitle_lines" name="subtitle_lines" min="1" max="5" value="{{ current.get('subtitle_lines', 3) }}">
+          </fieldset>
+          <fieldset>
+            <legend>Startup</legend>
+            <label><input type="checkbox" name="start_with_windows" value="true" {{ "checked" if autostart_enabled }} style="width:auto;display:inline-block;vertical-align:middle;"> Start Clicky with Windows</label>
+          </fieldset>
+          <button type="submit" class="full-width">Save live subtitle settings</button>
         </form>
       </div>
 

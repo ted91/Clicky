@@ -24,7 +24,10 @@ function deleteButton(r) {
   // from device" additionally erases the file from the SD card itself --
   // a real, irreversible action, kept visually separate (danger styling)
   // so it's not clicked by mistake in place of the routine one.
-  return `<button class="delete-btn" data-hash="${escapeHtml(r.content_hash)}" data-name="${escapeHtml(r.name)}">Delete</button>` +
+  const local = `<button class="delete-btn" data-hash="${escapeHtml(r.content_hash)}" data-name="${escapeHtml(r.name)}">Delete</button>`;
+  // Uploaded files never came from the device, so there's nothing on the SD card to erase.
+  if ((r.name || "").startsWith("upload_")) return local;
+  return local +
     `<button class="delete-device-btn danger" data-hash="${escapeHtml(r.content_hash)}" data-name="${escapeHtml(r.name)}">Delete from device</button>`;
 }
 
@@ -122,6 +125,15 @@ function renderRecording(r) {
       }).join("")}</div>`
     : `<pre class="transcript">${escapeHtml(r.transcript)}</pre>`;
 
+  // Live recordings translated while recording (subtitle bar) keep the English per line.
+  const translated = (r.segments || []).filter(seg => seg.translation);
+  const translationHtml = translated.length
+    ? `<details><summary>English translation (${escapeHtml((translated[0].translation_lang || "").toUpperCase())} → EN)</summary>
+         <div class="transcript">${translated.map(seg =>
+           `<p><span class="speaker">${escapeHtml(speakerNames[seg.speaker_id] || `Speaker ${seg.speaker_id}`)}:</span> ${escapeHtml(seg.translation)}</p>`).join("")}</div>
+       </details>`
+    : "";
+
   const confidenceClass = (score) => score >= 0.9 ? "confidence-green" : score >= 0.75 ? "confidence-yellow" : "confidence-red";
   const confidenceBar = (score) => {
     const pct = Math.round(score * 100);
@@ -194,7 +206,11 @@ function renderRecording(r) {
               ${meetingHeader}
               ${sentimentBadge}
               ${topicsHtml}
-              <p>${escapeHtml(r.summary.summary)}</p>
+              ${r.summary.summary
+                ? `<p>${escapeHtml(r.summary.summary)}</p>`
+                : r.summary.summary_error
+                  ? `<p class="providers" style="font-style: italic; color: #c0392b;">No summary: ${escapeHtml(r.summary.summary_error)} The transcript is still saved.</p>`
+                  : (r.llm_provider === "none" ? `<p class="providers" style="font-style: italic;">Transcript only — summarization is turned off (Settings → Providers).</p>` : "")}
               ${r.summary.excluded_background_note ? `<p class="providers" style="font-style: italic;">${escapeHtml(r.summary.excluded_background_note)}</p>` : ""}
               ${actionItems ? `<div class="section-label">Action items</div><ul class="action-items">${actionItems}</ul>` : ""}
               ${followUps ? `<div class="section-label">Follow-ups</div><ul class="action-items">${followUps}</ul>` : ""}
@@ -208,6 +224,7 @@ function renderRecording(r) {
                 <summary>Full transcript</summary>
                 ${transcriptHtml}
               </details>
+              ${translationHtml}
               <div class="providers">stt=${escapeHtml(r.stt_provider)} · llm=${escapeHtml(r.llm_provider)} ${destBadges}</div>
             </div>
           </div>
@@ -274,7 +291,7 @@ async function refresh() {
     const container = document.getElementById("recordings");
     container.innerHTML = recordings.length
       ? recordings.map(renderRecording).join("")
-      : '<p class="empty">No recordings processed yet — record a memo on the device and it\'ll show up here within one poll interval.</p>';
+      : '<p class="empty">No recordings yet — record a memo on the device, or add an audio file above.</p>';
     document.getElementById("count").textContent = recordings.length;
 
     // innerHTML above just blew away every checkbox's checked state --

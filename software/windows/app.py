@@ -6,7 +6,7 @@ import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import BackgroundTasks, FastAPI, Request, Form, Response
+from fastapi import BackgroundTasks, FastAPI, File, Request, Form, Response, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -133,7 +133,7 @@ def _recordings_for_display():
 
 
 @app.get("/")
-def index(request: Request):
+def index(request: Request, uploaded: str = "", upload_error: str = ""):
     redirect = _gate(request)
     if redirect:
         return redirect
@@ -145,8 +145,111 @@ def index(request: Request):
         request,
         "index.html",
         {"recordings": recordings, "sync_transport": config.SYNC_TRANSPORT, "active_nav": "transcription",
-         "voice_id_enabled": voice_id.is_enabled()},
+         "voice_id_enabled": voice_id.is_enabled(), "uploaded": uploaded, "upload_error": upload_error},
     )
+
+
+@app.post("/recordings/upload")
+async def upload_recording(request: Request, file: UploadFile = File(...)):
+    """Adds an audio/video file from disk as a recording -- same pipeline as a device sync
+    (storage.add_pending -> poller.process_once transcribes/summarizes it on the next poll)."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    import hashlib
+    import audio_utils
+
+    def back(**params):
+        return RedirectResponse("/?" + urllib.parse.urlencode(params), status_code=303)
+
+    data = await file.read()
+    if not data:
+        return back(upload_error="That file is empty.")
+    content_hash = hashlib.md5(data).hexdigest()
+    if storage.is_known_content_hash(content_hash):
+        return back(upload_error="That file was already added.")
+    try:
+        wav = await asyncio.to_thread(audio_utils.to_device_wav, data)
+    except ValueError as e:
+        return back(upload_error=str(e))
+    if audio_utils.is_silent_wav(wav):
+        # Speech-to-text "hears" words in pure silence (Whisper: "You You You ..."), so reject instead.
+        return back(upload_error="This file has no sound in it -- it's completely silent from start to finish, so "
+                                 "there's nothing to transcribe. (Files like this usually come from recording "
+                                 "with a muted microphone.)")
+
+    stem, ext = os.path.splitext(os.path.basename(file.filename or ""))
+    ext = ext.lstrip(".").lower()
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_")[:60] or "audio"
+    # Keep the original extension in the name so memo.mp3 and memo.m4a don't both show as "upload_memo.wav".
+    name = f"upload_{safe_stem}" + (f"_{ext}" if ext and ext != "wav" else "") + ".wav"
+    await asyncio.to_thread(storage.add_pending, name, len(wav), content_hash, wav)
+    return back(uploaded=file.filename or name)
+
+
+@app.get("/api/live")
+def live_status(request: Request):
+    """Live recording state + the transcript so far, polled by the dashboard's live panel."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    import live_recorder
+    return JSONResponse(live_recorder.controller.status())
+
+
+@app.post("/settings/live")
+def save_live_settings(request: Request,
+                       subtitle_bar: str = Form(""), subtitle_translate_from: str = Form(""),
+                       subtitle_show_original: str = Form(""), subtitle_translate_own_mic: str = Form(""),
+                       subtitle_show_source: str = Form(""), subtitle_font_size: int = Form(24),
+                       subtitle_lines: int = Form(3), live_mic_device: str = Form(""),
+                       live_output_device: str = Form(""), live_mode: str = Form("both"),
+                       auto_record_calls: str = Form(""), capslock_record_hotkey: str = Form(""),
+                       live_transcription: str = Form(""), start_with_windows: str = Form("")):
+    """Settings -> Live subtitles (live recording, subtitle bar, translation, devices)."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    on = lambda v: v == "true"
+    settings.update(
+        subtitle_bar=on(subtitle_bar), subtitle_translate_from=subtitle_translate_from,
+        subtitle_show_original=on(subtitle_show_original), subtitle_translate_own_mic=on(subtitle_translate_own_mic),
+        subtitle_show_source=on(subtitle_show_source), subtitle_font_size=max(12, min(72, subtitle_font_size)),
+        subtitle_lines=max(1, min(5, subtitle_lines)), live_mic_device=live_mic_device,
+        live_output_device=live_output_device, live_record_computer_audio=live_mode != "mic_only",
+        auto_record_calls=on(auto_record_calls), capslock_record_hotkey=on(capslock_record_hotkey),
+        live_transcription=on(live_transcription),
+    )
+    error = None
+    try:
+        import autostart
+        if autostart.is_enabled() != on(start_with_windows):
+            autostart.set_enabled(on(start_with_windows))
+    except Exception as e:
+        error = f"Couldn't change 'Start with Windows': {e}"
+    return templates.TemplateResponse(request, "settings.html", _settings_context("live", saved=error is None, setup_error=error))
+
+
+@app.post("/live/auto-record")
+def live_auto_record(request: Request, enabled: str = Form("")):
+    """Dashboard switch for live_recorder.CallWatcher (record Teams/Zoom/Meet calls automatically)."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    settings.update(auto_record_calls=enabled == "1")
+    import live_recorder
+    return JSONResponse(live_recorder.controller.status())
+
+
+@app.post("/live/toggle")
+async def live_toggle(request: Request):
+    """Dashboard Start/Stop button -- same controller as the tray menu and the Caps Lock hold."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    import live_recorder
+    await asyncio.to_thread(live_recorder.controller.toggle)
+    return JSONResponse(live_recorder.controller.status())
 
 
 @app.get("/api/recordings")
@@ -911,6 +1014,22 @@ def api_mac_wifi_ssid(request: Request):
     return _current_mac_wifi_ssid()
 
 
+def _live_settings_context() -> dict:
+    """Settings -> Live subtitles: audio devices, installed translation languages, autostart state."""
+    import autostart
+    import live_transcriber
+    import live_translator
+    try:
+        import live_recorder
+        devices = live_recorder.list_devices()
+    except Exception:
+        devices = {"mics": [], "outputs": []}
+    return {"live_devices": devices,
+            "live_languages": [(c, live_translator.lang_name(c)) for c in live_translator.available_languages()],
+            "autostart_enabled": autostart.is_enabled(),
+            "live_models_ok": live_transcriber.models_available()}
+
+
 def _settings_context(active_panel: str = "device", wifi_msg: str = "", saved: bool = False, setup_error: str = None) -> dict:
     """Common context every settings.html render needs -- centralized so a
     new integration/panel doesn't mean touching every route that renders
@@ -932,6 +1051,7 @@ def _settings_context(active_panel: str = "device", wifi_msg: str = "", saved: b
         "google_configured": google_client.has_client_credentials(),
         "teams_connected": teams_client.is_connected(),
         "teams_configured": teams_client.has_client_credentials(),
+        **_live_settings_context(),
         "linkedin_connected": linkedin_client.is_connected(),
         "linkedin_configured": linkedin_client.has_client_credentials(),
         "x_connected": x_client.is_connected(),

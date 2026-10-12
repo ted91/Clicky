@@ -248,6 +248,95 @@
     Sync: {{ sync_transport }} &middot; <span id="count">{{ recordings|length }}</span> recording(s)
   </div>
 
+  {# Live recording (live_recorder.py): Caps Lock hold / tray / this button, transcript shown as it's spoken. #}
+  <div id="live-panel" style="margin:0.75rem 0; padding:0.75rem 1rem; border:1px solid var(--border, #ccc); border-radius:8px;">
+    <div style="display:flex; flex-wrap:wrap; align-items:center; gap:0.6rem;">
+      <span id="live-dot" style="width:10px; height:10px; border-radius:50%; background:#999; display:inline-block;"></span>
+      <strong id="live-title">Live recording</strong>
+      <span id="live-info" style="font-size:0.85rem; opacity:0.75;">Hold Caps Lock for 1 second (or use the tray icon) to start.</span>
+      <label style="margin-left:auto; font-size:0.85rem; display:flex; align-items:center; gap:0.35rem; cursor:pointer;"
+             title="Starts recording when a Teams / Zoom / Meet call is detected and stops when it ends. Let participants know you're recording.">
+        <input type="checkbox" id="live-auto" style="width:auto; margin:0;"> Record calls automatically
+      </label>
+      <button type="button" id="live-toggle">Start recording</button>
+    </div>
+    <div id="live-lines" hidden style="margin-top:0.6rem; max-height:16rem; overflow-y:auto; font-size:0.9rem; line-height:1.4;"></div>
+  </div>
+  <script>
+    (function () {
+      const lines = document.getElementById("live-lines"), btn = document.getElementById("live-toggle");
+      const auto = document.getElementById("live-auto");
+      auto.addEventListener("change", async () => {
+        const body = new URLSearchParams({enabled: auto.checked ? "1" : ""});
+        try { await fetch("/live/auto-record", {method: "POST", body}); } finally { auto.blur(); }
+      });
+      const dot = document.getElementById("live-dot"), title = document.getElementById("live-title"), info = document.getElementById("live-info");
+      const label = id => id === "you" ? "You" : id === "others" ? "Others" : id;
+      const esc = s => String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+      const mmss = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+      let busy = false, lastHtml = "";
+      async function poll() {
+        try {
+          const r = await fetch("/api/live"); if (!r.ok) return;
+          const s = await r.json();
+          btn.textContent = s.recording ? "Stop recording" : "Start recording";
+          if (document.activeElement !== auto) auto.checked = !!s.auto_record;
+          dot.style.background = s.recording ? "#dc1e1e" : "#999";
+          if (!s.recording) {
+            title.textContent = "Live recording";
+            info.textContent = "Hold Caps Lock for 1 second (or use the tray icon) to start.";
+            lines.hidden = true; lastHtml = "";
+            return;
+          }
+          title.textContent = (s.auto_started ? "Recording call (auto) " : "Recording ") + mmss(s.elapsed);
+          info.textContent = s.sources + (s.live_transcription ? " — transcribing live" : " — transcript after you stop") +
+            (s.mic_state === "muted_in_call" ? " — your mic is muted, recording the meeting only" :
+             s.mic_state === "muted" ? " — ⚠ your microphone is muted: unmute it to record your voice" : "");
+          const en = t => t ? `<div style="opacity:0.75; margin:0 0 0.3rem 1rem;">EN: ${esc(t)}</div>` : "";
+          let html = (s.segments || []).slice(-40).map(g =>
+            `<div><strong>${esc(label(g.speaker_id))}:</strong> ${esc(g.text)}</div>${en(g.translation)}`).join("");
+          for (const [src, txt] of Object.entries(s.drafts || {})) {
+            if (txt) html += `<div style="opacity:0.6; font-style:italic;"><strong>${esc(label(src))}:</strong> ${esc(txt)}</div>` +
+                             `<div style="opacity:0.5; font-style:italic;">${en((s.draft_translations || {})[src])}</div>`;
+          }
+          lines.hidden = false;
+          if (html !== lastHtml) {
+            const atBottom = lines.scrollTop + lines.clientHeight >= lines.scrollHeight - 20;
+            lines.innerHTML = html || '<div style="opacity:0.6;">Listening…</div>'; lastHtml = html;
+            if (atBottom) lines.scrollTop = lines.scrollHeight;
+          }
+        } catch (e) { /* server restarting -- retry next tick */ }
+      }
+      btn.addEventListener("click", async () => {
+        if (busy) return; busy = true; btn.disabled = true;
+        if (btn.textContent.startsWith("Stop")) btn.textContent = "Saving…";
+        try { await fetch("/live/toggle", {method: "POST"}); } finally { busy = false; btn.disabled = false; poll(); }
+      });
+      poll(); setInterval(poll, 1000);
+    })();
+  </script>
+
+  {# Add a recording from a file instead of the device -- same pipeline (app.py's upload_recording). #}
+  <form method="post" action="/recordings/upload" enctype="multipart/form-data" id="upload-form"
+        style="display:flex; flex-wrap:wrap; align-items:center; gap:0.6rem; margin:0.75rem 0 1rem; padding:0.75rem 1rem; border:1px dashed var(--border, #ccc); border-radius:8px;">
+    <strong style="font-size:0.9rem;">Add audio file</strong>
+    <input type="file" name="file" required
+           accept="audio/*,video/mp4,.wav,.mp3,.m4a,.mp4,.ogg,.oga,.opus,.flac,.webm,.aac,.wma">
+    <button type="submit" id="upload-btn">Upload &amp; transcribe</button>
+    <span style="font-size:0.8rem; opacity:0.75;">WAV, MP3, M4A, MP4, OGG, FLAC… processed the same way as a device recording.</span>
+  </form>
+  {% if uploaded %}
+    <p class="saved" style="margin-top:-0.5rem;">✓ Added “{{ uploaded }}” — it shows below as Processing… and fills in once transcribed.</p>
+  {% elif upload_error %}
+    <p class="error" style="margin-top:-0.5rem; color:#c0392b;">Upload failed: {{ upload_error }}</p>
+  {% endif %}
+  <script>
+    document.getElementById("upload-form").addEventListener("submit", () => {
+      const btn = document.getElementById("upload-btn");
+      btn.disabled = true; btn.textContent = "Uploading…";
+    });
+  </script>
+
   {# Manual meeting recording is controlled from the menu-bar icon, not the
      dashboard -- the dashboard is config + viewing only. This just shows a
      passive indicator when a recording happens to be in progress. #}
@@ -271,7 +360,7 @@
 
   <div id="recordings">
     {% if not recordings %}
-      <p class="empty">No recordings processed yet — record a memo on the device and it'll show up here within one poll interval.</p>
+      <p class="empty">No recordings yet — record a memo on the device, or add an audio file above.</p>
     {% endif %}
     {% for r in recordings %}
       <div class="recording">
@@ -280,7 +369,9 @@
             <div class="recording-left-controls">
               <input type="checkbox" class="recording-select" data-hash="{{ r.content_hash }}">
               <button class="delete-btn" data-hash="{{ r.content_hash }}" data-name="{{ r.name }}">Delete</button>
+              {% if not r.name.startswith("upload_") %}
               <button class="delete-device-btn danger" data-hash="{{ r.content_hash }}" data-name="{{ r.name }}">Delete from device</button>
+              {% endif %}
             </div>
             <audio controls preload="none" src="/audio/{{ r.content_hash }}.wav"></audio>
             <a class="download-audio-btn" href="/audio/{{ r.content_hash }}.wav?download=1" download title="Download original recording">Download</a>
@@ -320,7 +411,13 @@
               </div>
             {% endif %}
           {% endif %}
-          <p>{{ r.summary.summary }}</p>
+          {% if r.summary.summary %}
+            <p>{{ r.summary.summary }}</p>
+          {% elif r.summary.summary_error %}
+            <p class="providers" style="font-style: italic; color: #c0392b;">No summary: {{ r.summary.summary_error }} The transcript is still saved.</p>
+          {% elif r.llm_provider == "none" %}
+            <p class="providers" style="font-style: italic;">Transcript only — summarization is turned off (Settings → Providers).</p>
+          {% endif %}
           {% if r.summary.excluded_background_note %}
             <p class="providers" style="font-style: italic;">{{ r.summary.excluded_background_note }}</p>
           {% endif %}
@@ -437,6 +534,17 @@
               <pre class="transcript">{{ r.transcript }}</pre>
             {% endif %}
           </details>
+          {% set translated = (r.segments or []) | selectattr('translation') | list %}
+          {% if translated %}
+            <details>
+              <summary>English translation ({{ (translated[0].translation_lang or '') | upper }} → EN)</summary>
+              <div class="transcript">
+                {% for seg in translated %}
+                  <p><span class="speaker">{{ r.get('speaker_names', {}).get(seg.speaker_id) or ("Speaker " ~ seg.speaker_id) }}:</span> {{ seg.translation }}</p>
+                {% endfor %}
+              </div>
+            </details>
+          {% endif %}
           <div class="providers">
             stt={{ r.stt_provider }} · llm={{ r.llm_provider }}
             {% if r.notion_synced %}<span class="badge dest">Notion</span>{% endif %}

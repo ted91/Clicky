@@ -49,6 +49,7 @@
         <option value="mistral" {{ "selected" if current.stt_provider == "mistral" }}>Mistral (Voxtral)</option>
         <option value="openai" {{ "selected" if current.stt_provider == "openai" }}>OpenAI (Whisper)</option>
         <option value="deepgram" {{ "selected" if current.stt_provider == "deepgram" }}>Deepgram (Nova-3, higher accuracy)</option>
+        <option value="parakeet" {{ "selected" if current.stt_provider == "parakeet" }}>On-board Parakeet (free, offline, most accurate local option)</option>
         <option value="local" {{ "selected" if current.stt_provider == "local" }}>Local (faster-whisper, free)</option>
       </select>
 
@@ -58,6 +59,7 @@
         <option value="openai" {{ "selected" if current.llm_provider == "openai" }}>OpenAI</option>
         <option value="anthropic" {{ "selected" if current.llm_provider == "anthropic" }}>Anthropic (Claude)</option>
         <option value="local" {{ "selected" if current.llm_provider == "local" }}>Local (Ollama, free)</option>
+        <option value="none" {{ "selected" if current.llm_provider == "none" }}>None (transcription only, no API key)</option>
       </select>
 
       <div id="mistral-key" class="key-field">
