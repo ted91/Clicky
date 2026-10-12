@@ -47,9 +47,10 @@ SOURCE_LABELS = {MIC: "microphone", COMPUTER: "computer audio"}
 class _Source:
     """One capture stream, resampled to 16 kHz mono and placed on a shared wall-clock timeline."""
 
-    def __init__(self, p, pa, source_id: str, info: dict, t0: float, on_audio=None):
+    def __init__(self, p, pa, source_id: str, info: dict, t0: float, on_audio=None, keep_audio: bool = True):
         import soxr
         self.source_id, self._pa, self._t0, self._on_audio = source_id, pa, t0, on_audio
+        self.keep_audio = keep_audio   # False = subtitles only: audio goes to the live transcriber and nowhere else
         self.device_name = info.get("name", "")
         self.rate = int(info["defaultSampleRate"])
         self.channels = max(1, int(info["maxInputChannels"]))
@@ -75,7 +76,8 @@ class _Source:
                 expected_start = int((arrived - self._t0) * RATE) - len(y)
                 if expected_start > self._cursor + _GAP_TOLERANCE:
                     self._cursor = expected_start   # skip ahead over a silent gap instead of drifting early
-                self._parts.append((self._cursor, y))
+                if self.keep_audio:
+                    self._parts.append((self._cursor, y))
                 self._cursor += len(y)
             if self._on_audio:
                 self._on_audio(self.source_id, arrived, y)
@@ -152,6 +154,7 @@ class LiveRecorder:
         self.started_at = None
         self.started_monotonic = None
         self.sources_description = ""
+        self.keep_audio = True
 
     @property
     def recording(self) -> bool:
@@ -199,7 +202,7 @@ class LiveRecorder:
         import pyaudiowpatch as pa
         old = next((s for s in self._sources if s.source_id == MIC), None)
         feed = self.transcriber.feed if self.transcriber else None
-        new = _Source(self._p, pa, MIC, info, self.started_monotonic, feed)
+        new = _Source(self._p, pa, MIC, info, self.started_monotonic, feed, self.keep_audio)
         if old:
             old.close()
             self._retired.append(old)            # its audio so far still goes into the WAV
@@ -216,11 +219,13 @@ class LiveRecorder:
         return peak
 
     def start(self, include_computer_audio: bool = True, live_transcription: bool = True,
-              mic_device: str = "", output_device: str = ""):
+              mic_device: str = "", output_device: str = "", keep_audio: bool = True):
         """Raises RuntimeError with a user-facing message if no microphone can be opened.
-        mic_device / output_device: device names from list_devices() ("" = Windows default)."""
+        mic_device / output_device: device names from list_devices() ("" = Windows default).
+        keep_audio=False: subtitles only -- nothing is buffered, stop() returns no audio."""
         if self.recording:
             return
+        self.keep_audio = keep_audio
         import pyaudiowpatch as pa
         p = pa.PyAudio()
         t0 = time.monotonic()
@@ -238,13 +243,13 @@ class LiveRecorder:
 
         sources = []
         try:
-            sources.append(_Source(p, pa, MIC, _pick_mic(p, pa, mic_device), t0, feed))
+            sources.append(_Source(p, pa, MIC, _pick_mic(p, pa, mic_device), t0, feed, keep_audio))
         except Exception as e:
             p.terminate()
             raise RuntimeError(f"Couldn't open the microphone: {e}")
         if include_computer_audio:
             try:
-                sources.append(_Source(p, pa, COMPUTER, _pick_loopback(p, output_device), t0, feed))
+                sources.append(_Source(p, pa, COMPUTER, _pick_loopback(p, output_device), t0, feed, keep_audio))
             except Exception as e:
                 log.warning("computer-audio capture unavailable, recording microphone only: %s", e)
         self._p, self._sources, self._retired = p, sources, []
@@ -266,9 +271,9 @@ class LiveRecorder:
         segments = self.transcriber.finish() if self.transcriber else None
 
         length = max((s.length for s in sources), default=0)
-        log.info("live recording stopped (%.1fs, %s live segments)", length / RATE,
-                 len(segments) if segments is not None else "no")
-        if length < _MIN_SECONDS * RATE:
+        log.info("live %s stopped (%.1fs, %s live segments)", "recording" if self.keep_audio else "subtitles",
+                 length / RATE, len(segments) if segments is not None else "no")
+        if not self.keep_audio or length < _MIN_SECONDS * RATE:
             return None, segments
         mix = sum(s.timeline(length) for s in sources)
         peak = float(np.max(np.abs(mix))) if length else 0.0
@@ -314,6 +319,7 @@ class Controller:
         self._listeners = []
         self.last_saved = None   # name of the last ingested recording, for the dashboard
         self.auto_started = False  # this recording was started by CallWatcher (so it also ends it)
+        self.mode = None           # "record" | "subtitles" while a session runs
         self.mic_state = ""      # checking / live / muted / muted_in_call -- kept current by _monitor_mic()
         self.call = ""           # the running call, when one was detected while the mic was muted
         self.screenshots = []    # [{t, time, file, window}] for the current recording (take_screenshot)
@@ -329,33 +335,70 @@ class Controller:
                 log.exception("live recording listener failed")
 
     @property
-    def recording(self) -> bool:
+    def active(self) -> bool:
+        """A recording OR a subtitles-only session is running (audio devices open)."""
         return self.recorder.recording
 
-    def toggle(self, *_):
-        return self.stop() if self.recording else self.start()
+    @property
+    def recording(self) -> bool:
+        """A recording that will be saved is running (not subtitles-only)."""
+        return self.recorder.recording and self.mode == "record"
 
-    def start(self, reason: str = "", auto: bool = False):
+    @property
+    def subtitles_only(self) -> bool:
+        return self.recorder.recording and self.mode == "subtitles"
+
+    def toggle(self, *_):
+        """Caps Lock double tap / tray Start-Stop: start or stop a recording. During subtitles-only it
+        switches to a recording (the subtitles keep going; from then on it's saved)."""
+        if self.recording:
+            return self.stop()
+        return self.start()
+
+    def toggle_subtitles(self, *_):
+        """Subtitles-only switch (tray / dashboard): live subtitles without recording anything."""
+        if self.subtitles_only:
+            return self.stop()
+        if self.recording:
+            self._fire("info", "Already recording - the subtitles are on as part of the recording.")
+            return
+        return self.start(subtitles_only=True)
+
+    def start(self, reason: str = "", auto: bool = False, subtitles_only: bool = False):
         """reason: shown in the "started" notification (e.g. "Teams call detected"); auto: started by
-        CallWatcher, which then also stops it when the call ends."""
+        CallWatcher, which then also stops it when the call ends. subtitles_only: transcribe + show the
+        subtitle bar, keep nothing (no audio, no transcript, nothing saved)."""
         import settings
+        if not subtitles_only and self.subtitles_only:
+            self.stop()                               # subtitles-only -> real recording
         with self._lock:
             if self.recorder.recording:
                 return
             saved = settings.get_all()
+            if subtitles_only:
+                import live_transcriber
+                if not live_transcriber.models_available():
+                    self._fire("failed", "Live subtitles need the transcription model - run "
+                                         "`python live_transcriber.py` once to download it.")
+                    return
             try:
                 self.recorder.start(include_computer_audio=saved.get("live_record_computer_audio", True),
-                                    live_transcription=saved.get("live_transcription", True),
+                                    live_transcription=True if subtitles_only else saved.get("live_transcription", True),
                                     mic_device=saved.get("live_mic_device", ""),
-                                    output_device=saved.get("live_output_device", ""))
+                                    output_device=saved.get("live_output_device", ""),
+                                    keep_audio=not subtitles_only)
             except Exception as e:
                 self._fire("failed", str(e))
                 return
+            self.mode = "subtitles" if subtitles_only else "record"
             self.auto_started = auto
             self.screenshots = []
         self.mic_state, self.call = "checking", ""
-        self._fire("started", (f"{reason} - " if reason else "") + self.recorder.sources_description +
-                   (", transcribing live" if self.recorder.transcriber else ""))
+        if subtitles_only:
+            self._fire("subtitles_on", self.recorder.sources_description)
+        else:
+            self._fire("started", (f"{reason} - " if reason else "") + self.recorder.sources_description +
+                       (", transcribing live" if self.recorder.transcriber else ""))
         threading.Thread(target=self._monitor_mic, args=(self.recorder.started_monotonic,), daemon=True).start()
 
     def take_screenshot(self, *_):
@@ -427,9 +470,9 @@ class Controller:
                     self.mic_state = "muted"
                     if not warned:
                         warned = True
-                        self._fire("warning", "Your microphone is muted, so your voice isn't being recorded. "
-                                              "Unmute it (headset mute button or boom arm) to record this "
-                                              "conversation - Clicky won't unmute it for you.")
+                        self._fire("warning", "Your microphone is muted, so your voice isn't being picked up. "
+                                              "Unmute it (headset mute button or boom arm) to include it - "
+                                              "Clicky won't unmute it for you.")
             else:
                 self.mic_state, self.call = "live", ""
                 if warned:
@@ -441,9 +484,17 @@ class Controller:
         with self._lock:
             if not self.recorder.recording:
                 return
-            started_at = self.recorder.started_at
-            self._fire("stopping")
-            wav_bytes, segments = self.recorder.stop()
+            mode, started_at = self.mode, self.recorder.started_at
+            if mode == "subtitles":
+                self.recorder.stop()                  # transcript and audio are simply dropped
+                self.mode = None
+            else:
+                self._fire("stopping")
+                wav_bytes, segments = self.recorder.stop()
+                self.mode = None
+        if mode == "subtitles":
+            self._fire("subtitles_off", "")
+            return
         if wav_bytes is None:
             self._fire("discarded", "That was under a second, so nothing was saved.")
             return
@@ -461,9 +512,10 @@ class Controller:
         """For the dashboard's live panel (app.py /api/live)."""
         import settings
         rec = self.recorder
-        out = {"recording": rec.recording, "last_saved": self.last_saved, "screenshots": len(self.screenshots),
+        out = {"recording": self.recording, "subtitles_only": self.subtitles_only, "active": self.active,
+               "last_saved": self.last_saved, "screenshots": len(self.screenshots),
                "auto_record": bool(settings.get_all().get("auto_record_calls", False)),
-               "auto_started": rec.recording and self.auto_started}
+               "auto_started": self.recording and self.auto_started}
         if rec.recording:
             out.update(sources=rec.sources_description,
                        elapsed=round(time.monotonic() - rec.started_monotonic, 1),

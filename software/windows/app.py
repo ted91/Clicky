@@ -232,6 +232,17 @@ def save_live_settings(request: Request,
     return templates.TemplateResponse(request, "settings.html", _settings_context("live", saved=error is None, setup_error=error))
 
 
+@app.post("/live/subtitles")
+async def live_subtitles(request: Request):
+    """Dashboard "Subtitles only" switch: live subtitles without recording or saving anything."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    import live_recorder
+    await asyncio.to_thread(live_recorder.controller.toggle_subtitles)
+    return JSONResponse(live_recorder.controller.status())
+
+
 @app.post("/live/screenshot")
 async def live_screenshot(request: Request):
     """Dashboard button: screenshot the meeting window into the current recording (same as Shift x2)."""

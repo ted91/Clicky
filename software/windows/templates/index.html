@@ -258,6 +258,7 @@
              title="Starts recording when a Teams / Zoom / Meet call is detected and stops when it ends. Let participants know you're recording.">
         <input type="checkbox" id="live-auto" style="width:auto; margin:0;"> Record calls automatically
       </label>
+      <button type="button" id="live-subs" title="Live subtitles (and translation) without recording or saving anything">Subtitles only</button>
       <button type="button" id="live-shot" hidden title="Screenshot the meeting window into this recording (or double-tap Shift)">📸 Screenshot</button>
       <button type="button" id="live-toggle">Start recording</button>
     </div>
@@ -268,6 +269,11 @@
       const lines = document.getElementById("live-lines"), btn = document.getElementById("live-toggle");
       const auto = document.getElementById("live-auto");
       const shotBtn = document.getElementById("live-shot");
+      const subsBtn = document.getElementById("live-subs");
+      subsBtn.addEventListener("click", async () => {
+        subsBtn.disabled = true;
+        try { await fetch("/live/subtitles", {method: "POST"}); } finally { subsBtn.disabled = false; poll(); }
+      });
       shotBtn.addEventListener("click", async () => {
         shotBtn.disabled = true;
         try { await fetch("/live/screenshot", {method: "POST"}); } finally { shotBtn.disabled = false; poll(); }
@@ -288,18 +294,24 @@
           btn.textContent = s.recording ? "Stop recording" : "Start recording";
           shotBtn.hidden = !s.recording;
           shotBtn.textContent = "📸 Screenshot" + (s.screenshots ? ` (${s.screenshots})` : "");
+          subsBtn.hidden = s.recording;
+          subsBtn.textContent = s.subtitles_only ? "Stop subtitles" : "Subtitles only";
           if (document.activeElement !== auto) auto.checked = !!s.auto_record;
-          dot.style.background = s.recording ? "#dc1e1e" : "#999";
-          if (!s.recording) {
+          dot.style.background = s.recording ? "#dc1e1e" : s.subtitles_only ? "#2878e6" : "#999";
+          if (s.subtitles_only) {
+            title.textContent = "Live subtitles " + mmss(s.elapsed);
+            info.textContent = "not recording — nothing is saved" + (s.mic_state === "muted" ? " — ⚠ your microphone is muted" : "");
+          } else if (!s.recording) {
             title.textContent = "Live recording";
             info.textContent = "Double-tap Caps Lock (or use the tray icon) to start.";
             lines.hidden = true; lastHtml = "";
             return;
+          } else {
+            title.textContent = (s.auto_started ? "Recording call (auto) " : "Recording ") + mmss(s.elapsed);
+            info.textContent = s.sources + (s.live_transcription ? " — transcribing live" : " — transcript after you stop") +
+              (s.mic_state === "muted_in_call" ? " — your mic is muted, recording the meeting only" :
+               s.mic_state === "muted" ? " — ⚠ your microphone is muted: unmute it to record your voice" : "");
           }
-          title.textContent = (s.auto_started ? "Recording call (auto) " : "Recording ") + mmss(s.elapsed);
-          info.textContent = s.sources + (s.live_transcription ? " — transcribing live" : " — transcript after you stop") +
-            (s.mic_state === "muted_in_call" ? " — your mic is muted, recording the meeting only" :
-             s.mic_state === "muted" ? " — ⚠ your microphone is muted: unmute it to record your voice" : "");
           const en = t => t ? `<div style="opacity:0.75; margin:0 0 0.3rem 1rem;">EN: ${esc(t)}</div>` : "";
           let html = (s.segments || []).slice(-40).map(g =>
             `<div><span style="opacity:0.6;">[${mmss(g.start)}]</span> <strong>${esc(label(g.speaker_id))}:</strong> ${esc(g.text)}</div>${en(g.translation)}`).join("");

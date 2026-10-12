@@ -278,12 +278,12 @@ def _tray_icon_image():
     return Image.open(os.path.join(here, "clicky_icon.ico"))
 
 
-def _recording_icon_image(base):
-    """The normal icon with a red dot in the corner, shown while a live recording is running."""
+def _recording_icon_image(base, color=(220, 30, 30, 255)):
+    """The normal icon with a dot in the corner: red while recording, blue for subtitles only."""
     from PIL import ImageDraw
     img = base.convert("RGBA").resize((64, 64))
     draw = ImageDraw.Draw(img)
-    draw.ellipse((34, 34, 62, 62), fill=(220, 30, 30, 255), outline=(255, 255, 255, 255), width=3)
+    draw.ellipse((34, 34, 62, 62), fill=color, outline=(255, 255, 255, 255), width=3)
     return img
 
 
@@ -297,6 +297,7 @@ def _beep(kind: str):
 
 IDLE_TOOLTIP = "Clicky is running - click to open the dashboard. Double-tap Caps Lock to record."
 RECORDING_TOOLTIP = "Clicky is RECORDING - double-tap Caps Lock (or right-click) to stop"
+SUBTITLES_TOOLTIP = "Clicky - live subtitles on, nothing is being recorded (right-click to switch off)"
 
 
 def _run_tray() -> bool:
@@ -313,6 +314,7 @@ def _run_tray() -> bool:
         import pystray
         image = _tray_icon_image()
         recording_image = _recording_icon_image(image)
+        subtitles_image = _recording_icon_image(image, (40, 120, 230, 255))
     except Exception:
         return False
 
@@ -352,6 +354,14 @@ def _run_tray() -> bool:
             icon.icon, icon.title = image, IDLE_TOOLTIP
             bar.hide(after_s=subtitle_bar.HIDE_AFTER_STOP_S)
             _notify(info, "Recording discarded" if event == "discarded" else "Recording problem")
+        elif event == "subtitles_on":
+            icon.icon, icon.title = subtitles_image, SUBTITLES_TOOLTIP
+            bar.show()
+            _notify("Showing live subtitles. Nothing is recorded or saved - switch it off in the tray menu.",
+                    "Live subtitles on")
+        elif event == "subtitles_off":
+            icon.icon, icon.title = image, IDLE_TOOLTIP
+            bar.hide(after_s=1.5)
         elif event == "screenshot":
             _beep("start")
             _notify(f"Saved with the recording at {info}.", "Meeting screenshot")
@@ -369,12 +379,17 @@ def _run_tray() -> bool:
         if controller.recording:
             controller.stop()
             time.sleep(1.5)   # let the save thread write the recording before the process exits
+        elif controller.subtitles_only:
+            controller.stop()
         icon.stop()
 
     menu = pystray.Menu(
         pystray.MenuItem("Open Clicky dashboard", _open_dashboard, default=True),
         pystray.MenuItem(lambda item: "Stop recording" if controller.recording else "Start recording (or double-tap Caps Lock)",
                          lambda *_: threading.Thread(target=controller.toggle, daemon=True).start()),
+        pystray.MenuItem("Live subtitles only (nothing saved)",
+                         lambda *_: threading.Thread(target=controller.toggle_subtitles, daemon=True).start(),
+                         checked=lambda item: controller.subtitles_only),
         pystray.MenuItem("Take meeting screenshot (or double-tap Shift)",
                          lambda *_: threading.Thread(target=controller.take_screenshot, daemon=True).start(),
                          enabled=lambda item: controller.recording),

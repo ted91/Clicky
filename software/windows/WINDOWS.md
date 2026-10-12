@@ -47,6 +47,12 @@ transcript, so it isn't transcribed a second time. See `live_recorder.py`
 / `live_transcriber.py`. Recording other people needs their consent --
 tell them before you start.
 
+**Subtitles only:** the tray's "Live subtitles only (nothing saved)" or the
+dashboard's "Subtitles only" button shows the live subtitle bar (and
+translation) without recording: no audio is buffered and nothing is saved.
+A Caps Lock double tap (or an auto-recorded call) during it switches to a
+normal, saved recording.
+
 While recording a call on this computer, **double-tap Shift** (or use the
 tray / dashboard) to screenshot the meeting window. Screenshots are stamped
 with the recording time (same clock as the transcript) and the wall-clock

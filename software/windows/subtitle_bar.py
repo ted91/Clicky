@@ -195,14 +195,16 @@ class SubtitleBar:
         if self._status_fn:
             try:
                 s = self._status_fn()
-                if s.get("recording"):
+                if s.get("subtitles_only"):
+                    bits.append("SUBTITLES ONLY · not recording")
+                elif s.get("recording"):
                     e = int(s.get("elapsed", 0))
                     bits.append(f"● REC {e // 60}:{e % 60:02d}")
                     if s.get("mic_state") == "muted_in_call":
                         bits.append("your mic is muted - recording the meeting")
                     elif s.get("mic_state") == "muted":
                         bits.append("your mic is muted")
-                else:
+                elif not s.get("active"):
                     bits.append("saving...")
             except Exception:
                 pass
