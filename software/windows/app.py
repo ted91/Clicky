@@ -243,7 +243,7 @@ def live_auto_record(request: Request, enabled: str = Form("")):
 
 @app.post("/live/toggle")
 async def live_toggle(request: Request):
-    """Dashboard Start/Stop button -- same controller as the tray menu and the Caps Lock hold."""
+    """Dashboard Start/Stop button -- same controller as the tray menu and the Caps Lock double tap."""
     redirect = _gate(request)
     if redirect:
         return redirect

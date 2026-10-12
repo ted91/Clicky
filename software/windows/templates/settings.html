@@ -723,7 +723,7 @@
       <div class="panel" data-panel="live">
         <h2>Live Subtitles</h2>
         <p class="desc">
-          Live recording (hold Caps Lock for 1 second, the tray menu, or the dashboard) transcribes on this laptop
+          Live recording (double-tap Caps Lock, the tray menu, or the dashboard) transcribes on this laptop
           with Parakeet while you talk, shows it in an always-on-top subtitle bar, and can translate it to English.
           The saved recording keeps the audio, the transcript and the translation. Right-click the subtitle bar
           for quick changes; drag it to move it. Tell people before you record them.
@@ -735,7 +735,7 @@
         <form method="post" action="/settings/live">
           <fieldset>
             <legend>Recording</legend>
-            <label><input type="checkbox" name="capslock_record_hotkey" value="true" {{ "checked" if current.get('capslock_record_hotkey', True) }} style="width:auto;display:inline-block;vertical-align:middle;"> Hold Caps Lock for 1 second to start / stop recording</label>
+            <label><input type="checkbox" name="capslock_record_hotkey" value="true" {{ "checked" if current.get('capslock_record_hotkey', True) }} style="width:auto;display:inline-block;vertical-align:middle;"> Double-tap Caps Lock to start / stop recording</label>
             <label><input type="checkbox" name="auto_record_calls" value="true" {{ "checked" if current.get('auto_record_calls', False) }} style="width:auto;display:inline-block;vertical-align:middle;"> Record Teams / Zoom / Meet calls automatically</label>
             <label><input type="checkbox" name="live_transcription" value="true" {{ "checked" if current.get('live_transcription', True) }} style="width:auto;display:inline-block;vertical-align:middle;"> Transcribe live while recording</label>
             <label for="live_mode">What to record</label>

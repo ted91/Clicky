@@ -6,10 +6,10 @@ models are installed, transcribed live while recording (live_transcriber.py, Par
 recording -- audio plus the live transcript -- goes into the normal pipeline via storage.add_pending(),
 so it appears on the dashboard like a device recording, without a second transcription pass.
 
-Started/stopped by `controller` (one per process): the tray menu, a dashboard button, and holding
-Caps Lock for about a second (CapsLockHoldWatcher). The watcher polls only the Caps Lock key's state
--- no system-wide keyboard hook, so Clicky never sees anything else that's typed. A hold flips Caps
-Lock like any press, so the watcher flips it back afterwards; short taps behave as normal Caps Lock.
+Started/stopped by `controller` (one per process): the tray menu, a dashboard button, and a quick
+double tap of Caps Lock (CapsLockDoubleTapWatcher). The watcher polls only the Caps Lock key's state
+-- no system-wide keyboard hook, so Clicky never sees anything else that's typed. Two taps toggle Caps
+Lock twice, so it ends up unchanged; single taps and holds behave as normal Caps Lock.
 
 Capture approach (PyAudioWPatch + soxr) is the one Live Subtitles already uses on Windows.
 """
@@ -242,7 +242,7 @@ def ingest(wav_bytes: bytes, started_at: datetime, segments=None) -> str:
 
 
 class Controller:
-    """The single start/stop entry point (tray, Caps Lock hold, dashboard). Listeners get
+    """The single start/stop entry point (tray, Caps Lock double tap, dashboard). Listeners get
     on_change(event, info) with event in started / stopped / saved / discarded / failed."""
 
     def __init__(self):
@@ -418,13 +418,17 @@ class CallWatcher(threading.Thread):
                 we_started = handled_this_call = False
 
 
-class CapsLockHoldWatcher(threading.Thread):
-    """Calls on_hold() each time Caps Lock is held for hold_seconds, then restores the Caps Lock
-    state the hold flipped. Polls GetAsyncKeyState for this one key only (see module docstring)."""
+class CapsLockDoubleTapWatcher(threading.Thread):
+    """Calls on_double_tap() when Caps Lock is tapped twice quickly (second press within
+    `window_s` of the first, both short taps). Two taps toggle Caps Lock twice, so it ends up where it
+    started -- nothing to restore. Polls GetAsyncKeyState for this one key only (no keyboard hook).
+    A press held longer than `max_tap_s` doesn't count, so holding Caps Lock stays ordinary."""
 
-    def __init__(self, on_hold, hold_seconds: float = 1.0, poll_seconds: float = 0.05):
-        super().__init__(daemon=True, name="capslock-hold")
-        self._on_hold, self._hold, self._poll = on_hold, hold_seconds, poll_seconds
+    def __init__(self, on_double_tap, window_s: float = 0.4, max_tap_s: float = 0.35,
+                 cooldown_s: float = 0.8, poll_seconds: float = 0.015):
+        super().__init__(daemon=True, name="capslock-doubletap")
+        self._on_double_tap = on_double_tap
+        self._window, self._max_tap, self._cooldown, self._poll = window_s, max_tap_s, cooldown_s, poll_seconds
         self._stop_event = threading.Event()
 
     def stop(self):
@@ -432,44 +436,39 @@ class CapsLockHoldWatcher(threading.Thread):
 
     def run(self):
         user32 = ctypes.windll.user32
-        down_since, fired, toggle_before = None, False, None
-        toggle_while_up = user32.GetKeyState(VK_CAPITAL) & 1
-        ignore_until = 0.0
+        user32.GetAsyncKeyState(VK_CAPITAL)            # clear the "pressed since last call" bit
+        was_down, down_at, last_tap, quiet_until = False, 0.0, None, 0.0
         enabled, enabled_checked = True, 0.0
         while not self._stop_event.wait(self._poll):
             now = time.monotonic()
             if now - enabled_checked > 1.0:            # the Settings switch applies without a restart
                 import settings
                 enabled, enabled_checked = settings.get_all().get("capslock_record_hotkey", True), now
+            state = user32.GetAsyncKeyState(VK_CAPITAL)
             if not enabled:
-                down_since = None
+                was_down, last_tap = False, None
                 continue
-            is_down = bool(user32.GetAsyncKeyState(VK_CAPITAL) & 0x8000)
-            if now < ignore_until:
-                continue
-            if is_down:
-                if down_since is None:
-                    down_since, fired, toggle_before = now, False, toggle_while_up
-                elif not fired and now - down_since >= self._hold:
-                    fired = True
+            is_down = bool(state & 0x8000)
+            tapped_between_polls = bool(state & 1) and not is_down and not was_down   # a press shorter than one poll
+            if is_down and not was_down:
+                down_at = now
+            released = (was_down and not is_down) or tapped_between_polls
+            if released:
+                short = tapped_between_polls or (now - down_at) <= self._max_tap
+                if not short:
+                    last_tap = None
+                elif now < quiet_until:
+                    pass
+                elif last_tap is not None and now - last_tap <= self._window:
+                    last_tap, quiet_until = None, now + self._cooldown
                     # off the polling thread: stopping waits for the live transcriber to catch up
-                    threading.Thread(target=self._safe_hold, daemon=True).start()
-            else:
-                if down_since is not None and fired and (user32.GetKeyState(VK_CAPITAL) & 1) != toggle_before:
-                    _tap_caps_lock()
-                    ignore_until = time.monotonic() + 0.3   # don't treat our own restoring tap as a press
-                down_since = None
-                toggle_while_up = user32.GetKeyState(VK_CAPITAL) & 1
+                    threading.Thread(target=self._safe_fire, daemon=True).start()
+                else:
+                    last_tap = now
+            was_down = is_down
 
-    def _safe_hold(self):
+    def _safe_fire(self):
         try:
-            self._on_hold()
+            self._on_double_tap()
         except Exception:
-            log.exception("Caps Lock hold action failed")
-
-
-def _tap_caps_lock():
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP = 0x1, 0x2
-    user32 = ctypes.windll.user32
-    user32.keybd_event(VK_CAPITAL, 0x3A, KEYEVENTF_EXTENDEDKEY, 0)
-    user32.keybd_event(VK_CAPITAL, 0x3A, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+            log.exception("Caps Lock double-tap action failed")

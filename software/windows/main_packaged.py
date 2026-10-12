@@ -295,8 +295,8 @@ def _beep(kind: str):
         pass
 
 
-IDLE_TOOLTIP = "Clicky is running - click to open the dashboard. Hold Caps Lock 1 s to record."
-RECORDING_TOOLTIP = "Clicky is RECORDING - hold Caps Lock 1 s (or right-click) to stop"
+IDLE_TOOLTIP = "Clicky is running - click to open the dashboard. Double-tap Caps Lock to record."
+RECORDING_TOOLTIP = "Clicky is RECORDING - double-tap Caps Lock (or right-click) to stop"
 
 
 def _run_tray() -> bool:
@@ -304,7 +304,7 @@ def _run_tray() -> bool:
     dashboard; right-click offers Open / Start-Stop recording / Quit) and a
     one-time "Clicky is running" notification, so a user can tell the app is
     up even though it has no window of its own. Also owns live recording
-    (live_recorder.py): the tray menu item and the Caps Lock hold both toggle
+    (live_recorder.py): the tray menu item and a Caps Lock double tap both toggle
     it, with a red-dot icon, a sound and a notification on every start/stop.
     Blocks until Quit is chosen. Returns False if the tray couldn't be
     created (missing pystray/Pillow, no shell), so the caller can fall back
@@ -339,7 +339,7 @@ def _run_tray() -> bool:
             icon.icon, icon.title = recording_image, RECORDING_TOOLTIP
             bar.show()
             _beep("start")
-            _notify(f"Recording {info}. Hold Caps Lock 1 s again to stop. "
+            _notify(f"Recording {info}. Double-tap Caps Lock again to stop. "
                     "Let everyone in the conversation know you're recording.", "Clicky is recording")
         elif event == "stopping":
             icon.icon, icon.title = image, "Clicky - saving the recording..."
@@ -368,7 +368,7 @@ def _run_tray() -> bool:
 
     menu = pystray.Menu(
         pystray.MenuItem("Open Clicky dashboard", _open_dashboard, default=True),
-        pystray.MenuItem(lambda item: "Stop recording" if controller.recording else "Start recording (or hold Caps Lock 1 s)",
+        pystray.MenuItem(lambda item: "Stop recording" if controller.recording else "Start recording (or double-tap Caps Lock)",
                          lambda *_: threading.Thread(target=controller.toggle, daemon=True).start()),
         pystray.MenuItem("Show subtitle bar while recording",
                          lambda *_: (settings.update(subtitle_bar=not settings.get_all().get("subtitle_bar", True)),
@@ -382,7 +382,7 @@ def _run_tray() -> bool:
     icon = pystray.Icon("Clicky", image, IDLE_TOOLTIP, menu)
 
     # Always running; it checks the "capslock_record_hotkey" setting itself, so Settings can switch it live.
-    watcher = live_recorder.CapsLockHoldWatcher(controller.toggle)
+    watcher = live_recorder.CapsLockDoubleTapWatcher(controller.toggle)
 
     def _on_ready(icon):
         icon.visible = True
@@ -392,7 +392,7 @@ def _run_tray() -> bool:
         live_transcriber.preload_in_background()
         live_translator.preload_in_background()
         _notify("Click the Clicky icon in the system tray to open the dashboard. "
-                "Hold Caps Lock for 1 second to start or stop recording a conversation.", "Clicky is running")
+                "Double-tap Caps Lock to start or stop recording a conversation.", "Clicky is running")
 
     try:
         icon.run(_on_ready)

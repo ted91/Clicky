@@ -37,8 +37,8 @@ folder (a "onedir" build — Windows has no equivalent to macOS's single
 
 ## Live recording (Caps Lock)
 
-Hold **Caps Lock for ~1 second** (or use the tray menu, or the dashboard's
-"Start recording" button) to start recording; hold it again to stop. It
+**Double-tap Caps Lock** (or use the tray menu, or the dashboard's
+"Start recording" button) to start recording; double-tap again to stop. It
 records the microphone ("you") and the computer's audio ("others" -- the
 far side of a Teams/Zoom/Meet call) and transcribes both **live** with
 Parakeet-TDT 0.6B v3 (same engine as Live Subtitles), shown on the
