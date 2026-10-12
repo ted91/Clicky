@@ -7,12 +7,10 @@ A packaged app has no terminal for the user to read "Uvicorn running on
 127.0.0.1 (not app.py's dev-mode 0.0.0.0) since this is meant for one
 person's own Mac, not something to expose on the LAN by default.
 
-The dashboard is a configuration/viewing surface, not something Clicky
-should shove in your face on every launch -- day-to-day control is the
-menu-bar icon (meetingcap, see meeting_recorder.py), which has its own
-"Open Clicky Dashboard" item for whenever you actually want it. The
-browser tab only auto-opens the very first time, before /setup has been
-completed, since a first-time user needs somewhere to land.
+On Windows there is no meetingcap menu-bar agent, so this file owns the
+system-tray icon itself (pystray): it's the visible "Clicky is running"
+signal, with Open dashboard / Quit. The dashboard also opens in the browser
+on every launch so a new user can see the app started.
 """
 import os
 import signal
@@ -41,9 +39,19 @@ else:
 if getattr(sys, "frozen", False):
     os.chdir(sys._MEIPASS)
 
+import paths
+
+# With no console (pythonw.exe, or the PyInstaller console=False exe) sys.stdout/stderr are None, and
+# uvicorn's log setup crashes the server thread on them -- the tray icon still appears but nothing
+# answers on port 8000. Send output to a log file instead, which also keeps tracebacks visible.
+if sys.stdout is None or sys.stderr is None:
+    os.makedirs(paths.APP_DATA_DIR, exist_ok=True)
+    _log_stream = open(os.path.join(paths.APP_DATA_DIR, "clicky.log"), "a", buffering=1, encoding="utf-8")
+    sys.stdout = sys.stdout or _log_stream
+    sys.stderr = sys.stderr or _log_stream
+
 import uvicorn
 
-import paths
 import settings
 from app import app
 
@@ -189,7 +197,7 @@ def _show_already_running_alert():
     only surface guaranteed visible regardless of what else is running."""
     message = "Check the menu bar for the existing mic icon, or quit it first before relaunching." \
         if sys.platform == "darwin" else \
-        "Check the system tray for the existing icon, or quit it first before relaunching."
+        "Look for the Clicky icon in the system tray (it may be under the ^ arrow) and right-click it to open the dashboard or quit."
     try:
         if sys.platform == "darwin":
             subprocess.run(
@@ -209,18 +217,89 @@ def _run_server():
     uvicorn.run(app, host="127.0.0.1", port=PORT, reload=False, log_level="info")
 
 
+def _dashboard_url() -> str:
+    return f"http://127.0.0.1:{PORT}"
+
+
+def _open_dashboard(*_):
+    webbrowser.open(_dashboard_url())
+
+
+def _wait_for_server(timeout: float = 20.0) -> bool:
+    import socket
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", PORT), timeout=0.5):
+                return True
+        except OSError:
+            time.sleep(0.3)
+    return False
+
+
+def _open_dashboard_when_ready():
+    if _wait_for_server():
+        _open_dashboard()
+
+
+def _tray_icon_image():
+    from PIL import Image
+    here = sys._MEIPASS if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    return Image.open(os.path.join(here, "clicky_icon.ico"))
+
+
+def _run_tray() -> bool:
+    """Shows the Clicky system-tray icon (left-click / double-click opens the
+    dashboard; right-click offers Open / Quit) and a one-time "Clicky is
+    running" notification, so a user can tell the app is up even though it
+    has no window of its own. Blocks until Quit is chosen. Returns False if
+    the tray couldn't be created (missing pystray/Pillow, no shell), so the
+    caller can fall back to running headless rather than dying."""
+    try:
+        import pystray
+        image = _tray_icon_image()
+    except Exception:
+        return False
+
+    def _quit(icon, _item):
+        icon.stop()
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Open Clicky dashboard", _open_dashboard, default=True),
+        pystray.MenuItem(f"Running at {_dashboard_url()}", None, enabled=False),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Quit Clicky", _quit),
+    )
+    icon = pystray.Icon("Clicky", image, "Clicky is running - click to open the dashboard", menu)
+
+    def _on_ready(icon):
+        icon.visible = True
+        try:
+            icon.notify("Click the Clicky icon in the system tray to open the dashboard.", "Clicky is running")
+        except Exception:
+            pass
+
+    try:
+        icon.run(_on_ready)
+    except Exception:
+        return False
+    return True
+
+
 if __name__ == "__main__":
     if not _acquire_single_instance_lock():
+        _open_dashboard()
         _show_already_running_alert()
         sys.exit(1)
-
-    first_run = not settings.is_configured()
 
     server_thread = threading.Thread(target=_run_server, daemon=True)
     server_thread.start()
 
-    if first_run:
-        time.sleep(1.5)  # give uvicorn a moment to bind before opening the tab
-        webbrowser.open(f"http://127.0.0.1:{PORT}")
+    # Every launch (not just the first) opens the dashboard so it's obvious
+    # the app started -- see the module docstring for why it's the tray icon
+    # that carries the day-to-day "it's running" signal.
+    threading.Thread(target=_open_dashboard_when_ready, daemon=True).start()
 
+    if _run_tray():
+        os._exit(0)  # tray "Quit" -- hard exit so no background poller thread keeps the process alive
     server_thread.join()

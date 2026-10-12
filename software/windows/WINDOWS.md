@@ -37,8 +37,20 @@ folder (a "onedir" build — Windows has no equivalent to macOS's single
 
 ## Installing / running
 
-Want a real installer (Start Menu entry, shows up in "Installed apps",
-clean uninstall) instead of a raw folder? See **`msix/MSIX.md`** — packages
+**Recommended: per-user MSI.** After the PyInstaller build, run
+`python build_msi.py --version <x.y.z>` (Python 3.12 -- it uses the stdlib
+`msilib`, removed in 3.13). Output: `dist\Clicky-<version>.msi`. It installs
+to `%LOCALAPPDATA%\Programs\Clicky` with a small Welcome / progress / Finish
+wizard, a Start menu shortcut and an Apps entry -- no admin rights and no
+certificate to trust (unlike MSIX). On machines where endpoint protection
+locks freshly built unsigned exes after a few minutes, run `build_msi.py`
+immediately after PyInstaller.
+
+Note that an unsigned `Clicky.exe` can still be blocked from *running* by a
+company application-control policy (AppLocker/WDAC) even though it installs
+fine -- that needs the exe code-signed or the install folder allowlisted.
+
+Want an MSIX instead? See **`msix/MSIX.md`** — packages
 this same `dist\Clicky\` build into a signed, sideloadable `.msix`. No
 Microsoft account or Store review needed, just a free self-signed
 certificate you trust once per machine.

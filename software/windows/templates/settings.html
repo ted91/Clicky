@@ -134,6 +134,10 @@
         <span class="icon">📅</span> Google
         <span class="status-dot {{ 'connected' if google_connected }}"></span>
       </div>
+      <div class="sidebar-item" data-panel="teams">
+        <span class="icon">👥</span> Teams
+        <span class="status-dot {{ 'connected' if teams_connected }}"></span>
+      </div>
       <div class="sidebar-item" data-panel="obsidian">
         <span class="icon">🗂️</span> Obsidian
         <span class="status-dot {{ 'connected' if current.obsidian_vault_path }}"></span>
@@ -595,6 +599,24 @@
           <form method="post" action="/google/disconnect"><button type="submit" class="secondary">Disconnect</button></form>
         {% else %}
           <a href="/google/connect" style="text-decoration:none;"><button type="button">Connect Google Calendar</button></a>
+        {% endif %}
+      </div>
+
+      <!-- Teams -->
+      <div class="panel" data-panel="teams">
+        <h2>Microsoft Teams</h2>
+        <p class="desc">
+          Lets the Teams Transcripts page (left nav) read your Teams meetings and their transcripts, so you can
+          pick past/shared meetings, find related ones, and save analyzed summaries straight to Obsidian.
+          Only meetings where someone started Teams' own transcription during the call have a transcript to pull.
+        </p>
+        {% if not teams_configured %}
+          <p class="error">Microsoft Teams integration isn't set up for this build yet — that needs an Azure AD app registration for your organization (one-time, done by IT/the app's developer, not something you do here).</p>
+        {% elif teams_connected %}
+          <p class="saved">✓ Connected</p>
+          <form method="post" action="/teams/disconnect"><button type="submit" class="secondary">Disconnect</button></form>
+        {% else %}
+          <a href="/teams/connect" style="text-decoration:none;"><button type="button">Connect Microsoft Teams</button></a>
         {% endif %}
       </div>
 

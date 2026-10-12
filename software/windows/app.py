@@ -16,6 +16,7 @@ import secrets
 
 import config
 import google_client
+import teams_client
 import linkedin_client
 import x_client
 import substack_client
@@ -929,6 +930,8 @@ def _settings_context(active_panel: str = "device", wifi_msg: str = "", saved: b
         "setup_error": setup_error,
         "google_connected": google_client.is_connected(),
         "google_configured": google_client.has_client_credentials(),
+        "teams_connected": teams_client.is_connected(),
+        "teams_configured": teams_client.has_client_credentials(),
         "linkedin_connected": linkedin_client.is_connected(),
         "linkedin_configured": linkedin_client.has_client_credentials(),
         "x_connected": x_client.is_connected(),
@@ -1064,6 +1067,153 @@ def google_disconnect(request: Request):
         return redirect
     google_client.disconnect()
     return RedirectResponse("/integrations?panel=google", status_code=303)
+
+
+@app.get("/teams/connect")
+def teams_connect(request: Request):
+    # Unlike Google, the OAuth client here is tenant-specific (see
+    # config.py's comment on TEAMS_CLIENT_ID) -- still baked in at build
+    # time by whoever deployed this for their org, not entered per-user.
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    if not teams_client.has_client_credentials():
+        return RedirectResponse("/integrations?panel=teams", status_code=303)
+    state = secrets.token_urlsafe(16)
+    request.session["teams_oauth_state"] = state
+    return RedirectResponse(teams_client.authorize_url(request, state), status_code=303)
+
+
+@app.get("/teams/callback", name="teams_callback")
+def teams_callback(request: Request, code: str = None, state: str = None, error: str = None):
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    expected_state = request.session.pop("teams_oauth_state", None)
+    if error or not code or not state or state != expected_state:
+        return templates.TemplateResponse(request, "settings.html",
+            _settings_context("teams", setup_error=f"Microsoft sign-in failed: {error or 'invalid response'}"))
+    try:
+        teams_client.exchange_code(request, code)
+    except RuntimeError as e:
+        return templates.TemplateResponse(request, "settings.html", _settings_context("teams", saved=False, setup_error=str(e)))
+    return RedirectResponse("/integrations?panel=teams", status_code=303)
+
+
+@app.post("/teams/disconnect")
+def teams_disconnect(request: Request):
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    teams_client.disconnect()
+    return RedirectResponse("/integrations?panel=teams", status_code=303)
+
+
+# --- Teams transcript picker: list meetings, rank by relevance, analyze+save ---
+
+@app.get("/teams")
+def teams_page(request: Request, selected: str = "", related_to: str = ""):
+    """Lists Teams meetings from the last 30 days (+ next 7, for ones
+    already transcribed ahead of time, rare but possible for recurring
+    calls). `selected` is a comma-separated list of meeting ids carried
+    across requests so multi-select survives the "Find related" round
+    trip (plain forms, no JS framework in this app -- see poller.py's
+    comment on why this stays dependency-light)."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+    if not teams_client.is_connected():
+        return RedirectResponse("/integrations?panel=teams", status_code=303)
+
+    selected_ids = set(filter(None, selected.split(",")))
+    error = None
+    meetings = []
+    try:
+        meetings = teams_client.list_meetings()
+    except RuntimeError as e:
+        error = str(e)
+
+    for m in meetings:
+        m["checked"] = m["id"] in selected_ids
+
+    relevance_scores = {}
+    if related_to and not error:
+        anchor = next((m for m in meetings if m["id"] == related_to), None)
+        if anchor:
+            candidates = [m for m in meetings if m["id"] != related_to]
+            import rag_index
+            scores = rag_index.rank_by_similarity(anchor["title"], [m["title"] for m in candidates])
+            relevance_scores = {m["id"]: round(s, 3) for m, s in zip(candidates, scores)}
+            meetings.sort(key=lambda m: -relevance_scores.get(m["id"], 1.0 if m["id"] == related_to else -1))
+
+    return templates.TemplateResponse(request, "teams.html", {
+        "request": request,
+        "active_nav": "teams",
+        "meetings": meetings,
+        "selected": selected,
+        "related_to": related_to,
+        "relevance_scores": relevance_scores,
+        "error": error,
+    })
+
+
+@app.post("/teams/analyze")
+async def teams_analyze(request: Request, meeting_ids: list = Form(...)):
+    """Fetches the transcript for each selected meeting, summarizes it with
+    the configured LLM provider (same summarize() used for device
+    recordings -- see providers/base.py), and pushes each as an Obsidian
+    note via obsidian_sync.push_recording(). Meetings with no transcript
+    (transcription was never started) are skipped and reported, not
+    treated as a hard failure for the whole batch."""
+    redirect = _gate(request)
+    if redirect:
+        return redirect
+
+    import providers
+    import obsidian_sync
+
+    all_meetings = {m["id"]: m for m in teams_client.list_meetings()}
+    llm_provider_name, summarize = providers.get_summarizer()
+    results = []
+    for mid in meeting_ids:
+        meeting = all_meetings.get(mid)
+        if not meeting:
+            results.append({"title": mid, "ok": False, "error": "Meeting not found (may have fallen out of the 30-day window)."})
+            continue
+        try:
+            transcript = teams_client.get_meeting_transcript(meeting)
+            if not transcript:
+                results.append({"title": meeting["title"], "ok": False, "error": "No transcript available for this meeting."})
+                continue
+            summary = await asyncio.to_thread(summarize, transcript, None, {
+                "title": meeting["title"],
+                "attendees": meeting["attendees"],
+                "start": meeting["start"],
+            })
+            record = {
+                "name": f"teams-{mid}",
+                "created_at": meeting["start"],
+                "stt_provider": "teams",
+                "llm_provider": llm_provider_name,
+                "summary": summary,
+                "transcript": transcript,
+                "meeting": {"title": meeting["title"], "attendees": meeting["attendees"]},
+            }
+            note_path = obsidian_sync.push_recording(record)
+            results.append({"title": meeting["title"], "ok": True, "note_path": note_path})
+        except RuntimeError as e:
+            results.append({"title": meeting.get("title", mid), "ok": False, "error": str(e)})
+
+    return templates.TemplateResponse(request, "teams.html", {
+        "request": request,
+        "active_nav": "teams",
+        "meetings": list(all_meetings.values()),
+        "selected": "",
+        "related_to": "",
+        "relevance_scores": {},
+        "error": None,
+        "analyze_results": results,
+    })
 
 
 @app.post("/integrations/setup-publications")

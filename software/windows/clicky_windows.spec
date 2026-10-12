@@ -54,6 +54,8 @@ a = Analysis(
         # macOS spec. Provider API keys (Mistral/OpenAI/etc.) don't need
         # this -- those are entered per-user via /setup.
         ('.env', '.'),
+        # Tray icon image, loaded at runtime by main_packaged.py's _run_tray().
+        ('clicky_icon.ico', '.'),
     ],
     hiddenimports=[
         # Same reasoning as clicky.spec's list -- these are imported
@@ -63,6 +65,9 @@ a = Analysis(
         'mistralai.client',
         'bleak',
         'bleak.backends.winrt',  # Windows' actual BLE backend -- bleak picks this automatically at runtime, but PyInstaller needs it listed to bundle it at all
+        'pystray',  # system-tray icon (main_packaged.py); picks its Windows backend dynamically
+        'pystray._win32',
+        'PIL.Image',
         'yaml',  # obsidian_sync.py's frontmatter read/write
         # voice_id.py's speaker-embedding model -- torch/speechbrain's own
         # dynamic import patterns are extensive; this list is a starting

@@ -7,6 +7,8 @@ requests
 python-dotenv
 itsdangerous          # needed by starlette's SessionMiddleware (login sessions)
 pyyaml                # obsidian_sync.py's frontmatter read/write (was an implicit transitive dep before -- declared explicitly now)
+pystray                # Windows system-tray icon (main_packaged.py)
+Pillow                 # image loading for the tray icon
 
 # Local speaker-voiceprint recognition (voice_id.py) -- a real, deliberate
 # exception to this file's "avoid heavy deps" pattern below (see
@@ -30,7 +32,7 @@ sentence-transformers
 # mistralai            # STT_PROVIDER=mistral or LLM_PROVIDER=mistral
 # openai               # STT_PROVIDER=openai or LLM_PROVIDER=openai
 # anthropic            # LLM_PROVIDER=anthropic
-# faster-whisper       # STT_PROVIDER=local
+# faster-whisper "av<16"   # STT_PROVIDER=local -- faster-whisper 1.2.x passes an av.open() option PyAV 16+ removed
 # ollama               # LLM_PROVIDER=local
 # bleak                # SYNC_TRANSPORT=ble
 # pyobjc-framework-CoreBluetooth   # SYNC_TRANSPORT=ble, macOS only -- optional L2CAP CoC fast path (ble_l2cap_client.py); safe to skip, falls back to bleak/GATT automatically

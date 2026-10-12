@@ -76,6 +76,29 @@ ANTHROPIC_LLM_MODEL = os.getenv("ANTHROPIC_LLM_MODEL", "claude-haiku-4-5")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 
+# Microsoft Graph / Teams OAuth (same shared-client pattern as Google above
+# -- ONE app registration, created once, works across every customer's
+# Azure AD tenant). Register it as multi-tenant (Azure Portal -> App
+# registrations -> New registration -> "Accounts in any organizational
+# directory"), redirect URI http://localhost:8000/teams/callback,
+# delegated permissions OnlineMeetings.Read,
+# OnlineMeetingTranscript.Read.All, Calendars.Read, offline_access.
+# TEAMS_TENANT_ID stays "common" (below) so sign-in works for any tenant,
+# not just the one that did the registration.
+#
+# One real (platform, not code) friction point: unlike Google's low-risk
+# scopes above which any user can self-consent to, Microsoft classifies
+# OnlineMeetingTranscript.Read.All/Calendars.Read as sensitive -- the
+# FIRST user at each customer org to sign in will hit a screen requiring
+# that org's Global Admin to click "Accept for your organization" once.
+# Every subsequent user there then signs in normally. This is a Microsoft
+# consent policy for Graph permissions at this sensitivity level, the same
+# gate every third-party Teams-transcript product hits -- not something
+# to route around with per-org registrations.
+TEAMS_CLIENT_ID = os.getenv("TEAMS_CLIENT_ID", "")
+TEAMS_CLIENT_SECRET = os.getenv("TEAMS_CLIENT_SECRET", "")
+TEAMS_TENANT_ID = os.getenv("TEAMS_TENANT_ID", "common")
+
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
 LOCAL_WHISPER_MODEL = os.getenv("LOCAL_WHISPER_MODEL", "base")
