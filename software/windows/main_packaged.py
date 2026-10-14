@@ -416,6 +416,8 @@ def _run_tray() -> bool:
         live_recorder.CallWatcher(controller).start()   # does nothing unless "auto_record_calls" is on
         live_transcriber.preload_in_background()
         live_translator.preload_in_background()
+        import transcript_refiner
+        transcript_refiner.start_worker()   # also resumes recordings left "refining" by a restart
         _notify("Click the Clicky icon in the system tray to open the dashboard. "
                 "Double-tap Caps Lock to start or stop recording a conversation.", "Clicky is running")
 

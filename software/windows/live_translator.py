@@ -20,6 +20,49 @@ log = logging.getLogger("live_translator")
 LANG_NAMES = {"de": "German", "fr": "French", "es": "Spanish", "it": "Italian", "nl": "Dutch", "pl": "Polish",
               "pt": "Portuguese", "ru": "Russian", "sv": "Swedish", "cs": "Czech", "da": "Danish", "fi": "Finnish"}
 _PUNCT = re.compile(r"[^\w]+", re.UNICODE)
+MIN_TAIL_WORDS = 3     # the still-growing part of a sentence is only translated once it has this many words
+
+# Spoken fillers -- in both languages, since Parakeet often writes German "ja" as English "yeah" and the
+# translation turns every "ja" into "yeah"/"yes". Used by the subtitle bar to keep lines readable.
+FILLERS = {"yeah", "yes", "yep", "ja", "jo", "jaja", "joa", "okay", "ok", "hm", "hmm", "mhm", "mm", "mmh",
+           "äh", "ähm", "eh", "ehm", "uh", "um", "uhm", "er", "erm", "ah", "oh", "na", "so", "also", "genau"}
+
+
+def clean_subtitle(text: str) -> str:
+    """Display-only cleanup for the subtitle bar: collapses repeated fillers ("yeah yeah yeah" -> "yeah")
+    and returns "" for a line made only of fillers. Real content is never changed."""
+    words = (text or "").split()
+    out = []
+    for w in words:
+        n = _PUNCT.sub("", w.lower())
+        if n in FILLERS and out and _PUNCT.sub("", out[-1].lower()) == n:
+            continue
+        out.append(w)
+    if not out or all(_PUNCT.sub("", w.lower()) in FILLERS for w in out):
+        return ""
+    while _PUNCT.sub("", out[0].lower()) in FILLERS:   # "Yeah. So... I think we should" -> "I think we should"
+        out.pop(0)
+    out[0] = out[0][:1].upper() + out[0][1:]
+    return " ".join(out)
+
+
+# Parakeet picks the language per word and writes a German "ja" as "Yeah." -- put it back before
+# translating so the German model sees German (opus-mt-de-en passes an English "Yeah" straight through).
+_ENGLISH_YES = {"de": "ja", "nl": "ja", "sv": "ja", "da": "ja"}
+
+
+def _fix_source_words(words, lang):
+    ja = _ENGLISH_YES.get(lang)
+    if not ja:
+        return list(words)
+    out = []
+    for w in words:
+        n = _norm(w)
+        if n in ("yeah", "yes", "yep", "ya"):
+            core = ja.capitalize() if w[:1].isupper() else ja
+            w = core + w[len(w.rstrip(".,!?…;:")):]           # keep the punctuation
+        out.append(w)
+    return out
 
 
 def _models_dir() -> str:
@@ -147,6 +190,7 @@ class Translator:
 
     def update(self, committed, draft, final, lang):
         """-> {"sentences": [closed English sentences], "stable": str, "dim": str}"""
+        committed, draft = _fix_source_words(committed, lang), _fix_source_words(draft, lang)
         sentences, cur = [], []
         for w in committed:
             cur.append(w)
@@ -160,6 +204,10 @@ class Translator:
                 closed.append(self.sentence(tail_f, lang))
             return {"sentences": closed, "stable": "", "dim": ""}
         if not tail_f:
+            return {"sentences": closed, "stable": "", "dim": ""}
+        if len(tail_f.split()) < MIN_TAIL_WORDS:
+            # A 1-2 word fragment at the start of a sentence ("Ja", "Also", "Und") translates to filler
+            # like "Yeah." / "So." that then flickers away -- wait for a little context first.
             return {"sentences": closed, "stable": "", "dim": ""}
         if tail_c and draft:
             e_c, e_f = self.translate_batch([tail_c, tail_f], lang)

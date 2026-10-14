@@ -50,9 +50,13 @@ function renderRecording(r) {
   if (r.status !== "done") {
     const badge = r.status === "pending"
       ? '<span class="badge pending">Processing&hellip;</span>'
+      : r.status === "refining"
+      ? '<span class="badge pending" title="Detecting who spoke when and transcribing each speaker turn (local)">Creating transcript&hellip;</span>'
       : '<span class="badge failed">Processing failed</span>';
     const body = r.status === "failed"
       ? `<p class="error-text">${escapeHtml(r.error)}</p><p class="providers">Will retry automatically next sync cycle — audio is already saved, no need to re-record.</p>`
+      : r.status === "refining"
+      ? `<p class="providers">Recording saved. Detecting the speakers and creating the transcript locally (about a fifth of the recording length)&hellip;</p>`
       : `<p class="providers">Audio synced, waiting to be transcribed and summarized&hellip;</p>`;
     return `
       <div class="recording">

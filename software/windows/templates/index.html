@@ -262,11 +262,10 @@
       <button type="button" id="live-shot" hidden title="Screenshot the meeting window into this recording (or double-tap Shift)">📸 Screenshot</button>
       <button type="button" id="live-toggle">Start recording</button>
     </div>
-    <div id="live-lines" hidden style="margin-top:0.6rem; max-height:16rem; overflow-y:auto; font-size:0.9rem; line-height:1.4;"></div>
   </div>
   <script>
     (function () {
-      const lines = document.getElementById("live-lines"), btn = document.getElementById("live-toggle");
+      const btn = document.getElementById("live-toggle");
       const auto = document.getElementById("live-auto");
       const shotBtn = document.getElementById("live-shot");
       const subsBtn = document.getElementById("live-subs");
@@ -283,10 +282,8 @@
         try { await fetch("/live/auto-record", {method: "POST", body}); } finally { auto.blur(); }
       });
       const dot = document.getElementById("live-dot"), title = document.getElementById("live-title"), info = document.getElementById("live-info");
-      const label = id => id === "you" ? "You" : id === "others" ? "Others" : id;
-      const esc = s => String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
       const mmss = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
-      let busy = false, lastHtml = "";
+      let busy = false;
       async function poll() {
         try {
           const r = await fetch("/api/live"); if (!r.ok) return;
@@ -304,26 +301,12 @@
           } else if (!s.recording) {
             title.textContent = "Live recording";
             info.textContent = "Double-tap Caps Lock (or use the tray icon) to start.";
-            lines.hidden = true; lastHtml = "";
             return;
           } else {
             title.textContent = (s.auto_started ? "Recording call (auto) " : "Recording ") + mmss(s.elapsed);
-            info.textContent = s.sources + (s.live_transcription ? " — transcribing live" : " — transcript after you stop") +
+            info.textContent = s.sources + " — transcript is created after you stop" +
               (s.mic_state === "muted_in_call" ? " — your mic is muted, recording the meeting only" :
                s.mic_state === "muted" ? " — ⚠ your microphone is muted: unmute it to record your voice" : "");
-          }
-          const en = t => t ? `<div style="opacity:0.75; margin:0 0 0.3rem 1rem;">EN: ${esc(t)}</div>` : "";
-          let html = (s.segments || []).slice(-40).map(g =>
-            `<div><span style="opacity:0.6;">[${mmss(g.start)}]</span> <strong>${esc(label(g.speaker_id))}:</strong> ${esc(g.text)}</div>${en(g.translation)}`).join("");
-          for (const [src, txt] of Object.entries(s.drafts || {})) {
-            if (txt) html += `<div style="opacity:0.6; font-style:italic;"><strong>${esc(label(src))}:</strong> ${esc(txt)}</div>` +
-                             `<div style="opacity:0.5; font-style:italic;">${en((s.draft_translations || {})[src])}</div>`;
-          }
-          lines.hidden = false;
-          if (html !== lastHtml) {
-            const atBottom = lines.scrollTop + lines.clientHeight >= lines.scrollHeight - 20;
-            lines.innerHTML = html || '<div style="opacity:0.6;">Listening…</div>'; lastHtml = html;
-            if (atBottom) lines.scrollTop = lines.scrollHeight;
           }
         } catch (e) { /* server restarting -- retry next tick */ }
       }
@@ -400,6 +383,7 @@
         <div class="recording-header">
           <h3>{{ r.name }}
             {% if r.status == "pending" %}<span class="badge pending">Processing&hellip;</span>{% endif %}
+            {% if r.status == "refining" %}<span class="badge pending" title="Detecting who spoke when and transcribing each speaker turn (local)">Creating transcript&hellip;</span>{% endif %}
             {% if r.status == "failed" %}<span class="badge failed">Processing failed</span>{% endif %}
             {% if r.merged_from %}
               <span class="badge" title="Merged with {{ r.merged_from|length }} continuation recording(s) -- see backlog #5">+{{ r.merged_from|length }} continuation{{ "s" if r.merged_from|length > 1 }}</span>
@@ -592,6 +576,8 @@
         {% elif r.status == "failed" %}
           <p class="error-text">{{ r.error }}</p>
           <p class="providers">Will retry automatically next sync cycle — audio is already saved, no need to re-record.</p>
+        {% elif r.status == "refining" %}
+          <p class="providers">Recording saved. Detecting the speakers and creating the transcript locally (about a fifth of the recording length)&hellip;</p>
         {% else %}
           <p class="providers">Audio synced, waiting to be transcribed and summarized&hellip;</p>
         {% endif %}

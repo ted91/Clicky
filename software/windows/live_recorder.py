@@ -58,6 +58,7 @@ class _Source:
         self._parts = []     # (position_in_samples, float32 array)
         self._cursor = 0
         self.recent_peak = 0.0   # loudest sample since the last take_recent_peak() -- exactly 0 while muted
+        self.last_audio = time.monotonic()   # a mic delivers (zeros) even while muted; nothing at all = gone
         self._lock = threading.Lock()
         self.stream = p.open(format=pa.paFloat32, channels=self.channels, rate=self.rate, input=True,
                              input_device_index=info["index"], frames_per_buffer=int(self.rate * 0.03),
@@ -65,6 +66,7 @@ class _Source:
 
     def _callback(self, in_data, frame_count, time_info, status):
         arrived = time.monotonic()
+        self.last_audio = arrived
         x = np.frombuffer(in_data, dtype=np.float32)
         if self.channels > 1:
             x = x.reshape(-1, self.channels).mean(axis=1)
@@ -82,6 +84,13 @@ class _Source:
             if self._on_audio:
                 self._on_audio(self.source_id, arrived, y)
         return (None, self._pa.paContinue)
+
+    @property
+    def alive(self) -> bool:
+        try:
+            return self.stream.is_active()
+        except Exception:
+            return False
 
     def close(self):
         try:
@@ -136,13 +145,40 @@ def _pick_mic(p, pa, name: str):
     return p.get_default_wasapi_device(d_in=True)
 
 
-def _pick_loopback(p, name: str):
+def _pick_loopbacks(p, name: str, also: str = "") -> list:
+    """Loopback devices to record "computer audio" from: the chosen device, or else the Windows default
+    output AND the default communications output (`also`) when they differ -- Teams often plays the call
+    on the communications device (e.g. a monitor or headset) while other sound goes to the default one."""
+    loops = {d["name"].replace(" [Loopback]", ""): d for d in p.get_loopback_device_info_generator()}
     if name:
-        for d in p.get_loopback_device_info_generator():
-            if d["name"].replace(" [Loopback]", "") == name:
-                return d
+        if name in loops:
+            return [loops[name]]
         log.warning("chosen computer-audio device %r not found, using the Windows default", name)
-    return p.get_default_wasapi_loopback()
+    out = [p.get_default_wasapi_loopback()]
+    if also and also in loops and loops[also]["index"] != out[0]["index"]:
+        out.append(loops[also])
+    return out
+
+
+def _desired_devices(snap: dict, mic_pref: str, out_pref: str, with_computer: bool):
+    """Which devices a recording should be using right now, from audio_devices.snapshot()."""
+    mic = mic_pref if mic_pref and mic_pref in snap["mics"] else snap["mic"]
+    if not with_computer:
+        outs = frozenset()
+    elif out_pref and out_pref in snap["outputs"]:
+        outs = frozenset([out_pref])
+    else:
+        outs = frozenset(n for n in (snap["output"], snap["output_comm"]) if n)
+    return mic, outs
+
+
+def _snapshot():
+    try:
+        import audio_devices
+        return audio_devices.snapshot()
+    except Exception as e:
+        log.debug("couldn't read Windows' audio devices: %s", e)
+        return None
 
 
 class LiveRecorder:
@@ -155,6 +191,10 @@ class LiveRecorder:
         self.started_monotonic = None
         self.sources_description = ""
         self.keep_audio = True
+        self.last_tracks = {}    # {source_id: WAV bytes} of the last stop(), one per speaker source
+        self._lock = threading.RLock()   # capture changes (device follower, mic fallback) vs. stop()
+        self._prefs = ("", "", True)     # (chosen mic, chosen output, record computer audio) of this session
+        self.on_device_change = None     # fn(message) -- the Controller turns it into a notification
 
     @property
     def recording(self) -> bool:
@@ -164,6 +204,10 @@ class LiveRecorder:
         """Another input device that's actually delivering audio (not exact zeros), loudest first --
         or None. For when the recorded mic is a dongle whose headset is off, a disabled mic, etc."""
         import pyaudiowpatch as pa
+        with self._lock:
+            return self._find_live_mic(pa, probe_s)
+
+    def _find_live_mic(self, pa, probe_s):
         if not self.recording:
             return None
         current = next((s for s in self._sources if s.source_id == MIC), None)
@@ -200,15 +244,19 @@ class LiveRecorder:
         """Swap the microphone source for another device mid-recording; the shared wall-clock timeline
         keeps it in sync with the rest of the recording (already-recorded audio stays)."""
         import pyaudiowpatch as pa
-        old = next((s for s in self._sources if s.source_id == MIC), None)
-        feed = self.transcriber.feed if self.transcriber else None
-        new = _Source(self._p, pa, MIC, info, self.started_monotonic, feed, self.keep_audio)
-        if old:
-            old.close()
-            self._retired.append(old)            # its audio so far still goes into the WAV
-            self._sources.remove(old)
-        self._sources.insert(0, new)
-        log.info("switched microphone: %s -> %s", old.device_name if old else None, new.device_name)
+        with self._lock:
+            if not self.recording:
+                return
+            old = next((s for s in self._sources if s.source_id == MIC), None)
+            feed = self.transcriber.feed if self.transcriber else None
+            new = _Source(self._p, pa, MIC, info, self.started_monotonic, feed, self.keep_audio)
+            if old:
+                old.close()
+                self._retired.append(old)            # its audio so far still goes into the WAV
+                self._sources.remove(old)
+            self._sources.insert(0, new)
+            self._describe()
+            log.info("switched microphone: %s -> %s", old.device_name if old else None, new.device_name)
 
     def take_mic_peak(self):
         """Loudest microphone sample since the previous call (None without a mic source)."""
@@ -241,71 +289,175 @@ class LiveRecorder:
                 log.warning("live transcription unavailable, recording audio only: %s", e)
         feed = self.transcriber.feed if self.transcriber else None
 
-        sources = []
+        self._prefs = (mic_device, output_device, include_computer_audio)
+        snap = _snapshot()
         try:
-            sources.append(_Source(p, pa, MIC, _pick_mic(p, pa, mic_device), t0, feed, keep_audio))
+            sources = self._open_sources(p, pa, t0, feed, snap, require_mic=True)
         except Exception as e:
             p.terminate()
             raise RuntimeError(f"Couldn't open the microphone: {e}")
-        if include_computer_audio:
-            try:
-                sources.append(_Source(p, pa, COMPUTER, _pick_loopback(p, output_device), t0, feed, keep_audio))
-            except Exception as e:
-                log.warning("computer-audio capture unavailable, recording microphone only: %s", e)
         self._p, self._sources, self._retired = p, sources, []
         self.started_at, self.started_monotonic = datetime.now(), t0
-        self.sources_description = " + ".join(SOURCE_LABELS[s.source_id] for s in sources)
+        self._describe()
         log.info("live recording started (%s, live transcription %s)", self.sources_description,
                  "on" if self.transcriber else "off")
+        threading.Thread(target=self._follow_devices, args=(t0, snap), daemon=True, name="device-follower").start()
+
+    def _open_sources(self, p, pa, t0, feed, snap, require_mic=False) -> list:
+        mic_pref, out_pref, with_computer = self._prefs
+        sources = []
+        try:
+            sources.append(_Source(p, pa, MIC, _pick_mic(p, pa, mic_pref), t0, feed, self.keep_audio))
+        except Exception as e:
+            if require_mic:
+                raise
+            log.warning("couldn't open the microphone after a device change: %s", e)
+        if with_computer:
+            try:
+                for info in _pick_loopbacks(p, out_pref, (snap or {}).get("output_comm", "")):
+                    sources.append(_Source(p, pa, COMPUTER, info, t0, feed, self.keep_audio))
+            except Exception as e:
+                log.warning("computer-audio capture unavailable, recording microphone only: %s", e)
+        return sources
+
+    def _describe(self):
+        mic = next((s.device_name for s in self._sources if s.source_id == MIC), "")
+        outs = [s.device_name.replace(" [Loopback]", "") for s in self._sources if s.source_id == COMPUTER]
+        bits = []
+        if mic:
+            bits.append(f"microphone ({mic})")
+        if outs:
+            bits.append(f"computer audio ({', '.join(outs)})")
+        self.sources_description = " + ".join(bits) or "nothing (no audio device)"
+
+    def _follow_devices(self, started, snap, every_s: float = 2.0):
+        """Keeps the recording on the right devices when they change mid-meeting: a headset connected or
+        removed, a new Windows default, or the recorded mic disappearing. PortAudio can't see new devices
+        while it runs, so the capture is reopened -- a fraction of a second -- on the same timeline;
+        everything recorded so far is kept."""
+        try:
+            ctypes.windll.ole32.CoInitializeEx(None, 0)
+        except Exception:
+            pass
+        last = _desired_devices(snap, *self._prefs) if snap else None
+        while self.recording and self.started_monotonic == started:
+            time.sleep(every_s)
+            snap = _snapshot()
+            if snap is None or not self.recording or self.started_monotonic != started:
+                continue
+            want = _desired_devices(snap, *self._prefs)
+            mic = next((s for s in self._sources if s.source_id == MIC), None)
+            mic_gone = mic is not None and (not mic.alive or time.monotonic() - mic.last_audio > 3 * every_s)
+            if want == last and not mic_gone:
+                continue
+            last = want
+            try:
+                if self.reopen(started, snap):
+                    log.info("audio devices changed (mic gone: %s), now recording %s", mic_gone, self.sources_description)
+                    if self.on_device_change:
+                        self.on_device_change(f"Audio devices changed - now recording {self.sources_description}.")
+            except Exception as e:
+                log.warning("couldn't follow the audio device change: %s", e)
+
+    def reopen(self, started, snap=None) -> bool:
+        """Closes and reopens all capture on the current devices (with a fresh PortAudio device list)."""
+        import pyaudiowpatch as pa
+        with self._lock:
+            if not self.recording or self.started_monotonic != started:
+                return False
+            for s in self._sources:
+                s.close()
+            self._retired.extend(self._sources)       # their audio so far stays in the recording
+            self._sources = []
+            self._p.terminate()
+            self._p = pa.PyAudio()
+            feed = self.transcriber.feed if self.transcriber else None
+            self._sources = self._open_sources(self._p, pa, started, feed, snap or _snapshot())
+            self._describe()
+            return True
 
     def stop(self):
         """Stops capture. Returns (wav_bytes, segments): 16 kHz mono 16-bit WAV, and the live transcript
         segments (None when live transcription was off). wav_bytes is None for a sub-second recording."""
-        if not self.recording:
-            return None, None
-        for s in self._sources:
-            s.close()
-        self._p.terminate()
-        sources, self._p, self._sources = self._sources + self._retired, None, []
-        self._retired = []
+        with self._lock:
+            if not self.recording:
+                return None, None
+            for s in self._sources:
+                s.close()
+            self._p.terminate()
+            sources, self._p, self._sources = self._sources + self._retired, None, []
+            self._retired = []
         segments = self.transcriber.finish() if self.transcriber else None
 
         length = max((s.length for s in sources), default=0)
         log.info("live %s stopped (%.1fs, %s live segments)", "recording" if self.keep_audio else "subtitles",
                  length / RATE, len(segments) if segments is not None else "no")
+        self.last_tracks = {}
         if not self.keep_audio or length < _MIN_SECONDS * RATE:
             return None, segments
-        mix = sum(s.timeline(length) for s in sources)
+        # One track per speaker source (a mic swapped mid-recording is merged back into "you") -- kept so
+        # the after-recording accuracy pass (transcript_refiner.py) can still tell You from Others.
+        tracks = {}
+        for s in sources:
+            tracks[s.source_id] = tracks.get(s.source_id, 0) + s.timeline(length)
+        self.last_tracks = {sid: _to_wav(arr) for sid, arr in tracks.items()}
+        mix = sum(tracks.values())
         peak = float(np.max(np.abs(mix))) if length else 0.0
         if peak > 1.0:
             mix /= peak   # two loud sources summed -- scale down rather than clip
-        pcm = (np.clip(mix, -1.0, 1.0) * 32767).astype("<i2").tobytes()
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(RATE)
-            w.writeframes(pcm)
-        return buf.getvalue(), segments
+        return _to_wav(mix), segments
 
 
-def ingest(wav_bytes: bytes, started_at: datetime, segments=None, screenshots=None) -> str:
+def _to_wav(samples: np.ndarray) -> bytes:
+    """float32 16 kHz mono -> 16-bit PCM WAV bytes."""
+    pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2").tobytes()
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(RATE)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def ingest(wav_bytes: bytes, started_at: datetime, segments=None, screenshots=None, tracks=None,
+           in_call=None) -> str:
     """Adds a finished live recording to the normal pipeline. With live segments, the transcript is
     stored as-is (poller.process_once skips batch transcription for it). screenshots: [{t, time, file,
     window}] taken during the recording (t = seconds from its start, same clock as segment start/end).
+    tracks: {source_id: WAV bytes} per speaker source; with the accuracy pass on (transcript_refiner),
+    the recording waits in status "refining" until transcript_refiner has transcribed them by speaker.
     Returns the recording's name."""
+    import paths
     import settings
     import storage
+    import transcript_refiner
     name = f"live_{started_at:%Y-%m-%d_%H-%M-%S}.wav"
-    extra = {"screenshots": list(screenshots or [])}
+    content_hash = hashlib.md5(wav_bytes).hexdigest()
+    owner = (settings.get_all().get("owner_name") or "").strip() or "You"
+    # The mic is the owner only during an online call; in the room everyone talks into it.
+    mic_name = owner if in_call or in_call is None else "Microphone (room)"
+    extra = {"screenshots": list(screenshots or []), "speaker_names": {MIC: mic_name, COMPUTER: "Others"}}
+    if in_call is not None:
+        extra["in_call"] = bool(in_call)
     if segments:
-        owner = (settings.get_all().get("owner_name") or "").strip() or "You"
-        extra.update({
-            "prefilled_transcription": {"text": " ".join(s["text"] for s in segments),
-                                        "segments": segments, "stt_provider": "parakeet-live"},
-            "speaker_names": {MIC: owner, COMPUTER: "Others"},
-        })
-    storage.add_pending(name, len(wav_bytes), hashlib.md5(wav_bytes).hexdigest(), wav_bytes, extra=extra)
+        extra["prefilled_transcription"] = {"text": " ".join(s["text"] for s in segments),
+                                            "segments": segments, "stt_provider": "parakeet-live"}
+    refine = bool(tracks) and transcript_refiner.is_enabled()
+    if tracks:
+        folder = os.path.join(paths.APP_DATA_DIR, "tracks")
+        os.makedirs(folder, exist_ok=True)
+        extra["source_tracks"] = {}
+        for sid, data in tracks.items():
+            path = os.path.join(folder, f"{name[:-4]}__{sid}.wav")
+            with open(path, "wb") as f:
+                f.write(data)
+            extra["source_tracks"][sid] = path
+    if refine:
+        extra["status"] = "refining"      # poller.process_once only picks up pending/failed
+    storage.add_pending(name, len(wav_bytes), content_hash, wav_bytes, extra=extra)
+    if refine:
+        transcript_refiner.enqueue(content_hash)
     return name
 
 
@@ -315,6 +467,7 @@ class Controller:
 
     def __init__(self):
         self.recorder = LiveRecorder()
+        self.recorder.on_device_change = lambda msg: self._fire("info", msg)
         self._lock = threading.Lock()
         self._listeners = []
         self.last_saved = None   # name of the last ingested recording, for the dashboard
@@ -323,6 +476,7 @@ class Controller:
         self.mic_state = ""      # checking / live / muted / muted_in_call -- kept current by _monitor_mic()
         self.call = ""           # the running call, when one was detected while the mic was muted
         self.screenshots = []    # [{t, time, file, window}] for the current recording (take_screenshot)
+        self.saw_call = False    # a Teams/Zoom/Meet call ran at some point during this recording
 
     def add_listener(self, fn):
         self._listeners.append(fn)
@@ -393,6 +547,7 @@ class Controller:
             self.mode = "subtitles" if subtitles_only else "record"
             self.auto_started = auto
             self.screenshots = []
+            self.saw_call = auto
         self.mic_state, self.call = "checking", ""
         if subtitles_only:
             self._fire("subtitles_on", self.recorder.sources_description)
@@ -439,9 +594,15 @@ class Controller:
         warned, tried_switch = False, False
         time.sleep(first_check_s)
         while self.recorder.recording and self.recorder.started_monotonic == started:
+            if not self.saw_call:
+                try:
+                    self.saw_call = bool(meeting_detector.current_call())
+                except Exception:
+                    pass
             peak = self.recorder.take_mic_peak()
             if peak is None:                        # no microphone source at all
-                return
+                time.sleep(every_s)
+                continue
             if peak == 0.0 and not tried_switch:
                 # Exact zeros can also mean the wrong device (a headset dongle with the headset off, a
                 # disabled mic) while the user talks into another one -- switch to a live mic first.
@@ -498,12 +659,12 @@ class Controller:
         if wav_bytes is None:
             self._fire("discarded", "That was under a second, so nothing was saved.")
             return
-        threading.Thread(target=self._save, args=(wav_bytes, started_at, segments, list(self.screenshots)),
-                         daemon=True).start()
+        threading.Thread(target=self._save, args=(wav_bytes, started_at, segments, list(self.screenshots),
+                                                  dict(self.recorder.last_tracks), self.saw_call), daemon=True).start()
 
-    def _save(self, wav_bytes, started_at, segments, screenshots):
+    def _save(self, wav_bytes, started_at, segments, screenshots, tracks, in_call):
         try:
-            self.last_saved = ingest(wav_bytes, started_at, segments, screenshots)
+            self.last_saved = ingest(wav_bytes, started_at, segments, screenshots, tracks, in_call)
             self._fire("saved", self.last_saved)
         except Exception as e:
             self._fire("failed", f"Couldn't save the recording: {e}")

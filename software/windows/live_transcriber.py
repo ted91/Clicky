@@ -39,7 +39,7 @@ VAD_THRESHOLD = 0.5
 
 _CHUNK = 512                       # Silero window at 16 kHz (32 ms)
 _CHUNK_S = _CHUNK / RATE
-_PREROLL_CHUNKS = 10               # ~320 ms kept from before speech starts
+_PREROLL_CHUNKS = 20               # ~640 ms kept from before speech starts (320 ms clipped soft first words: "Der", "Ich")
 _START_CHUNKS = 2                  # 64 ms of speech opens an utterance
 _KEEP_TAIL_S = 0.15                # trailing silence kept in a final window
 _PUNCT = re.compile(r"[^\w]+", re.UNICODE)
@@ -88,6 +88,8 @@ def download_models(progress=print):
         with tarfile.open(archive) as tar:
             tar.extractall(models_dir())
         os.remove(archive)
+    import speaker_diarization                 # who-spoke-when models for the after-recording transcript
+    speaker_diarization.download_models(progress)
 
 
 # --- shared model (loaded once, ~14 s cold) ------------------------------------------------------

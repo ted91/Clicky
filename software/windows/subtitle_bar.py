@@ -131,18 +131,23 @@ class SubtitleBar:
 
     # ---- content (same entry model as Live Subtitles' overlay) -----------------------------------
     def _apply(self, u):
+        from live_translator import clean_subtitle
         src, utt, now = u["source"], u["utt_id"], time.monotonic()
         self.utt_first.setdefault((src, utt), now)
         tr = u.get("translation")
         if tr:
             for i, s in enumerate(tr["sentences"]):
+                s = clean_subtitle(s)                 # "Yeah, yeah, yeah." lines are dropped
                 if s:
                     self.entries[(src, utt, i)] = dict(stable=s, dim="", orig="", t=now)
             live_stable, live_dim = tr["stable"], tr["dim"]
         else:
             live_stable, live_dim = u["stable"], u["dim"]
-            if u["final"] and u["stable"]:
-                self.entries[(src, utt, 0)] = dict(stable=u["stable"], dim="", orig="", t=now)
+            final_text = clean_subtitle(u["stable"]) if u["final"] else ""
+            if final_text:
+                self.entries[(src, utt, 0)] = dict(stable=final_text, dim="", orig="", t=now)
+        if not clean_subtitle((live_stable + " " + live_dim).strip()):
+            live_stable = live_dim = ""               # a draft that is only filler isn't worth a line
         orig = (u["stable"] + (" " + u["dim"] if u["dim"] else "")).strip() if tr else ""
         live = (src, utt, LIVE)
         if u["final"] or not (live_stable or live_dim):

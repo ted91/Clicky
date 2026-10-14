@@ -206,7 +206,8 @@ def save_live_settings(request: Request,
                        live_output_device: str = Form(""), live_mode: str = Form("both"),
                        auto_record_calls: str = Form(""), capslock_record_hotkey: str = Form(""),
                        shift_screenshot_hotkey: str = Form(""),
-                       live_transcription: str = Form(""), start_with_windows: str = Form("")):
+                       live_transcription: str = Form(""), refine_transcripts: str = Form(""),
+                       start_with_windows: str = Form("")):
     """Settings -> Live subtitles (live recording, subtitle bar, translation, devices)."""
     redirect = _gate(request)
     if redirect:
@@ -220,7 +221,7 @@ def save_live_settings(request: Request,
         live_output_device=live_output_device, live_record_computer_audio=live_mode != "mic_only",
         auto_record_calls=on(auto_record_calls), capslock_record_hotkey=on(capslock_record_hotkey),
         shift_screenshot_hotkey=on(shift_screenshot_hotkey),
-        live_transcription=on(live_transcription),
+        live_transcription=on(live_transcription), refine_transcripts=on(refine_transcripts),
     )
     error = None
     try:

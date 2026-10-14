@@ -736,6 +736,19 @@ def set_meeting(content_hash: str, meeting: dict):
         _save(records)
 
 
+def update_fields(content_hash: str, **fields) -> bool:
+    """Sets arbitrary top-level fields on one record (e.g. transcript_refiner swapping in the refined
+    transcript and flipping status back to "pending"). Returns False if the record doesn't exist."""
+    with _lock:
+        records = _load()
+        record = _find(records, content_hash)
+        if record is None:
+            return False
+        record.update(fields)
+        _save(records)
+        return True
+
+
 def set_drafts(content_hash: str, drafts: dict):
     """Stores the generated post-meeting follow-up drafts (see
     poller.generate_drafts_once). Drafts are only ever *generated* by the
